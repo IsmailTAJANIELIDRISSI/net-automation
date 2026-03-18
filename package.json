@@ -1,0 +1,59 @@
+{
+  "name": "portnet-automation-playwright",
+  "version": "1.0.0",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k -n VITE,ELECTRON -c cyan,green \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "build:ui": "vite build",
+    "build:app": "npm run build:ui && electron-builder",
+    "preview": "vite preview",
+    "start": "node index.js",
+    "start:lotRef": "node index.js --lotRef=",
+    "login-test": "node login-portnet.js"
+  },
+  "keywords": [],
+  "author": "Med Africa Logistics",
+  "license": "ISC",
+  "description": "Playwright automation for BADR + Portnet DS Combinée workflow",
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "nodemailer": "^8.0.1",
+    "playwright": "^1.58.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.21",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^33.4.5",
+    "electron-builder": "^25.1.8",
+    "postcss": "^8.5.3",
+    "tailwindcss": "^3.4.17",
+    "vite": "^6.3.5",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "ma.medafrica.portnet-automation",
+    "productName": "MedAfrica DS Combinée",
+    "directories": {
+      "buildResources": "assets",
+      "output": "release"
+    },
+    "files": [
+      "electron/**/*",
+      "src/badr/**/*",
+      "src/portnet/**/*",
+      "src/config/**/*",
+      "src/utils/**/*",
+      "dist/**/*",
+      "node_modules/**/*",
+      "!node_modules/electron/**/*"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    }
+  }
+}
