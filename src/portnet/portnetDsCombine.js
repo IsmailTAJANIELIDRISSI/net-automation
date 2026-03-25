@@ -1036,8 +1036,30 @@ class PortnetDsCombine {
         return;
       }
 
-      await createdAtHeader.locator('button[aria-label="Sort"]').click();
+      await createdAtHeader.scrollIntoViewIfNeeded().catch(() => {});
+
+      // MUI DataGrid often hides the sort icon button until hover/focus.
+      // Clicking the header itself is more reliable across rerenders.
+      const sortButton = createdAtHeader
+        .locator('button[aria-label="Sort"]')
+        .first();
+      const buttonVisible = await sortButton.isVisible().catch(() => false);
+
+      if (buttonVisible) {
+        await sortButton.click();
+      } else {
+        await createdAtHeader.click();
+      }
+
       await this.page.waitForTimeout(500);
+
+      const afterSort =
+        (await createdAtHeader.getAttribute("aria-sort").catch(() => "none")) ||
+        "none";
+      if (afterSort === "descending") {
+        log.info("Consultation sorted by Date de creation (descending)");
+        return;
+      }
     }
 
     log.warn(

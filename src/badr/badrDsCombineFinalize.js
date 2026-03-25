@@ -291,17 +291,23 @@ class BADRDsCombineFinalize {
       await page.waitForTimeout(500);
     }
 
-    // Expand "DS MEAD COMBINEE"
+    // Expand "DS MEAD COMBINEE" using a deterministic selector to avoid strict-mode collisions.
     log.info("Expanding DS MEAD COMBINEE...");
-    await page
-      .locator('a.ui-menuitem-link:has-text("DS MEAD COMBINEE")')
-      .click();
+    const dsMeadCombineeNode = page
+      .locator(
+        'a#_205151, a.ui-menuitem-link:has(span.ui-menuitem-text:text-is("DS MEAD COMBINEE"))',
+      )
+      .first();
+    await dsMeadCombineeNode.waitFor({ state: "visible", timeout: 15000 });
+    await dsMeadCombineeNode.click();
     await page.waitForTimeout(500);
 
     // Click "Déclarer scellés DS MEAD combinée"
     log.info("Clicking Déclarer scellés..."); // Handle UTF-8 safely
     const declarerLink = page
-      .locator('a[id="_12251"], a[href*="dsMeadCombineeScelle.xhtml"]')
+      .locator(
+        'a#_12251, a[title*="codeFonctionnalite=cf12251"], a[href*="dsMeadCombineeScelle.xhtml"]',
+      )
       .first();
     await declarerLink.waitFor({ state: "visible", timeout: 15000 });
     await declarerLink.click();
