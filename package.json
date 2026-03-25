@@ -3,12 +3,17 @@
   "version": "1.0.0",
   "main": "electron/main.js",
   "scripts": {
+    "autopull": "node scripts/auto-pull.js",
+    "predev": "npm run autopull",
     "dev": "concurrently -k -n VITE,ELECTRON -c cyan,green \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
     "build:ui": "vite build",
     "build:app": "npm run build:ui && electron-builder",
+    "prestart": "npm run autopull",
     "preview": "vite preview",
     "start": "node index.js",
+    "prestart:lotRef": "npm run autopull",
     "start:lotRef": "node index.js --lotRef=",
+    "prelogin-test": "npm run autopull",
     "login-test": "node login-portnet.js"
   },
   "keywords": [],

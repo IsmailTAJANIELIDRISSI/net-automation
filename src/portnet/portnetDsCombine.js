@@ -1016,6 +1016,33 @@ class PortnetDsCombine {
     await this.page.goto("https://cargo.portnet.ma/dsCombine/consultation", {
       waitUntil: "networkidle",
     });
+
+    // Ensure newest rows are shown first to reduce ambiguity on shared dsReference.
+    await this._ensureConsultationSortedByCreatedAtDesc();
+  }
+
+  async _ensureConsultationSortedByCreatedAtDesc() {
+    const pollFrame = this.page.frameLocator('iframe[title="iframe"]');
+    const createdAtHeader = pollFrame.locator(
+      '[role="columnheader"][data-field="createdAtFormatted"]',
+    );
+
+    await createdAtHeader.waitFor({ state: "visible", timeout: 30000 });
+
+    for (let i = 0; i < 3; i++) {
+      const sort = (await createdAtHeader.getAttribute("aria-sort")) || "none";
+      if (sort === "descending") {
+        log.info("Consultation sorted by Date de creation (descending)");
+        return;
+      }
+
+      await createdAtHeader.locator('button[aria-label="Sort"]').click();
+      await this.page.waitForTimeout(500);
+    }
+
+    log.warn(
+      "Could not confirm descending sort on Date de creation header. Continuing with current order.",
+    );
   }
 
   _parseCreatedAtToTimestamp(createdAtRaw) {
@@ -1053,6 +1080,8 @@ class PortnetDsCombine {
     const submittedAtTs = options.submittedAt
       ? new Date(options.submittedAt).getTime()
       : null;
+    const anchorCreatedAtRaw = String(options.anchorCreatedAtRaw || "").trim();
+    const preferNewest = options.preferNewest === true;
     const excludeRefDs = new Set(
       (options.excludeRefDs || [])
         .map((ref) => this._normalizeRefDs(ref))
@@ -1105,6 +1134,12 @@ class PortnetDsCombine {
           .getAttribute("aria-label")
           .catch(() => "")) || "";
 
+      const numeroManifesteRaw =
+        (await row
+          .locator('div[data-field="numeroManifeste"] div[aria-label]')
+          .getAttribute("aria-label")
+          .catch(() => "")) || "";
+
       allMatches.push({
         rowIndex: i,
         statusText,
@@ -1112,7 +1147,31 @@ class PortnetDsCombine {
         refDsShort: this._normalizeRefDs(refDsRaw),
         createdAtRaw,
         createdAtTs: this._parseCreatedAtToTimestamp(createdAtRaw),
+        numeroManifesteRaw,
       });
+    }
+
+    if (anchorCreatedAtRaw) {
+      const anchored = allMatches.find(
+        (m) => String(m.createdAtRaw || "").trim() === anchorCreatedAtRaw,
+      );
+
+      if (anchored) {
+        const anchoredAccepted =
+          (anchored.statusText === "Acceptée" ||
+            anchored.statusText === "Acceptee") &&
+          anchored.refDsShort &&
+          !excludeRefDs.has(anchored.refDsShort);
+
+        return {
+          found: true,
+          statusText: anchored.statusText || "",
+          refDsRaw: anchoredAccepted ? anchored.refDsRaw : "",
+          createdAtRaw: anchored.createdAtRaw || "",
+          numeroManifesteRaw: anchored.numeroManifesteRaw || "",
+          matchesCount: matchCount,
+        };
+      }
     }
 
     // When submittedAt is known, bind this check to ONE row: the row whose
@@ -1130,17 +1189,39 @@ class PortnetDsCombine {
 
       if (timeCandidates.length === 0) {
         log.warn(
-          `No consultation row in time window for ${portnetRef} (submittedAt=${options.submittedAt}). Skipping this poll cycle.`,
+          `No consultation row in time window for ${portnetRef} (submittedAt=${options.submittedAt}). Falling back to closest row outside window.`,
         );
+
+        const sortable = allMatches
+          .filter((m) => Number.isFinite(m.createdAtTs))
+          .sort((a, b) => {
+            const da = Math.abs(a.createdAtTs - submittedAtTs);
+            const db = Math.abs(b.createdAtTs - submittedAtTs);
+            if (da !== db) return da - db;
+            return (b.createdAtTs || 0) - (a.createdAtTs || 0);
+          });
+
+        const fallbackTarget = sortable[0] || allMatches[0];
+        const fallbackAccepted =
+          (fallbackTarget?.statusText === "Acceptée" ||
+            fallbackTarget?.statusText === "Acceptee") &&
+          fallbackTarget?.refDsShort &&
+          !excludeRefDs.has(fallbackTarget.refDsShort);
+
         return {
-          found: false,
-          statusText: "",
-          refDsRaw: "",
+          found: true,
+          statusText: fallbackTarget?.statusText || "",
+          refDsRaw: fallbackAccepted ? fallbackTarget.refDsRaw : "",
+          createdAtRaw: fallbackTarget?.createdAtRaw || "",
           matchesCount: matchCount,
         };
       }
 
       timeCandidates.sort((a, b) => {
+        if (preferNewest) {
+          return (b.createdAtTs || 0) - (a.createdAtTs || 0);
+        }
+
         const da = Math.abs(a.createdAtTs - submittedAtTs);
         const db = Math.abs(b.createdAtTs - submittedAtTs);
         if (da !== db) return da - db;
@@ -1159,6 +1240,7 @@ class PortnetDsCombine {
         statusText: target.statusText || "",
         refDsRaw: canUseAcceptedRef ? target.refDsRaw : "",
         createdAtRaw: target.createdAtRaw || "",
+        numeroManifesteRaw: target.numeroManifesteRaw || "",
         matchesCount: matchCount,
       };
     }
@@ -1171,7 +1253,9 @@ class PortnetDsCombine {
         !excludeRefDs.has(m.refDsShort),
     );
 
-    acceptedCandidates.sort((a, b) => (b.createdAtTs || 0) - (a.createdAtTs || 0));
+    acceptedCandidates.sort(
+      (a, b) => (b.createdAtTs || 0) - (a.createdAtTs || 0),
+    );
     const bestAccepted = acceptedCandidates[0] || null;
 
     const fallbackRow = bestAccepted || allMatches[0];
@@ -1180,6 +1264,7 @@ class PortnetDsCombine {
       statusText: fallbackRow?.statusText || "",
       refDsRaw: bestAccepted?.refDsRaw || "",
       createdAtRaw: fallbackRow?.createdAtRaw || "",
+      numeroManifesteRaw: fallbackRow?.numeroManifesteRaw || "",
       matchesCount: matchCount,
     };
   }

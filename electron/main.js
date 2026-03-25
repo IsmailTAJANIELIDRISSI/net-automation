@@ -246,6 +246,8 @@ function updateAutomationState(folderPath, patch) {
 
 function mapCheckpointToStatus(state) {
   switch (state?.phase) {
+    case "portnet_sent_waiting":
+      return "submitting-portnet";
     case "portnet_submitted":
       return "portnet-submitted";
     case "portnet_accepted":
@@ -267,6 +269,26 @@ function getPollIntervalMs(attempts) {
   if (attempts < 5) return 60_000;
   if (attempts < 20) return 120_000;
   return 180_000;
+}
+
+function normalizePortnetStatus(statusText) {
+  return String(statusText || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function isEnvoyeeStatus(statusText) {
+  return normalizePortnetStatus(statusText).startsWith("envoye");
+}
+
+function isAcceptedStatus(statusText) {
+  return normalizePortnetStatus(statusText).startsWith("acceptee");
+}
+
+function isRejectedStatus(statusText) {
+  return normalizePortnetStatus(statusText).startsWith("rejetee");
 }
 
 async function prepareLotAndWeightCheck(acheminement) {
@@ -566,15 +588,20 @@ async function submitPortnetPhase(acheminement, lotInfo, portnetPage) {
 
   const portnetRef = await dsCombine.submitRequest(lotInfo.sequenceNum);
   updateAutomationState(folderPath, {
-    phase: "portnet_submitted",
+    // Mark as "sent click done" first; real submitted means consultation row = Envoyee.
+    phase: "portnet_sent_waiting",
     portnetRef,
     submittedAt: new Date().toISOString(),
     attempts: 0,
     lotInfo,
     error: null,
   });
-  sendProgress(id, "portnet-submitted", { portnetRef });
-  sendLog("info", "Portnet", `Request submitted for "${id}" (${portnetRef})`);
+  sendProgress(id, "monitoring-portnet", { portnetRef, attempts: 0 });
+  sendLog(
+    "info",
+    "Portnet",
+    `Submit clicked for "${id}" (${portnetRef}). Waiting consultation status = Envoyee before marking as submitted.`,
+  );
 
   return { success: true, portnetRef };
 }
@@ -675,7 +702,11 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
   await dsCombine.openConsultationPage();
 
   // ── BADR session refresh every 2 minutes (prevent logout during long polling) ──
+  let badrBusy = false;
+  let badrRefreshInProgress = false;
   let badrRefreshInterval = setInterval(async () => {
+    if (badrBusy || badrRefreshInProgress) return;
+    badrRefreshInProgress = true;
     try {
       sendLog(
         "info",
@@ -687,6 +718,8 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
       sendLog("info", "BADR", "BADR session refreshed successfully.");
     } catch (err) {
       sendLog("warn", "BADR", `Failed to refresh BADR session: ${err.message}`);
+    } finally {
+      badrRefreshInProgress = false;
     }
   }, 120000); // 120 seconds = 2 minutes
 
@@ -715,10 +748,20 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
           `Consultation check ${attempts}/${maxAttempts} for "${ach.id}" (${state.portnetRef})...`,
         );
 
-        const { found, statusText, refDsRaw, createdAtRaw } =
+        const {
+          found,
+          statusText,
+          refDsRaw,
+          createdAtRaw,
+          numeroManifesteRaw,
+        } =
           await dsCombine.getConsultationStatus(state.portnetRef, {
             submittedAt: state.submittedAt || null,
             excludeRefDs: Array.from(claimedAcceptedRefs),
+            anchorCreatedAtRaw: state.consultationCreatedAtRaw || null,
+            preferNewest:
+              !state.consultationCreatedAtRaw &&
+              state.phase === "portnet_sent_waiting",
           });
 
         updateAutomationState(ach.folderPath, {
@@ -736,13 +779,41 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
           continue;
         }
 
+        if (!state.consultationCreatedAtRaw && createdAtRaw) {
+          updateAutomationState(ach.folderPath, {
+            consultationCreatedAtRaw: createdAtRaw,
+            consultationNumeroManifeste: numeroManifesteRaw || "",
+          });
+          sendLog(
+            "info",
+            "Portnet",
+            `Anchored consultation row for "${ach.id}" at createdAt=${createdAtRaw}${numeroManifesteRaw ? `, manifeste=${numeroManifesteRaw}` : ""}.`,
+          );
+        }
+
         sendLog(
           "info",
           "Portnet",
           `Current status for ${state.portnetRef}: ${statusText}`,
         );
 
-        if (statusText === "Acceptée" || statusText === "Acceptee") {
+        if (isEnvoyeeStatus(statusText) && state.phase !== "portnet_submitted") {
+          updateAutomationState(ach.folderPath, {
+            phase: "portnet_submitted",
+            submittedConfirmedAt: new Date().toISOString(),
+            error: null,
+          });
+          sendProgress(ach.id, "portnet-submitted", {
+            portnetRef: state.portnetRef,
+          });
+          sendLog(
+            "info",
+            "Portnet",
+            `Submission confirmed on consultation (Envoyee) for "${ach.id}" (${state.portnetRef}).`,
+          );
+        }
+
+        if (isAcceptedStatus(statusText)) {
           const shortRef = String(refDsRaw || "")
             .substring(10)
             .replace(/^0+/, "");
@@ -768,8 +839,13 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
             declarationRef: shortRef,
           });
           pending.delete(ach.id);
-          await finalizeAcceptedOnBadr(ach, shortRef);
-        } else if (statusText === "Rejetée" || statusText === "Rejetee") {
+          badrBusy = true;
+          try {
+            await finalizeAcceptedOnBadr(ach, shortRef);
+          } finally {
+            badrBusy = false;
+          }
+        } else if (isRejectedStatus(statusText)) {
           const error = `DS Combinée request was REJECTED for ${state.portnetRef}! Please check manually.`;
           updateAutomationState(ach.folderPath, {
             phase: "error",
@@ -858,12 +934,15 @@ async function runAutomationTask(
         return submitResult;
       }
     } else {
+      const resumeStatus = checkpoint.phase === "portnet_submitted"
+        ? "portnet-submitted"
+        : "monitoring-portnet";
       sendLog(
         "info",
         "Automation",
         `Checkpoint found for "${id}" — request already submitted (${checkpoint.portnetRef}), skipping precheck + re-send.`,
       );
-      sendProgress(id, "portnet-submitted", {
+      sendProgress(id, resumeStatus, {
         portnetRef: checkpoint.portnetRef,
       });
     }
@@ -915,12 +994,15 @@ async function runAllAutomationTasks(acheminements) {
         continue;
       }
       if (hasSubmittedPortnet && !hasAcceptedPortnet) {
+        const resumeStatus = checkpoint.phase === "portnet_submitted"
+          ? "portnet-submitted"
+          : "monitoring-portnet";
         sendLog(
           "info",
           "Automation",
           `Skipping submit for "${ach.id}" — already submitted (${checkpoint.portnetRef}), going directly to monitoring.`,
         );
-        sendProgress(ach.id, "portnet-submitted", {
+        sendProgress(ach.id, resumeStatus, {
           portnetRef: checkpoint.portnetRef,
         });
         continue;

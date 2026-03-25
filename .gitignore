@@ -30,6 +30,9 @@ test-results/
 temp/
 *.tmp
 
+# User-specific runtime data
+Acheminements/
+
 # OS / editor files
 .DS_Store
 Thumbs.db
