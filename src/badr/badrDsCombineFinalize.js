@@ -17,7 +17,16 @@ class BADRDsCombineFinalize {
    * 1. Downloading the Autorisation d'Entree PDF
    * 2. Declaring Scelles
    */
-  async processFinalization(bureau, regime, serie, cle, scelle1, scelle2) {
+  async processFinalization(
+    bureau,
+    regime,
+    serie,
+    cle,
+    scelle1,
+    scelle2,
+    ltaRank = "",
+    lotReference = "",
+  ) {
     const annee = new Date().getFullYear().toString();
 
     // PHASE 1: PDF Download
@@ -27,6 +36,8 @@ class BADRDsCombineFinalize {
       annee,
       serie,
       cle,
+      ltaRank,
+      lotReference,
     );
 
     // Simulate Emailing (will be implemented later)
@@ -47,7 +58,15 @@ class BADRDsCombineFinalize {
   }
 
   // 1. Download Autorisation d'Entree
-  async downloadAutorisationEntree(bureau, regime, annee, serie, cle) {
+  async downloadAutorisationEntree(
+    bureau,
+    regime,
+    annee,
+    serie,
+    cle,
+    ltaRank = "",
+    lotReference = "",
+  ) {
     log.info(`Navigating to MISE EN DOUANE -> Déclaration to find the DS...`);
     const page = this.page;
 
@@ -162,14 +181,38 @@ class BADRDsCombineFinalize {
     await detailPopup.waitForTimeout(2000);
     log.info("Opened Declaration détail popup.");
 
-    // Expand Consultations
-    log.info("Expanding Consultations...");
+    // Expand Consultations with retry logic for render issues
+    log.info("Expanding Consultations with retry logic...");
     const consultationsLink = detailPopup.locator(
       'a[tabindex="-1"]:has-text("Consultations")',
     );
-    if (await consultationsLink.isVisible()) {
-      await consultationsLink.click();
-      await detailPopup.waitForTimeout(1000);
+
+    const imprimerButton = detailPopup.locator(
+      "a#imprimerDSMeadCombineeAutorisationEntreeMarchandise",
+    );
+
+    let imprimerVisible = await imprimerButton.isVisible().catch(() => false);
+    let retries = 0;
+    const maxRetries = 3;
+
+    while (!imprimerVisible && retries < maxRetries) {
+      log.info(
+        `Imprimer button not visible (retry ${retries + 1}/${maxRetries}). Expanding Consultations...`,
+      );
+
+      if (await consultationsLink.isVisible()) {
+        await consultationsLink.click();
+        await detailPopup.waitForTimeout(600);
+      }
+
+      imprimerVisible = await imprimerButton.isVisible().catch(() => false);
+      retries++;
+    }
+
+    if (!imprimerVisible) {
+      log.warn(
+        "Imprimer button not found after retries. Attempting direct click anyway...",
+      );
     }
 
     // Now click 'Imprimer autorisation entrée marchandise' and handle download
@@ -178,18 +221,23 @@ class BADRDsCombineFinalize {
     );
     const [download] = await Promise.all([
       detailPopup.waitForEvent("download"),
-      detailPopup
-        .locator("a#imprimerDSMeadCombineeAutorisationEntreeMarchandise")
-        .click(),
+      imprimerButton.click(),
     ]);
 
-    // Save it to a specific directory or just local temp
-    const originalName = download.suggestedFilename(); // expected "DS_acheminement_entree_marchdandise.pdf"
-    log.info(`Downloading PDF: ${originalName}`);
+    // Rename PDF with LTA rank and lot reference if provided
+    let pdfFileName = download.suggestedFilename(); // default: "DS_acheminement_entree_marchdandise.pdf"
+
+    if (ltaRank && lotReference) {
+      // Construct: DS_[rank]_acheminement_entree_marchandise_[lotReference].pdf
+      pdfFileName = `DS_${ltaRank}_acheminement_entree_marchandise_${lotReference}.pdf`;
+      log.info(`Using custom PDF name: ${pdfFileName}`);
+    } else {
+      log.info(`Downloading PDF with default name: ${pdfFileName}`);
+    }
 
     const downloadPath = this.tempDownloadDir
-      ? path.join(this.tempDownloadDir, originalName)
-      : path.join(__dirname, "..", "..", "temp", originalName);
+      ? path.join(this.tempDownloadDir, pdfFileName)
+      : path.join(__dirname, "..", "..", "temp", pdfFileName);
 
     // ensure dir exists
     const dir = path.dirname(downloadPath);
@@ -205,7 +253,7 @@ class BADRDsCombineFinalize {
     if (!fs.existsSync(systemDownloadsDir)) {
       fs.mkdirSync(systemDownloadsDir, { recursive: true });
     }
-    const systemDownloadPath = path.join(systemDownloadsDir, originalName);
+    const systemDownloadPath = path.join(systemDownloadsDir, pdfFileName);
     fs.copyFileSync(downloadPath, systemDownloadPath);
     log.info(`PDF also saved to system Downloads: ${systemDownloadPath}`);
 
@@ -438,6 +486,19 @@ class BADRDsCombineFinalize {
       );
       throw new Error("Scellés declaration failed. Check log.");
     }
+
+    // Cleanup: close any remaining popups from the scellés form
+    const allPages = page.context().pages();
+    for (const p of allPages) {
+      if (p !== page && !p.isClosed()) {
+        log.info("Closing scellés form popup after finalization");
+        await p.close().catch(() => {});
+      }
+    }
+
+    // Bring main page back to front and stabilize
+    await page.bringToFront().catch(() => {});
+    await page.waitForTimeout(500);
   }
 }
 

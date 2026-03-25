@@ -1040,11 +1040,24 @@ class PortnetDsCombine {
     return Number.isFinite(ts) ? ts : null;
   }
 
+  _normalizeRefDs(refDsRaw) {
+    const raw = String(refDsRaw || "").trim();
+    if (!raw || raw === "undefined") return "";
+
+    const compact = raw.replace(/\s+/g, "");
+    const shortRef = compact.length > 10 ? compact.substring(10) : compact;
+    return shortRef.replace(/^0+/, "");
+  }
+
   async getConsultationStatus(portnetRef, options = {}) {
     const submittedAtTs = options.submittedAt
       ? new Date(options.submittedAt).getTime()
       : null;
-    const excludeRefDs = new Set(options.excludeRefDs || []);
+    const excludeRefDs = new Set(
+      (options.excludeRefDs || [])
+        .map((ref) => this._normalizeRefDs(ref))
+        .filter(Boolean),
+    );
     const pollFrame = this.page.frameLocator('iframe[title="iframe"]');
 
     await pollFrame
@@ -1096,77 +1109,77 @@ class PortnetDsCombine {
         rowIndex: i,
         statusText,
         refDsRaw,
+        refDsShort: this._normalizeRefDs(refDsRaw),
         createdAtRaw,
         createdAtTs: this._parseCreatedAtToTimestamp(createdAtRaw),
       });
     }
 
-    let scopedMatches = allMatches;
+    // When submittedAt is known, bind this check to ONE row: the row whose
+    // creation time is closest to this request submission time.
     if (Number.isFinite(submittedAtTs)) {
-      const lowerBoundTs = submittedAtTs - 2 * 60 * 1000;
-      const timeScoped = allMatches.filter(
-        (m) => m.createdAtTs == null || m.createdAtTs >= lowerBoundTs,
+      const lowerBoundTs = submittedAtTs - 30 * 60 * 1000;
+      const upperBoundTs = submittedAtTs + 180 * 60 * 1000;
+
+      const timeCandidates = allMatches.filter(
+        (m) =>
+          Number.isFinite(m.createdAtTs) &&
+          m.createdAtTs >= lowerBoundTs &&
+          m.createdAtTs <= upperBoundTs,
       );
-      if (timeScoped.length > 0) {
-        scopedMatches = timeScoped;
+
+      if (timeCandidates.length === 0) {
+        log.warn(
+          `No consultation row in time window for ${portnetRef} (submittedAt=${options.submittedAt}). Skipping this poll cycle.`,
+        );
+        return {
+          found: false,
+          statusText: "",
+          refDsRaw: "",
+          matchesCount: matchCount,
+        };
       }
+
+      timeCandidates.sort((a, b) => {
+        const da = Math.abs(a.createdAtTs - submittedAtTs);
+        const db = Math.abs(b.createdAtTs - submittedAtTs);
+        if (da !== db) return da - db;
+        return (a.createdAtTs || 0) - (b.createdAtTs || 0);
+      });
+
+      const target = timeCandidates[0];
+      const isAccepted =
+        target.statusText === "Acceptée" || target.statusText === "Acceptee";
+
+      const canUseAcceptedRef =
+        isAccepted && target.refDsShort && !excludeRefDs.has(target.refDsShort);
+
+      return {
+        found: true,
+        statusText: target.statusText || "",
+        refDsRaw: canUseAcceptedRef ? target.refDsRaw : "",
+        createdAtRaw: target.createdAtRaw || "",
+        matchesCount: matchCount,
+      };
     }
 
-    let acceptedCandidates = scopedMatches.filter(
+    // Fallback path (no submittedAt available): prefer newest non-claimed accepted row.
+    let acceptedCandidates = allMatches.filter(
       (m) =>
         (m.statusText === "Acceptée" || m.statusText === "Acceptee") &&
-        m.refDsRaw &&
-        m.refDsRaw !== "undefined" &&
-        !excludeRefDs.has(m.refDsRaw),
+        m.refDsShort &&
+        !excludeRefDs.has(m.refDsShort),
     );
 
-    // If time-scope became too strict, gracefully fallback to all rows.
-    if (acceptedCandidates.length === 0) {
-      acceptedCandidates = allMatches.filter(
-        (m) =>
-          (m.statusText === "Acceptée" || m.statusText === "Acceptee") &&
-          m.refDsRaw &&
-          m.refDsRaw !== "undefined" &&
-          !excludeRefDs.has(m.refDsRaw),
-      );
-    }
-
-    // Pick the newest accepted row (best proxy for the most recent submission).
-    acceptedCandidates.sort(
-      (a, b) => (b.createdAtTs || 0) - (a.createdAtTs || 0),
-    );
-
+    acceptedCandidates.sort((a, b) => (b.createdAtTs || 0) - (a.createdAtTs || 0));
     const bestAccepted = acceptedCandidates[0] || null;
 
-    let hasAccepted = false;
-    let hasPending = false;
-    let hasRejected = false;
-    let firstStatus = "";
-
-    for (const rowData of scopedMatches) {
-      const { statusText } = rowData;
-
-      if (!firstStatus && statusText) firstStatus = statusText;
-
-      if (statusText === "Acceptée" || statusText === "Acceptee") {
-        hasAccepted = true;
-      } else if (statusText === "Rejetée" || statusText === "Rejetee") {
-        hasRejected = true;
-      } else {
-        hasPending = true;
-      }
-    }
-
-    let aggregatedStatus = firstStatus;
-    if (hasAccepted) aggregatedStatus = "Acceptée";
-    else if (hasPending) aggregatedStatus = "Envoyée";
-    else if (hasRejected) aggregatedStatus = "Rejetée";
-
+    const fallbackRow = bestAccepted || allMatches[0];
     return {
       found: true,
-      statusText: aggregatedStatus || "",
+      statusText: fallbackRow?.statusText || "",
       refDsRaw: bestAccepted?.refDsRaw || "",
-      createdAtRaw: bestAccepted?.createdAtRaw || "",
+      createdAtRaw: fallbackRow?.createdAtRaw || "",
       matchesCount: matchCount,
     };
   }

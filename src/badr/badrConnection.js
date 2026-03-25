@@ -180,6 +180,22 @@ class BADRConnection {
    * Full bootstrap: launch Edge → connect CDP → login.
    */
   async connect() {
+    if (this.page && !this.page.isClosed()) {
+      log.info("Reusing existing BADR page/session");
+      return;
+    }
+
+    try {
+      await this.connectToEdge();
+      await this.navigateAndLogin();
+      log.info("Connected to existing Edge CDP session");
+      return;
+    } catch (existingErr) {
+      log.warn("No reusable Edge session found – launching fresh Edge", {
+        message: existingErr.message,
+      });
+    }
+
     await this.startFreshEdge();
     await this.connectToEdge();
     await this.navigateAndLogin();
@@ -189,8 +205,62 @@ class BADRConnection {
    * Reconnect without relaunching Edge (CDP already running).
    */
   async reconnect() {
+    if (this.page && !this.page.isClosed()) {
+      log.info("BADR reconnect skipped: existing page is active");
+      return;
+    }
+
     await this.connectToEdge();
     await this.navigateAndLogin();
+  }
+
+  /**
+   * Navigate to BADR Accueil and wait for page to stabilize.
+   * Resets the DOM context to a known state before starting new operations.
+   */
+  async navigateToAccueil() {
+    if (!this.page || this.page.isClosed()) {
+      log.warn("BADR page is closed – cannot navigate to Accueil");
+      return;
+    }
+
+    // First, close any open popups from previous operations
+    const allPages = this.context.pages();
+    for (const p of allPages) {
+      if (p !== this.page && !p.isClosed()) {
+        log.info("Closing stray popup before Accueil navigation");
+        await p.close().catch(() => {});
+      }
+    }
+
+    const { url } = config.badr;
+    const parsed = new URL(url);
+    const pathParts = parsed.pathname.split("/").filter(Boolean);
+    const contextRoot = pathParts.length ? `/${pathParts[0]}` : "";
+    const accueilUrl = `${parsed.origin}${contextRoot}/views/hab/hab_index.xhtml`;
+
+    // Check if we're already on Accueil AND the menu exists in the DOM
+    const isOnAccueil = this.page.url().includes("/views/hab/hab_index.xhtml");
+    const menuExists = await this.page
+      .locator(".ui-panelmenu-header a:has-text('MISE EN DOUANE')")
+      .isVisible()
+      .catch(() => false);
+
+    if (isOnAccueil && menuExists) {
+      log.info("BADR already on Accueil — skipping navigation");
+      return;
+    }
+
+    if (!isOnAccueil) {
+      log.info("Not on Accueil – navigating now");
+    } else {
+      log.info("On Accueil URL but menu missing – re-navigating to stabilize");
+    }
+
+    log.info(`Navigating to BADR Accueil: ${accueilUrl}`);
+    await this.page.goto(accueilUrl, { waitUntil: "networkidle" });
+    await this.page.waitForTimeout(2000);
+    log.info("BADR Accueil ready");
   }
 
   /**

@@ -103,6 +103,71 @@ function sendProgress(acheminementId, status, extra = {}) {
   }
 }
 
+let sharedPortnetApp = null;
+let sharedPortnetPage = null;
+let sharedBadrConn = null;
+
+async function ensurePortnetSession() {
+  const PortnetLogin = require("../src/portnet/portnetLogin");
+
+  if (sharedPortnetPage && !sharedPortnetPage.isClosed()) {
+    return sharedPortnetPage;
+  }
+
+  if (!sharedPortnetApp) {
+    sharedPortnetApp = new PortnetLogin();
+    sendLog("info", "Portnet", "Launching shared Portnet session…");
+    sendLog(
+      "info",
+      "Portnet",
+      ">>> Résolvez le CAPTCHA dans la fenêtre du navigateur <<<",
+    );
+  }
+
+  sharedPortnetPage = await sharedPortnetApp.login();
+  sendLog("info", "Portnet", "Shared Portnet session ready.");
+  return sharedPortnetPage;
+}
+
+async function ensureBadrSession() {
+  const BADRConnection = require("../src/badr/badrConnection");
+
+  if (sharedBadrConn?.page && !sharedBadrConn.page.isClosed()) {
+    return sharedBadrConn;
+  }
+
+  if (!sharedBadrConn) {
+    sharedBadrConn = new BADRConnection();
+  }
+
+  try {
+    await sharedBadrConn.connect();
+  } catch (err) {
+    sendLog(
+      "warn",
+      "BADR",
+      `Shared BADR connect failed (${err.message}) — retrying with reconnect...`,
+    );
+    await sharedBadrConn.reconnect();
+  }
+
+  sendLog("info", "BADR", "Shared BADR session ready.");
+  return sharedBadrConn;
+}
+
+async function closeSharedSessions() {
+  if (sharedPortnetApp) {
+    await sharedPortnetApp.close().catch(() => {});
+    sharedPortnetApp = null;
+    sharedPortnetPage = null;
+  }
+  if (sharedBadrConn) {
+    await sharedBadrConn.disconnect().catch(() => {});
+    sharedBadrConn.kill();
+    sharedBadrConn = null;
+  }
+}
+
 const CHECKPOINT_KEY = "automationState";
 
 function readAcheminementFile(folderPath) {
@@ -119,6 +184,49 @@ function readAcheminementFile(folderPath) {
 function writeAcheminementFile(folderPath, data) {
   const savePath = path.join(folderPath, "acheminement.json");
   fs.writeFileSync(savePath, JSON.stringify(data, null, 2), "utf8");
+}
+
+function normalizeLotReference(value) {
+  if (!value) return "";
+  const text = String(value).trim();
+  const match = text.match(/^(\d+)-(\d+)$/);
+  if (!match) return text;
+
+  const left = String(parseInt(match[1], 10));
+  const right = match[2];
+  return `${Number.isNaN(Number(left)) ? match[1] : left}-${right}`;
+}
+
+function extractLotReferenceFromFolder(folderPath) {
+  try {
+    const fileNames = fs
+      .readdirSync(folderPath, { withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name);
+
+    const extractRef = (name) => {
+      const match = name.match(/\b\d{1,4}-\d{6,}\b/);
+      return match ? normalizeLotReference(match[0]) : "";
+    };
+
+    const mawbFile = fileNames.find((name) => /\bmawb\b/i.test(name));
+    const manifesteFile = fileNames.find((name) => /\bmanifeste\b/i.test(name));
+
+    const mawbRef = mawbFile ? extractRef(mawbFile) : "";
+    if (mawbRef) return mawbRef;
+
+    const manifesteRef = manifesteFile ? extractRef(manifesteFile) : "";
+    if (manifesteRef) return manifesteRef;
+
+    for (const name of fileNames) {
+      const ref = extractRef(name);
+      if (ref) return ref;
+    }
+  } catch {
+    return "";
+  }
+
+  return "";
 }
 
 function getAutomationState(folderPath) {
@@ -182,20 +290,18 @@ async function prepareLotAndWeightCheck(acheminement) {
     return { success: false, skipped: true, reason: "partiel" };
   }
 
-  const BADRConnection = require("../src/badr/badrConnection");
   const BADRLotLookup = require("../src/badr/badrLotLookup");
   const BADRPreapurement = require("../src/badr/badrPreapurement");
 
-  let badrConn = null;
   let lotInfo = null;
+  const folderLotReference = extractLotReferenceFromFolder(folderPath);
 
   try {
-    badrConn = new BADRConnection();
+    const badrConn = await ensureBadrSession();
+    await badrConn.navigateToAccueil();
 
     if (!sequenceNumber || sequenceNumber.trim() === "") {
       sendLog("info", "BADR", "No sequence number – looking up in BADR…");
-      await badrConn.connect();
-
       const lotLookup = new BADRLotLookup(badrConn.page);
       await lotLookup.openLotPopup();
       lotInfo = await lotLookup.searchLot(refNumber);
@@ -236,6 +342,12 @@ async function prepareLotAndWeightCheck(acheminement) {
         `Lot trouvé: ${lotInfo.declarationRef} | Lieu: ${lotInfo.lieuChargement}`,
       );
 
+      lotInfo.lotReference =
+        normalizeLotReference(folderLotReference) ||
+        normalizeLotReference(lotInfo.lotReference) ||
+        normalizeLotReference(refNumber) ||
+        "";
+
       const seqDisplay =
         String(parseInt(lotInfo.sequenceNum, 10)) +
         (lotInfo.cle ? ` ${lotInfo.cle}` : "");
@@ -245,6 +357,8 @@ async function prepareLotAndWeightCheck(acheminement) {
         const existing = readAcheminementFile(folderPath);
         existing.sequenceNumber = seqDisplay;
         existing.lieuChargement = lotInfo.lieuChargement || "";
+        existing.lotReference =
+          lotInfo.lotReference || existing.lotReference || "";
         writeAcheminementFile(folderPath, existing);
       } catch (e) {
         console.error("[sequenceNumber save] Failed:", e.message);
@@ -260,7 +374,17 @@ async function prepareLotAndWeightCheck(acheminement) {
       const cle = parts[1] || "";
       sendLog("info", "BADR", `Using provided sequence: ${serie} ${cle}`);
 
-      await badrConn.connect();
+      const existingData = readAcheminementFile(folderPath);
+      const persistedLotReference =
+        normalizeLotReference(folderLotReference) ||
+        normalizeLotReference(
+          existingData?.automationState?.lotInfo?.lotReference,
+        ) ||
+        normalizeLotReference(existingData?.automationState?.lotReference) ||
+        normalizeLotReference(existingData?.lotReference) ||
+        normalizeLotReference(refNumber) ||
+        "";
+
       lotInfo = {
         declarationRef: refNumber
           ? `301-000-${new Date().getFullYear()}-${serie}-${cle}`
@@ -272,10 +396,15 @@ async function prepareLotAndWeightCheck(acheminement) {
         cle,
         sequenceNum: `${String(parseInt(serie, 10))}${cle ? ` ${cle}` : ""}`,
         lieuChargement: lieuChargement || "",
+        lotReference: persistedLotReference,
       };
     }
 
-    sendLog("info", "BADR", "Checking poids brut via Préapurement DS…");
+    sendLog(
+      "info",
+      "BADR",
+      "Restarting with MISE EN DOUANE for preapurement check…",
+    );
     const preap = new BADRPreapurement(badrConn.page);
     const poidsInfo = await preap.getPoidsBrut(lotInfo, refNumber);
 
@@ -384,8 +513,13 @@ async function prepareLotAndWeightCheck(acheminement) {
     });
 
     return { success: true, lotInfo };
-  } finally {
-    if (badrConn) await badrConn.disconnect().catch(() => {});
+  } catch (err) {
+    sendLog(
+      "error",
+      "BADR",
+      `prepareLotAndWeightCheck failed for "${id}": ${err.message}`,
+    );
+    throw err;
   }
 }
 
@@ -447,16 +581,29 @@ async function submitPortnetPhase(acheminement, lotInfo, portnetPage) {
 
 async function finalizeAcceptedOnBadr(acheminement, badrRef) {
   const { id, folderPath, scelle1, scelle2 } = acheminement;
-  const BADRConnection = require("../src/badr/badrConnection");
   const BADRDsCombineFinalize = require("../src/badr/badrDsCombineFinalize");
 
-  let badrConn = null;
   try {
-    badrConn = new BADRConnection();
-    await badrConn.connect();
+    const badrConn = await ensureBadrSession();
+    await badrConn.navigateToAccueil();
 
     sendLog("info", "BADR", `Proceeding to finalize on BADR for "${id}"...`);
     sendProgress(id, "badr-downloading", { declarationRef: badrRef });
+
+    // Extract LTA rank from folder name (e.g., "1er LTA" → "1er")
+    const folderName = path.basename(folderPath);
+    const ltaRankMatch = folderName.match(/^(\d+(?:er|eme|éme|ème))/i);
+    const ltaRank = ltaRankMatch ? ltaRankMatch[1] : "";
+
+    // Get lot reference from acheminement file if available
+    const achData = readAcheminementFile(folderPath);
+    const lotReference =
+      normalizeLotReference(extractLotReferenceFromFolder(folderPath)) ||
+      normalizeLotReference(achData?.automationState?.lotInfo?.lotReference) ||
+      normalizeLotReference(achData?.automationState?.lotReference) ||
+      normalizeLotReference(achData?.lotReference) ||
+      normalizeLotReference(acheminement?.lotReference) ||
+      "";
 
     const finalizer = new BADRDsCombineFinalize(badrConn.page);
     const parsedSerie = badrRef.slice(0, -1);
@@ -469,6 +616,8 @@ async function finalizeAcceptedOnBadr(acheminement, badrRef) {
       parsedCle,
       scelle1,
       scelle2,
+      ltaRank,
+      lotReference,
     );
 
     updateAutomationState(folderPath, {
@@ -490,8 +639,6 @@ async function finalizeAcceptedOnBadr(acheminement, badrRef) {
     sendProgress(id, "error", { error: err.message });
     sendLog("error", "Automation", `Failed for "${id}": ${err.message}`);
     return { success: false, error: err.message };
-  } finally {
-    if (badrConn) await badrConn.disconnect().catch(() => {});
   }
 }
 
@@ -527,115 +674,138 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
 
   await dsCombine.openConsultationPage();
 
-  const maxAttempts = 240;
-  while (pending.size > 0) {
-    let highestAttempts = 0;
-
-    for (const ach of pending.values()) {
-      const state = getAutomationState(ach.folderPath);
-      if (!state?.portnetRef) {
-        pending.delete(ach.id);
-        continue;
-      }
-
-      const attempts = (state.attempts || 0) + 1;
-      highestAttempts = Math.max(highestAttempts, attempts);
-      sendProgress(ach.id, "monitoring-portnet", {
-        portnetRef: state.portnetRef,
-        attempts,
-      });
-
+  // ── BADR session refresh every 2 minutes (prevent logout during long polling) ──
+  let badrRefreshInterval = setInterval(async () => {
+    try {
       sendLog(
         "info",
-        "Portnet",
-        `Consultation check ${attempts}/${maxAttempts} for "${ach.id}" (${state.portnetRef})...`,
+        "BADR",
+        "Refreshing BADR session to prevent timeout during Portnet polling...",
       );
+      const badrConn = await ensureBadrSession();
+      await badrConn.navigateToAccueil();
+      sendLog("info", "BADR", "BADR session refreshed successfully.");
+    } catch (err) {
+      sendLog("warn", "BADR", `Failed to refresh BADR session: ${err.message}`);
+    }
+  }, 120000); // 120 seconds = 2 minutes
 
-      const { found, statusText, refDsRaw, createdAtRaw } =
-        await dsCombine.getConsultationStatus(state.portnetRef, {
-          submittedAt: state.submittedAt || null,
-          excludeRefDs: Array.from(claimedAcceptedRefs),
+  const maxAttempts = 240;
+  try {
+    while (pending.size > 0) {
+      let highestAttempts = 0;
+
+      for (const ach of pending.values()) {
+        const state = getAutomationState(ach.folderPath);
+        if (!state?.portnetRef) {
+          pending.delete(ach.id);
+          continue;
+        }
+
+        const attempts = (state.attempts || 0) + 1;
+        highestAttempts = Math.max(highestAttempts, attempts);
+        sendProgress(ach.id, "monitoring-portnet", {
+          portnetRef: state.portnetRef,
+          attempts,
         });
 
-      updateAutomationState(ach.folderPath, {
-        attempts,
-        lastCheckedAt: new Date().toISOString(),
-        lastSeenStatus: found ? statusText : "NOT_FOUND",
-      });
-
-      if (!found) {
         sendLog(
           "info",
           "Portnet",
-          `Row for ${state.portnetRef} not found in consultation yet.`,
+          `Consultation check ${attempts}/${maxAttempts} for "${ach.id}" (${state.portnetRef})...`,
         );
-        continue;
-      }
 
-      sendLog(
-        "info",
-        "Portnet",
-        `Current status for ${state.portnetRef}: ${statusText}`,
-      );
+        const { found, statusText, refDsRaw, createdAtRaw } =
+          await dsCombine.getConsultationStatus(state.portnetRef, {
+            submittedAt: state.submittedAt || null,
+            excludeRefDs: Array.from(claimedAcceptedRefs),
+          });
 
-      if (statusText === "Acceptée" || statusText === "Acceptee") {
-        const shortRef = String(refDsRaw || "")
-          .substring(10)
-          .replace(/^0+/, "");
+        updateAutomationState(ach.folderPath, {
+          attempts,
+          lastCheckedAt: new Date().toISOString(),
+          lastSeenStatus: found ? statusText : "NOT_FOUND",
+        });
 
-        if (!shortRef) {
+        if (!found) {
           sendLog(
-            "warn",
+            "info",
             "Portnet",
-            `Acceptée found for ${state.portnetRef} but Réference DS is still empty/undefined (createdAt=${createdAtRaw || "n/a"}). Waiting next poll...`,
+            `Row for ${state.portnetRef} not found in consultation yet.`,
           );
           continue;
         }
 
-        claimedAcceptedRefs.add(shortRef);
+        sendLog(
+          "info",
+          "Portnet",
+          `Current status for ${state.portnetRef}: ${statusText}`,
+        );
 
-        updateAutomationState(ach.folderPath, {
-          phase: "portnet_accepted",
-          badrRef: shortRef,
-          acceptedAt: new Date().toISOString(),
-          error: null,
-        });
-        sendProgress(ach.id, "portnet-accepted", { declarationRef: shortRef });
-        pending.delete(ach.id);
-        await finalizeAcceptedOnBadr(ach, shortRef);
-      } else if (statusText === "Rejetée" || statusText === "Rejetee") {
-        const error = `DS Combinée request was REJECTED for ${state.portnetRef}! Please check manually.`;
-        updateAutomationState(ach.folderPath, {
-          phase: "error",
-          error,
-          rejectedAt: new Date().toISOString(),
-        });
-        sendProgress(ach.id, "error", { error });
-        sendLog("error", "Automation", `Failed for "${ach.id}": ${error}`);
-        pending.delete(ach.id);
+        if (statusText === "Acceptée" || statusText === "Acceptee") {
+          const shortRef = String(refDsRaw || "")
+            .substring(10)
+            .replace(/^0+/, "");
+
+          if (!shortRef) {
+            sendLog(
+              "warn",
+              "Portnet",
+              `Acceptée found for ${state.portnetRef} but Réference DS is still empty/undefined (createdAt=${createdAtRaw || "n/a"}). Waiting next poll...`,
+            );
+            continue;
+          }
+
+          claimedAcceptedRefs.add(shortRef);
+
+          updateAutomationState(ach.folderPath, {
+            phase: "portnet_accepted",
+            badrRef: shortRef,
+            acceptedAt: new Date().toISOString(),
+            error: null,
+          });
+          sendProgress(ach.id, "portnet-accepted", {
+            declarationRef: shortRef,
+          });
+          pending.delete(ach.id);
+          await finalizeAcceptedOnBadr(ach, shortRef);
+        } else if (statusText === "Rejetée" || statusText === "Rejetee") {
+          const error = `DS Combinée request was REJECTED for ${state.portnetRef}! Please check manually.`;
+          updateAutomationState(ach.folderPath, {
+            phase: "error",
+            error,
+            rejectedAt: new Date().toISOString(),
+          });
+          sendProgress(ach.id, "error", { error });
+          sendLog("error", "Automation", `Failed for "${ach.id}": ${error}`);
+          pending.delete(ach.id);
+        }
       }
-    }
 
-    if (pending.size === 0) break;
-    if (highestAttempts >= maxAttempts) {
-      for (const ach of pending.values()) {
-        const state = getAutomationState(ach.folderPath);
-        const error = `Timed out waiting for Acceptée status for ${state?.portnetRef || ach.refNumber}`;
-        updateAutomationState(ach.folderPath, { phase: "error", error });
-        sendProgress(ach.id, "error", { error });
-        sendLog("error", "Automation", `Failed for "${ach.id}": ${error}`);
+      if (pending.size === 0) break;
+      if (highestAttempts >= maxAttempts) {
+        for (const ach of pending.values()) {
+          const state = getAutomationState(ach.folderPath);
+          const error = `Timed out waiting for Acceptée status for ${state?.portnetRef || ach.refNumber}`;
+          updateAutomationState(ach.folderPath, { phase: "error", error });
+          sendProgress(ach.id, "error", { error });
+          sendLog("error", "Automation", `Failed for "${ach.id}": ${error}`);
+        }
+        break;
       }
-      break;
-    }
 
-    const waitMs = getPollIntervalMs(highestAttempts);
-    sendLog(
-      "info",
-      "Portnet",
-      `Pending requests remain (${pending.size}). Waiting ${Math.round(waitMs / 60000)} minute(s) before refreshing consultation...`,
-    );
-    await portnetPage.waitForTimeout(waitMs);
-    await portnetPage.reload({ waitUntil: "networkidle" });
+      const waitMs = getPollIntervalMs(highestAttempts);
+      sendLog(
+        "info",
+        "Portnet",
+        `Pending requests remain (${pending.size}). Waiting ${Math.round(waitMs / 60000)} minute(s) before refreshing consultation...`,
+      );
+      await portnetPage.waitForTimeout(waitMs);
+      await portnetPage.reload({ waitUntil: "networkidle" });
+    }
+  } finally {
+    clearInterval(badrRefreshInterval);
+    sendLog("info", "BADR", "BADR session refresh timer stopped.");
   }
 }
 
@@ -644,7 +814,6 @@ async function runAutomationTask(
   { stopAfterSubmit = false, sharedPortnetPage = null } = {},
 ) {
   const { id, folderPath } = acheminement;
-  const PortnetLogin = require("../src/portnet/portnetLogin");
 
   sendLog("info", "Automation", `Starting automation for: ${id}`);
   sendProgress(id, "running");
@@ -668,7 +837,6 @@ async function runAutomationTask(
     return await finalizeAcceptedOnBadr(acheminement, checkpoint.badrRef);
   }
 
-  let ownPortnetApp = null;
   let portnetPage = sharedPortnetPage;
 
   try {
@@ -677,16 +845,8 @@ async function runAutomationTask(
       if (!prep.success) return prep;
 
       if (!portnetPage) {
-        ownPortnetApp = new PortnetLogin();
-        sendLog("info", "Portnet", "Launching Portnet login…");
         sendProgress(id, "captcha-waiting");
-        sendLog(
-          "info",
-          "Portnet",
-          ">>> Résolvez le CAPTCHA dans la fenêtre du navigateur <<<",
-        );
-        portnetPage = await ownPortnetApp.login();
-        sendLog("info", "Portnet", "Login confirmed.");
+        portnetPage = await ensurePortnetSession();
       }
 
       const submitResult = await submitPortnetPhase(
@@ -709,16 +869,8 @@ async function runAutomationTask(
     }
 
     if (!portnetPage) {
-      ownPortnetApp = new PortnetLogin();
-      sendLog("info", "Portnet", "Launching Portnet login…");
       sendProgress(id, "captcha-waiting");
-      sendLog(
-        "info",
-        "Portnet",
-        ">>> Résolvez le CAPTCHA dans la fenêtre du navigateur <<<",
-      );
-      portnetPage = await ownPortnetApp.login();
-      sendLog("info", "Portnet", "Login confirmed.");
+      portnetPage = await ensurePortnetSession();
     }
 
     await monitorPendingPortnetRequests([acheminement], portnetPage);
@@ -736,14 +888,10 @@ async function runAutomationTask(
     sendLog("error", "Automation", `Failed for "${id}": ${err.message}`);
     sendProgress(id, "error", { error: err.message });
     return { success: false, error: err.message };
-  } finally {
-    if (ownPortnetApp) await ownPortnetApp.close().catch(() => {});
   }
 }
 
 async function runAllAutomationTasks(acheminements) {
-  const PortnetLogin = require("../src/portnet/portnetLogin");
-  let portnetApp = null;
   let portnetPage = null;
 
   try {
@@ -754,15 +902,7 @@ async function runAllAutomationTasks(acheminements) {
     });
 
     if (needsPortnet) {
-      portnetApp = new PortnetLogin();
-      sendLog("info", "Portnet", "Launching Portnet login for batch run…");
-      sendLog(
-        "info",
-        "Portnet",
-        ">>> Résolvez le CAPTCHA dans la fenêtre du navigateur <<<",
-      );
-      portnetPage = await portnetApp.login();
-      sendLog("info", "Portnet", "Batch Portnet login confirmed.");
+      portnetPage = await ensurePortnetSession();
     }
 
     for (const ach of toProcess) {
@@ -805,8 +945,9 @@ async function runAllAutomationTasks(acheminements) {
     }
 
     return { success: true };
-  } finally {
-    if (portnetApp) await portnetApp.close().catch(() => {});
+  } catch (err) {
+    sendLog("error", "Automation", `Batch run failed: ${err.message}`);
+    return { success: false, error: err.message };
   }
 }
 
@@ -926,4 +1067,13 @@ ipcMain.handle("automation:run", async (_event, acheminement) => {
 
 ipcMain.handle("automation:run-all", async (_event, acheminements) => {
   return await runAllAutomationTasks(acheminements || []);
+});
+
+ipcMain.handle("automation:close-sessions", async () => {
+  await closeSharedSessions();
+  return { success: true };
+});
+
+app.on("before-quit", async () => {
+  await closeSharedSessions();
 });
