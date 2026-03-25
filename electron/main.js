@@ -754,15 +754,14 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
           refDsRaw,
           createdAtRaw,
           numeroManifesteRaw,
-        } =
-          await dsCombine.getConsultationStatus(state.portnetRef, {
-            submittedAt: state.submittedAt || null,
-            excludeRefDs: Array.from(claimedAcceptedRefs),
-            anchorCreatedAtRaw: state.consultationCreatedAtRaw || null,
-            preferNewest:
-              !state.consultationCreatedAtRaw &&
-              state.phase === "portnet_sent_waiting",
-          });
+        } = await dsCombine.getConsultationStatus(state.portnetRef, {
+          submittedAt: state.submittedAt || null,
+          excludeRefDs: Array.from(claimedAcceptedRefs),
+          anchorCreatedAtRaw: state.consultationCreatedAtRaw || null,
+          preferNewest:
+            !state.consultationCreatedAtRaw &&
+            state.phase === "portnet_sent_waiting",
+        });
 
         updateAutomationState(ach.folderPath, {
           attempts,
@@ -797,7 +796,10 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
           `Current status for ${state.portnetRef}: ${statusText}`,
         );
 
-        if (isEnvoyeeStatus(statusText) && state.phase !== "portnet_submitted") {
+        if (
+          isEnvoyeeStatus(statusText) &&
+          state.phase !== "portnet_submitted"
+        ) {
           updateAutomationState(ach.folderPath, {
             phase: "portnet_submitted",
             submittedConfirmedAt: new Date().toISOString(),
@@ -934,9 +936,10 @@ async function runAutomationTask(
         return submitResult;
       }
     } else {
-      const resumeStatus = checkpoint.phase === "portnet_submitted"
-        ? "portnet-submitted"
-        : "monitoring-portnet";
+      const resumeStatus =
+        checkpoint.phase === "portnet_submitted"
+          ? "portnet-submitted"
+          : "monitoring-portnet";
       sendLog(
         "info",
         "Automation",
@@ -994,9 +997,10 @@ async function runAllAutomationTasks(acheminements) {
         continue;
       }
       if (hasSubmittedPortnet && !hasAcceptedPortnet) {
-        const resumeStatus = checkpoint.phase === "portnet_submitted"
-          ? "portnet-submitted"
-          : "monitoring-portnet";
+        const resumeStatus =
+          checkpoint.phase === "portnet_submitted"
+            ? "portnet-submitted"
+            : "monitoring-portnet";
         sendLog(
           "info",
           "Automation",
