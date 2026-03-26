@@ -816,15 +816,23 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
         }
 
         if (isAcceptedStatus(statusText)) {
-          const shortRef = String(refDsRaw || "")
-            .substring(10)
-            .replace(/^0+/, "");
+          const fullRefDs = String(refDsRaw || "").trim();
+          const shortRef = fullRefDs.substring(10).replace(/^0+/, "");
 
-          if (!shortRef) {
+          if (!shortRef || !fullRefDs) {
             sendLog(
               "warn",
               "Portnet",
-              `Acceptée found for ${state.portnetRef} but Réference DS is still empty/undefined (createdAt=${createdAtRaw || "n/a"}). Waiting next poll...`,
+              `Acceptée found for ${state.portnetRef} but refDsMead extraction failed (raw="${fullRefDs}", createdAt=${createdAtRaw || "n/a"}, manifeste=${numeroManifesteRaw || "n/a"}). Waiting next poll...`,
+            );
+            continue;
+          }
+
+          if (claimedAcceptedRefs.has(shortRef)) {
+            sendLog(
+              "info",
+              "Portnet",
+              `Acceptée found for ${state.portnetRef} with refDsMead=${shortRef}, but already claimed by another LTA. Skipping...`,
             );
             continue;
           }

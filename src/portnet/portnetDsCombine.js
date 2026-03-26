@@ -1089,6 +1089,47 @@ class PortnetDsCombine {
     return Number.isFinite(ts) ? ts : null;
   }
 
+  async _extractRefDsMead(row) {
+    const log = createLogger("PortnetConsultation");
+
+    // Strategy 1: aria-label (most reliable)
+    let value =
+      (await row
+        .locator('div[data-field="refDsMead"] div[aria-label]')
+        .getAttribute("aria-label")
+        .catch(() => "")) || "";
+
+    if (value && value.trim()) return value.trim();
+
+    // Strategy 2: text content from first div
+    value =
+      (await row
+        .locator('div[data-field="refDsMead"] div')
+        .first()
+        .textContent()
+        .catch(() => "")) || "";
+
+    if (value && value.trim()) return value.trim();
+
+    // Strategy 3: innerText with deeper nesting
+    value =
+      (await row
+        .locator('div[data-field="refDsMead"]')
+        .innerText()
+        .catch(() => "")) || "";
+
+    if (value && value.trim()) return value.trim();
+
+    // Debugging: log cell HTML if all strategies fail
+    const cellHtml = await row
+      .locator('div[data-field="refDsMead"]')
+      .innerHTML()
+      .catch(() => "N/A");
+    log.warn(`Failed to extract refDsMead. Cell HTML: ${cellHtml}`);
+
+    return "";
+  }
+
   _normalizeRefDs(refDsRaw) {
     const raw = String(refDsRaw || "").trim();
     if (!raw || raw === "undefined") return "";
@@ -1144,11 +1185,8 @@ class PortnetDsCombine {
           .getAttribute("aria-label")
           .catch(() => "")) || "";
 
-      const refDsRaw =
-        (await row
-          .locator('div[data-field="refDsMead"] div[aria-label]')
-          .getAttribute("aria-label")
-          .catch(() => "")) || "";
+      let refDsRaw = await this._extractRefDsMead(row);
+      refDsRaw = String(refDsRaw || "").trim();
 
       const createdAtRaw =
         (await row
@@ -1174,23 +1212,33 @@ class PortnetDsCombine {
     }
 
     if (anchorCreatedAtRaw) {
-      const anchored = allMatches.find(
+      // Find all rows matching the anchor timestamp
+      const anchoredRows = allMatches.filter(
         (m) => String(m.createdAtRaw || "").trim() === anchorCreatedAtRaw,
       );
 
-      if (anchored) {
-        const anchoredAccepted =
-          (anchored.statusText === "Acceptée" ||
-            anchored.statusText === "Acceptee") &&
-          anchored.refDsShort &&
-          !excludeRefDs.has(anchored.refDsShort);
+      if (anchoredRows.length > 0) {
+        // Prefer a row that is Acceptée AND has non-empty refDsRaw
+        const acceptedRow = anchoredRows.find(
+          (m) =>
+            (m.statusText === "Acceptée" || m.statusText === "Acceptee") &&
+            m.refDsRaw &&
+            m.refDsRaw.trim(),
+        );
+
+        const target = acceptedRow || anchoredRows[0];
+        const targetAccepted =
+          (target.statusText === "Acceptée" ||
+            target.statusText === "Acceptee") &&
+          target.refDsShort &&
+          !excludeRefDs.has(target.refDsShort);
 
         return {
           found: true,
-          statusText: anchored.statusText || "",
-          refDsRaw: anchoredAccepted ? anchored.refDsRaw : "",
-          createdAtRaw: anchored.createdAtRaw || "",
-          numeroManifesteRaw: anchored.numeroManifesteRaw || "",
+          statusText: target.statusText || "",
+          refDsRaw: targetAccepted ? target.refDsRaw : "",
+          createdAtRaw: target.createdAtRaw || "",
+          numeroManifesteRaw: target.numeroManifesteRaw || "",
           matchesCount: matchCount,
         };
       }
