@@ -1090,42 +1090,49 @@ class PortnetDsCombine {
   }
 
   async _extractRefDsMead(row) {
-    const log = createLogger("PortnetConsultation");
+    const cellLocator = row.locator('div[data-field="refDsMead"]');
 
-    // Strategy 1: aria-label (most reliable)
+    // Wait for cell to be visible first
+    await cellLocator
+      .waitFor({ state: "visible", timeout: 5000 })
+      .catch(() => {});
+
+    // Strategy 1: aria-label on the tooltip/text container div
     let value =
-      (await row
-        .locator('div[data-field="refDsMead"] div[aria-label]')
+      (await cellLocator
+        .locator("div[aria-label]")
+        .first()
         .getAttribute("aria-label")
         .catch(() => "")) || "";
 
     if (value && value.trim()) return value.trim();
 
-    // Strategy 2: text content from first div
+    // Strategy 1b: aria-label directly on the cell itself
     value =
-      (await row
-        .locator('div[data-field="refDsMead"] div')
-        .first()
-        .textContent()
+      (await cellLocator.getAttribute("aria-label").catch(() => "")) || "";
+    if (value && value.trim()) return value.trim();
+
+    // Strategy 2: textContent
+    value = (await cellLocator.textContent().catch(() => "")) || "";
+    if (value && value.trim()) return value.trim();
+
+    // Strategy 3: innerText
+    value = (await cellLocator.innerText().catch(() => "")) || "";
+    if (value && value.trim()) return value.trim();
+
+    // Strategy 4: evaluate with JavaScript in case rendering is delayed
+    value =
+      (await cellLocator
+        .evaluate((el) => {
+          // Try aria-label on children first
+          const labeled = el.querySelector("[aria-label]");
+          if (labeled?.ariaLabel) return labeled.ariaLabel;
+          // Try textContent
+          return el.textContent?.trim() || "";
+        })
         .catch(() => "")) || "";
 
     if (value && value.trim()) return value.trim();
-
-    // Strategy 3: innerText with deeper nesting
-    value =
-      (await row
-        .locator('div[data-field="refDsMead"]')
-        .innerText()
-        .catch(() => "")) || "";
-
-    if (value && value.trim()) return value.trim();
-
-    // Debugging: log cell HTML if all strategies fail
-    const cellHtml = await row
-      .locator('div[data-field="refDsMead"]')
-      .innerHTML()
-      .catch(() => "N/A");
-    log.warn(`Failed to extract refDsMead. Cell HTML: ${cellHtml}`);
 
     return "";
   }
@@ -1140,10 +1147,23 @@ class PortnetDsCombine {
   }
 
   async getConsultationStatus(portnetRef, options = {}) {
+    /**
+     * Consultation status lookup with deterministic row anchoring.
+     * @param {string} portnetRef - DS Combined reference to find
+     * @param {object} options
+     *   - submittedAt: ISO timestamp for time-window matching
+     *   - excludeRefDs: array of refDsMead already claimed
+     *   - anchorCreatedAtRaw: "DD-MM-YYYY HH:MM" to lock on specific row (when shared dsReference)
+     *   - anchorNumeroManifesteRaw: manifeste ID to disambiguate rows with same createdAt
+     *   - preferNewest: if multi candidates, prefer latest (ignores time-window)
+     */
     const submittedAtTs = options.submittedAt
       ? new Date(options.submittedAt).getTime()
       : null;
     const anchorCreatedAtRaw = String(options.anchorCreatedAtRaw || "").trim();
+    const anchorNumeroManifesteRaw = String(
+      options.anchorNumeroManifesteRaw || "",
+    ).trim();
     const preferNewest = options.preferNewest === true;
     const excludeRefDs = new Set(
       (options.excludeRefDs || [])
@@ -1212,21 +1232,40 @@ class PortnetDsCombine {
     }
 
     if (anchorCreatedAtRaw) {
-      // Find all rows matching the anchor timestamp
+      // Find rows matching the anchor timestamp
       const anchoredRows = allMatches.filter(
         (m) => String(m.createdAtRaw || "").trim() === anchorCreatedAtRaw,
       );
 
       if (anchoredRows.length > 0) {
-        // Prefer a row that is Acceptée AND has non-empty refDsRaw
-        const acceptedRow = anchoredRows.find(
-          (m) =>
-            (m.statusText === "Acceptée" || m.statusText === "Acceptee") &&
-            m.refDsRaw &&
-            m.refDsRaw.trim(),
-        );
+        let target = null;
 
-        const target = acceptedRow || anchoredRows[0];
+        // If we have a manifeste anchor too, use it as primary key
+        if (options.anchorNumeroManifesteRaw) {
+          const manifesteAnchor = String(
+            options.anchorNumeroManifesteRaw || "",
+          ).trim();
+          target = anchoredRows.find(
+            (m) =>
+              String(m.numeroManifesteRaw || "").trim() === manifesteAnchor,
+          );
+        }
+
+        // Fallback: prefer Acceptée row with non-empty refDsRaw
+        if (!target) {
+          target = anchoredRows.find(
+            (m) =>
+              (m.statusText === "Acceptée" || m.statusText === "Acceptee") &&
+              m.refDsRaw &&
+              m.refDsRaw.trim(),
+          );
+        }
+
+        // Final fallback: just take first anchored row
+        if (!target) {
+          target = anchoredRows[0];
+        }
+
         const targetAccepted =
           (target.statusText === "Acceptée" ||
             target.statusText === "Acceptee") &&

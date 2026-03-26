@@ -758,6 +758,7 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
           submittedAt: state.submittedAt || null,
           excludeRefDs: Array.from(claimedAcceptedRefs),
           anchorCreatedAtRaw: state.consultationCreatedAtRaw || null,
+          anchorNumeroManifesteRaw: state.consultationNumeroManifeste || null,
           preferNewest:
             !state.consultationCreatedAtRaw &&
             state.phase === "portnet_sent_waiting",
@@ -786,7 +787,7 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
           sendLog(
             "info",
             "Portnet",
-            `Anchored consultation row for "${ach.id}" at createdAt=${createdAtRaw}${numeroManifesteRaw ? `, manifeste=${numeroManifesteRaw}` : ""}.`,
+            `Anchored consultation row for "${ach.id}" at createdAt=${createdAtRaw}, manifeste=${numeroManifesteRaw || "N/A"} (will use manifeste to disambiguate if multiple rows share timestamp).`,
           );
         }
 
@@ -888,6 +889,9 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
       );
       await portnetPage.waitForTimeout(waitMs);
       await portnetPage.reload({ waitUntil: "networkidle" });
+
+      // Re-apply sort after reload (sort is lost when page reloads)
+      await dsCombine._ensureConsultationSortedByCreatedAtDesc();
     }
   } finally {
     clearInterval(badrRefreshInterval);
