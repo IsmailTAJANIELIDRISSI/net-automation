@@ -565,7 +565,7 @@ async function submitPortnetPhase(acheminement, lotInfo, portnetPage) {
   sendProgress(id, "filling-form");
 
   const dsCombine = new PortnetDsCombine(portnetPage);
-  await dsCombine.fillEntete({
+  const fillResult = await dsCombine.fillEntete({
     sequenceNum: lotInfo.sequenceNum,
     refNumber: refNumber || undefined,
     lieuChargement: lieuChargement || undefined,
@@ -582,6 +582,30 @@ async function submitPortnetPhase(acheminement, lotInfo, portnetPage) {
       poidTotal ||
       undefined,
   });
+
+  if (fillResult?.stoppedAfterAnnexCompression) {
+    updateAutomationState(folderPath, {
+      phase: "annexe_compression_debug_stop",
+      error: null,
+      compressedOutputDir: fillResult.compressedOutputDir || null,
+      updatedAt: new Date().toISOString(),
+    });
+    sendLog(
+      "warn",
+      "Portnet",
+      `Debug stop after annexe compression for "${id}". Files available in "${fillResult.compressedOutputDir || folderPath}". Submission intentionally skipped.`,
+    );
+    sendProgress(id, "running", {
+      debugStop: true,
+      compressedOutputDir: fillResult.compressedOutputDir || folderPath,
+    });
+    return {
+      success: true,
+      skipped: true,
+      debugStop: true,
+      compressedOutputDir: fillResult.compressedOutputDir || folderPath,
+    };
+  }
 
   sendLog("info", "Portnet", `Submitting request for "${id}"…`);
   sendProgress(id, "submitting-portnet");
