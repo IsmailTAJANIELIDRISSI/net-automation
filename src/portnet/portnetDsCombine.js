@@ -27,6 +27,13 @@ const { createLogger } = require("../utils/logger");
 
 const log = createLogger("PortnetDsCombine");
 
+// Temporary debug mode: keep compressed files in each LTA folder and stop
+// the workflow right after compression (before Annexe upload).
+const STOP_AFTER_ANNEX_COMPRESSION =
+  String(
+    process.env.PORTNET_STOP_AFTER_ANNEX_COMPRESSION || "true",
+  ).toLowerCase() === "true";
+
 const TIMEOUT = config.timeout;
 const FORM_CFG = config.portnet.form;
 
@@ -604,6 +611,7 @@ class PortnetDsCombine {
    */
   async fillAnnexe(folderPath) {
     const f = this.frame;
+    const compressedOutputDir = path.join(folderPath, "compressed");
 
     // Wait for the Annexe section to render after Connaissement Ajouter
     await f
@@ -659,6 +667,25 @@ class PortnetDsCombine {
       const uploadPath = this._compressPdfIfNeeded(fullPath);
       const uploadSizeKB = (fs.statSync(uploadPath).size / 1024).toFixed(0);
 
+      // Always persist the prepared (compressed or original) document in
+      // <current LTA>/compressed for manual verification.
+      fs.mkdirSync(compressedOutputDir, { recursive: true });
+      const baseName = path.parse(matched).name;
+      const savedCompressedPath = path.join(
+        compressedOutputDir,
+        `${baseName}_compressed.pdf`,
+      );
+      fs.copyFileSync(uploadPath, savedCompressedPath);
+      log.info(`Annexe: saved prepared file to "${savedCompressedPath}"`);
+
+      // Debug stop mode: stop right after compression/save, before upload.
+      if (STOP_AFTER_ANNEX_COMPRESSION) {
+        log.warn(
+          `Annexe debug stop active. Skipping upload for "${matched}" after compression.`,
+        );
+        return { stoppedAfterCompression: true };
+      }
+
       log.info(
         `Annexe: uploading "${matched}" (${uploadSizeKB} KB) as ${label}`,
       );
@@ -713,10 +740,12 @@ class PortnetDsCombine {
         );
       }
       await this.page.waitForTimeout(500);
+
+      return { stoppedAfterCompression: false };
     };
 
     // 1. Manifeste → A0006 - FACTURE (data-value="1")  → expect 1 row
-    await uploadFile(
+    const manifestResult = await uploadFile(
       "1",
       (n) => n.startsWith("manifest") || n.startsWith("manifeste"),
       "A0006 - FACTURE",
@@ -724,14 +753,25 @@ class PortnetDsCombine {
     );
 
     // 2. MAWB → A0004 - TITRE DE PROPRIÉTÉ ET/OU DE TRANSPORT (data-value="7") → expect 2 rows
-    await uploadFile(
+    const mawbResult = await uploadFile(
       "7",
       (n) => n.startsWith("mawb"),
       "A0004 - TITRE DE TRANSPORT",
       2,
     );
 
+    if (
+      manifestResult?.stoppedAfterCompression ||
+      mawbResult?.stoppedAfterCompression
+    ) {
+      log.warn(
+        `Annexe debug stop active. Prepared files are available in "${compressedOutputDir}".`,
+      );
+      return { stoppedAfterCompression: true, compressedOutputDir };
+    }
+
     log.info("Annexe: both documents uploaded and verified in grid");
+    return { stoppedAfterCompression: false, compressedOutputDir };
   }
 
   // ── Demandes diverses section ───────────────────────────────────────────────
@@ -968,7 +1008,13 @@ class PortnetDsCombine {
 
     // ── Annexe section ───────────────────────────────────────────────────────
     if (formData.folderPath) {
-      await this.fillAnnexe(formData.folderPath);
+      const annexeResult = await this.fillAnnexe(formData.folderPath);
+      if (annexeResult?.stoppedAfterCompression) {
+        log.warn(
+          `Stopping flow after annexe compression debug mode. Check files in "${annexeResult.compressedOutputDir}".`,
+        );
+        return;
+      }
     } else {
       log.warn("No folderPath in formData – skipping Annexe upload");
     }
