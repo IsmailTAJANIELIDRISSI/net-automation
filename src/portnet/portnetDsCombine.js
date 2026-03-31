@@ -626,40 +626,88 @@ class PortnetDsCombine {
       `PDF compress: "${path.basename(filePath)}" is ${sizeMB} MB – compressing…`,
     );
 
-    const ilovePublic = String(process.env.ILOVEPDF_PUBLIC_KEY || "").trim();
-    const iloveSecret = String(process.env.ILOVEPDF_SECRET_KEY || "").trim();
+    const ilovePrimaryPublic = String(
+      process.env.ILOVEPDF_PUBLIC_KEY || "",
+    ).trim();
+    const ilovePrimarySecret = String(
+      process.env.ILOVEPDF_SECRET_KEY || "",
+    ).trim();
+    const ilovePartnerPublic = String(
+      process.env.ILOVEPDF_PARTNER_PUBLIC_KEY || "",
+    ).trim();
+    const ilovePartnerSecret = String(
+      process.env.ILOVEPDF_PARTNER_SECRET_KEY || "",
+    ).trim();
 
-    if (ilovePublic && iloveSecret) {
+    const iloveAccounts = [];
+    if (ilovePrimaryPublic && ilovePrimarySecret) {
+      iloveAccounts.push({
+        label: "primary",
+        publicKey: ilovePrimaryPublic,
+        secretKey: ilovePrimarySecret,
+      });
+    }
+    if (ilovePartnerPublic && ilovePartnerSecret) {
+      iloveAccounts.push({
+        label: "partner",
+        publicKey: ilovePartnerPublic,
+        secretKey: ilovePartnerSecret,
+      });
+    }
+
+    if (iloveAccounts.length > 0) {
       try {
-        const iloveOutPath = await this._compressViaIlovepdf(
-          filePath,
-          ilovePublic,
-          iloveSecret,
-        );
-        if (iloveOutPath && fs.existsSync(iloveOutPath)) {
-          const outMB = (fs.statSync(iloveOutPath).size / (1024 * 1024)).toFixed(
-            1,
+        let lastLimitError = null;
+        let lastNonLimitError = null;
+
+        for (const account of iloveAccounts) {
+          try {
+            const iloveOutPath = await this._compressViaIlovepdf(
+              filePath,
+              account.publicKey,
+              account.secretKey,
+            );
+            if (iloveOutPath && fs.existsSync(iloveOutPath)) {
+              const outMB = (
+                fs.statSync(iloveOutPath).size /
+                (1024 * 1024)
+              ).toFixed(1);
+              log.info(
+                `PDF compress (iLovePDF:${account.label}): ✓ compressed to ${outMB} MB → "${iloveOutPath}"`,
+              );
+              return iloveOutPath;
+            }
+          } catch (err) {
+            if (this._isIlovePdfLimitError(err)) {
+              lastLimitError = err;
+              log.warn(
+                `PDF compress (iLovePDF:${account.label}) limit reached: ${err?.message || "unknown error"}`,
+              );
+              continue;
+            }
+            lastNonLimitError = err;
+            log.warn(
+              `PDF compress (iLovePDF:${account.label}) failed: ${err?.message || "unknown error"} – trying fallback`,
+            );
+            break;
+          }
+        }
+
+        if (lastLimitError && !lastNonLimitError) {
+          throw new Error(
+            `iLovePDF compression limit reached on all configured accounts for "${path.basename(filePath)}". ` +
+              "Upload and Portnet submission were blocked intentionally. " +
+              "Please renew quota/credits or compress manually, then retry.",
           );
-          log.info(
-            `PDF compress (iLovePDF): ✓ compressed to ${outMB} MB → "${iloveOutPath}"`,
-          );
-          return iloveOutPath;
         }
       } catch (err) {
-        if (this._isIlovePdfLimitError(err)) {
-          throw new Error(
-            `iLovePDF compression limit reached for "${path.basename(filePath)}". ` +
-              "Upload and Portnet submission were blocked intentionally. " +
-              "Please renew iLovePDF quota/credits or compress manually, then retry.",
-          );
-        }
         log.warn(
           `PDF compress (iLovePDF) failed: ${err?.message || "unknown error"} – fallback to Ghostscript`,
         );
       }
     } else {
       log.info(
-        "PDF compress: ILOVEPDF keys not configured – using Ghostscript fallback",
+        "PDF compress: ILOVEPDF keys not configured (primary/partner) – using Ghostscript fallback",
       );
     }
 
