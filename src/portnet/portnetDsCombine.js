@@ -34,6 +34,8 @@ const STOP_AFTER_ANNEX_COMPRESSION =
     process.env.PORTNET_STOP_AFTER_ANNEX_COMPRESSION || "true",
   ).toLowerCase() === "true";
 
+const GS_TIMEOUT_MS = Number(process.env.PORTNET_GS_TIMEOUT_MS || 180000);
+
 const TIMEOUT = config.timeout;
 const FORM_CFG = config.portnet.form;
 
@@ -566,8 +568,8 @@ class PortnetDsCombine {
     // Ghostscript candidates (Windows 64-bit, 32-bit, POSIX)
     const gsCandidates = ["gswin64c", "gswin32c", "gs"];
 
-    // Try quality levels from best→smallest until the result fits
-    const qualities = ["/ebook", "/screen"];
+    // Progressive compression levels: least to most aggressive.
+    const qualities = ["/printer", "/ebook", "/screen"];
     let bestValidOutPath = null;
     let bestValidOutSize = Number.POSITIVE_INFINITY;
 
@@ -591,7 +593,7 @@ class PortnetDsCombine {
               `-sOutputFile=${outPath}`,
               filePath,
             ],
-            { timeout: 60000 },
+            { timeout: GS_TIMEOUT_MS },
           );
 
           if (!fs.existsSync(outPath)) continue;
@@ -730,6 +732,7 @@ class PortnetDsCombine {
       // Compress to ≤ 2 MB if needed (uses Ghostscript)
       const uploadPath = this._compressPdfIfNeeded(fullPath);
       const uploadSizeKB = (fs.statSync(uploadPath).size / 1024).toFixed(0);
+      const sourceUsed = uploadPath === fullPath ? "original" : "compressed";
 
       // Always persist the prepared (compressed or original) document in
       // <current LTA>/compressed for manual verification.
@@ -740,7 +743,9 @@ class PortnetDsCombine {
         `${baseName}_compressed.pdf`,
       );
       fs.copyFileSync(uploadPath, savedCompressedPath);
-      log.info(`Annexe: saved prepared file to "${savedCompressedPath}"`);
+      log.info(
+        `Annexe: saved prepared file to "${savedCompressedPath}" (source=${sourceUsed}, size=${uploadSizeKB} KB)`,
+      );
 
       // Debug stop mode: stop right after compression/save, before upload.
       if (STOP_AFTER_ANNEX_COMPRESSION) {

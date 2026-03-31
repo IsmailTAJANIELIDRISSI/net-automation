@@ -968,6 +968,9 @@ async function runAutomationTask(
         prep.lotInfo,
         portnetPage,
       );
+      if (submitResult?.debugStop) {
+        return submitResult;
+      }
       if (!submitResult.success || stopAfterSubmit) {
         return submitResult;
       }
