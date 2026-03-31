@@ -21,11 +21,13 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { execFileSync } = require("child_process");
+const { execFile } = require("child_process");
+const { promisify } = require("util");
 const config = require("../config/config");
 const { createLogger } = require("../utils/logger");
 
 const log = createLogger("PortnetDsCombine");
+const execFileAsync = promisify(execFile);
 
 // Temporary debug mode: keep compressed files in each LTA folder and stop
 // the workflow right after compression (before Annexe upload).
@@ -34,7 +36,21 @@ const STOP_AFTER_ANNEX_COMPRESSION =
     process.env.PORTNET_STOP_AFTER_ANNEX_COMPRESSION || "true",
   ).toLowerCase() === "true";
 
-const GS_TIMEOUT_MS = Number(process.env.PORTNET_GS_TIMEOUT_MS || 180000);
+const GS_TIMEOUT_MS = Math.max(
+  Number(process.env.PORTNET_GS_TIMEOUT_MS || 180000),
+  180000,
+);
+const GS_TIMEOUT_PER_MB_MS = Math.max(
+  Number(process.env.PORTNET_GS_TIMEOUT_PER_MB_MS || 12000),
+  5000,
+);
+const GS_PROFILE = String(process.env.PORTNET_GS_PROFILE || "fast")
+  .trim()
+  .toLowerCase();
+const GS_LARGE_FILE_MB = Math.max(
+  Number(process.env.PORTNET_GS_LARGE_FILE_MB || 10),
+  5,
+);
 
 const TIMEOUT = config.timeout;
 const FORM_CFG = config.portnet.form;
@@ -548,14 +564,46 @@ class PortnetDsCombine {
     }
   }
 
+  _resolveGhostscriptExecutables() {
+    const envPath = String(process.env.PORTNET_GS_PATH || "").trim();
+    const candidates = [];
+
+    if (envPath) candidates.push(envPath);
+
+    if (process.platform === "win32") {
+      const pf64 =
+        process.env["ProgramW6432"] ||
+        process.env["ProgramFiles"] ||
+        "C:\\Program Files";
+      const pf32 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+      const known = [
+        path.join(pf64, "gs", "gs10.05.1", "bin", "gswin64c.exe"),
+        path.join(pf64, "gs", "gs10.04.0", "bin", "gswin64c.exe"),
+        path.join(pf64, "gs", "gs10.03.1", "bin", "gswin64c.exe"),
+        path.join(pf64, "gs", "gs10.03.0", "bin", "gswin64c.exe"),
+        path.join(pf64, "gs", "gs10.02.1", "bin", "gswin64c.exe"),
+        path.join(pf64, "gs", "gs10.01.2", "bin", "gswin64c.exe"),
+        path.join(pf64, "gs", "gs10.01.1", "bin", "gswin64c.exe"),
+        path.join(pf64, "gs", "gs10.01.0", "bin", "gswin64c.exe"),
+        path.join(pf64, "gs", "gs10.00.0", "bin", "gswin64c.exe"),
+        path.join(pf32, "gs", "gs10.05.1", "bin", "gswin32c.exe"),
+      ];
+      for (const p of known) {
+        if (fs.existsSync(p)) candidates.push(p);
+      }
+    }
+
+    candidates.push("gswin64c", "gswin32c", "gs");
+
+    return [...new Set(candidates)];
+  }
+
   /**
-   * If `filePath` is larger than 2 MB, run Ghostscript to compress it and
-   * return the path to a temp-directory copy.  Otherwise returns the original
-   * path unchanged.  Tries multiple GS executable names for Windows / macOS /
-   * Linux.  If GS is not found or compression fails, returns the original path
-   * (the upload will likely be rejected by Portnet, but we log a clear warning).
+   * Compress a PDF to <= 2 MB.
+   * Primary: iLovePDF API (fast and stable for large scanned files).
+   * Fallback: local Ghostscript with explicit downsampling flags.
    */
-  _compressPdfIfNeeded(filePath) {
+  async _compressPdfIfNeeded(filePath) {
     const MAX_BYTES = 2 * 1024 * 1024; // 2 MB
     const sizeBytes = fs.statSync(filePath).size;
     if (sizeBytes <= MAX_BYTES) return filePath;
@@ -565,11 +613,91 @@ class PortnetDsCombine {
       `PDF compress: "${path.basename(filePath)}" is ${sizeMB} MB – compressing…`,
     );
 
-    // Ghostscript candidates (Windows 64-bit, 32-bit, POSIX)
-    const gsCandidates = ["gswin64c", "gswin32c", "gs"];
+    const ilovePublic = String(process.env.ILOVEPDF_PUBLIC_KEY || "").trim();
+    const iloveSecret = String(process.env.ILOVEPDF_SECRET_KEY || "").trim();
 
-    // Progressive compression levels: least to most aggressive.
-    const qualities = ["/printer", "/ebook", "/screen"];
+    if (ilovePublic && iloveSecret) {
+      try {
+        const iloveOutPath = await this._compressViaIlovepdf(
+          filePath,
+          ilovePublic,
+          iloveSecret,
+        );
+        if (iloveOutPath && fs.existsSync(iloveOutPath)) {
+          const outMB = (fs.statSync(iloveOutPath).size / (1024 * 1024)).toFixed(
+            1,
+          );
+          log.info(
+            `PDF compress (iLovePDF): ✓ compressed to ${outMB} MB → "${iloveOutPath}"`,
+          );
+          return iloveOutPath;
+        }
+      } catch (err) {
+        log.warn(
+          `PDF compress (iLovePDF) failed: ${err?.message || "unknown error"} – fallback to Ghostscript`,
+        );
+      }
+    } else {
+      log.info(
+        "PDF compress: ILOVEPDF keys not configured – using Ghostscript fallback",
+      );
+    }
+
+    return this._compressViaGhostscript(filePath, sizeBytes, MAX_BYTES);
+  }
+
+  async _compressViaIlovepdf(filePath, publicKey, secretKey) {
+    const ILovePDFApi = require("@ilovepdf/ilovepdf-nodejs");
+    const ILovePDFFile = require("@ilovepdf/ilovepdf-nodejs/ILovePDFFile");
+
+    const api = new ILovePDFApi(publicKey, secretKey);
+    const task = api.newTask("compress");
+
+    await task.start();
+    await task.addFile(new ILovePDFFile(filePath));
+    await task.process({ compression_level: "extreme" });
+
+    const data = await task.download();
+    if (!data || !Buffer.isBuffer(data) || data.length < 32) {
+      throw new Error("Empty response from iLovePDF download");
+    }
+
+    const outPath = path.join(
+      os.tmpdir(),
+      `portnet_ilovepdf_${Date.now()}_${path.basename(filePath)}`,
+    );
+    fs.writeFileSync(outPath, data);
+
+    if (!this._isLikelyValidPdf(outPath)) {
+      try {
+        fs.unlinkSync(outPath);
+      } catch {}
+      throw new Error("iLovePDF returned an invalid PDF");
+    }
+
+    return outPath;
+  }
+
+  async _compressViaGhostscript(filePath, sizeBytes, maxBytes) {
+    const gsCandidates = this._resolveGhostscriptExecutables();
+    const sizeMBNum = sizeBytes / (1024 * 1024);
+    const timeoutMs = Math.max(
+      GS_TIMEOUT_MS,
+      Math.ceil(sizeMBNum) * GS_TIMEOUT_PER_MB_MS,
+    );
+
+    let qualities =
+      GS_PROFILE === "full"
+        ? ["/printer", "/ebook", "/screen"]
+        : ["/ebook", "/screen"];
+    if (GS_PROFILE !== "full" && sizeMBNum >= GS_LARGE_FILE_MB) {
+      qualities = ["/screen"];
+    }
+
+    log.info(
+      `PDF compress config: profile=${GS_PROFILE}, timeout=${timeoutMs}ms, qualities=${qualities.join(" -> ")}`,
+    );
+
     let bestValidOutPath = null;
     let bestValidOutSize = Number.POSITIVE_INFINITY;
 
@@ -577,30 +705,41 @@ class PortnetDsCombine {
       for (const quality of qualities) {
         const outPath = path.join(
           os.tmpdir(),
-          `portnet_compressed_${Date.now()}_${gsExe.replace(/\W/g, "")}_${quality.replace("/", "")}_${path.basename(filePath)}`,
+          `portnet_gs_${Date.now()}_${gsExe.replace(/\W/g, "")}_${quality.replace("/", "")}_${path.basename(filePath)}`,
         );
 
+        const colorRes = quality === "/screen" ? "72" : "150";
+        const grayRes = quality === "/screen" ? "72" : "150";
+
         try {
-          execFileSync(
+          await execFileAsync(
             gsExe,
             [
               "-sDEVICE=pdfwrite",
               "-dCompatibilityLevel=1.4",
               `-dPDFSETTINGS=${quality}`,
+              "-dDownsampleColorImages=true",
+              "-dDownsampleGrayImages=true",
+              "-dDownsampleMonoImages=true",
+              `-dColorImageResolution=${colorRes}`,
+              `-dGrayImageResolution=${grayRes}`,
+              "-dMonoImageResolution=300",
+              "-dDetectDuplicateImages=true",
+              "-dCompressFonts=true",
+              "-dSubsetFonts=true",
               "-dNOPAUSE",
               "-dQUIET",
               "-dBATCH",
               `-sOutputFile=${outPath}`,
               filePath,
             ],
-            { timeout: GS_TIMEOUT_MS },
+            { timeout: timeoutMs },
           );
 
           if (!fs.existsSync(outPath)) continue;
-
           if (!this._isLikelyValidPdf(outPath)) {
             log.warn(
-              `PDF compress: invalid/corrupt output detected (${gsExe}, ${quality}). Ignoring this file.`,
+              `PDF compress (GS): invalid/corrupt output detected (${gsExe}, ${quality})`,
             );
             try {
               fs.unlinkSync(outPath);
@@ -612,22 +751,26 @@ class PortnetDsCombine {
           const outMB = (outSize / (1024 * 1024)).toFixed(1);
 
           if (outSize < bestValidOutSize) {
-            bestValidOutSize = outSize;
+            if (bestValidOutPath && bestValidOutPath !== outPath) {
+              try {
+                fs.unlinkSync(bestValidOutPath);
+              } catch {}
+            }
             bestValidOutPath = outPath;
+            bestValidOutSize = outSize;
           }
 
-          if (outSize <= MAX_BYTES) {
+          if (outSize <= maxBytes) {
             log.info(
-              `PDF compress: ✓ compressed to ${outMB} MB (quality=${quality}) → "${outPath}"`,
+              `PDF compress (GS): ✓ compressed to ${outMB} MB (${quality}) → "${outPath}"`,
             );
             return outPath;
           }
-          // Too large – try next quality level (overwrite same outPath)
+
           log.info(
-            `PDF compress: ${outMB} MB with ${quality}, trying lower quality…`,
+            `PDF compress (GS): ${outMB} MB with ${quality}, trying lower quality…`,
           );
         } catch (err) {
-          // Timeout/process failure may leave a partial unreadable file; remove it.
           try {
             if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
           } catch {}
@@ -638,35 +781,34 @@ class PortnetDsCombine {
             stderrText.includes("not recognized") ||
             stderrText.includes("No such file or directory");
 
-          if (isMissingExecutable) {
-            // This GS executable not found – try the next candidate.
-            break;
-          }
+          if (isMissingExecutable) break;
+
+          const stderrSnippet = stderrText
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 400);
 
           log.warn(
-            `PDF compress attempt failed (${gsExe}, ${quality}): ${err?.message || "unknown error"}`,
+            `PDF compress (GS) attempt failed (${gsExe}, ${quality}, timeout=${timeoutMs}ms): ${err?.message || "unknown error"}${stderrSnippet ? ` | stderr: ${stderrSnippet}` : ""}`,
           );
         }
       }
     }
 
-    // If we got here, either no valid <=2MB output or no Ghostscript.
     if (bestValidOutPath && fs.existsSync(bestValidOutPath)) {
-      const outMB = (
-        fs.statSync(bestValidOutPath).size /
-        (1024 * 1024)
-      ).toFixed(1);
+      const outMB = (fs.statSync(bestValidOutPath).size / (1024 * 1024)).toFixed(
+        1,
+      );
       log.warn(
-        `PDF compress: valid result still ${outMB} MB after max compression – proceeding with valid file`,
+        `PDF compress (GS): best valid result is ${outMB} MB – proceeding with it`,
       );
       return bestValidOutPath;
     }
 
     log.warn(
-      "PDF compress: could not produce a valid compressed PDF. " +
-        "Using original file to avoid uploading a corrupted document.",
+      "PDF compress: all compression attempts failed – using original file",
     );
-    return filePath; // fall back to original
+    return filePath;
   }
 
   // ── Annexe section ─────────────────────────────────────────────────────────
@@ -730,7 +872,7 @@ class PortnetDsCombine {
       const fullPath = path.join(folderPath, matched);
 
       // Compress to ≤ 2 MB if needed (uses Ghostscript)
-      const uploadPath = this._compressPdfIfNeeded(fullPath);
+      const uploadPath = await this._compressPdfIfNeeded(fullPath);
       const uploadSizeKB = (fs.statSync(uploadPath).size / 1024).toFixed(0);
       const sourceUsed = uploadPath === fullPath ? "original" : "compressed";
 

@@ -21,6 +21,7 @@
   "license": "ISC",
   "description": "Playwright automation for BADR + Portnet DS Combinée workflow",
   "dependencies": {
+    "@ilovepdf/ilovepdf-nodejs": "^0.3.1",
     "dotenv": "^16.6.1",
     "nodemailer": "^8.0.1",
     "playwright": "^1.58.2",
