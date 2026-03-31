@@ -33,7 +33,7 @@ const execFileAsync = promisify(execFile);
 // the workflow right after compression (before Annexe upload).
 const STOP_AFTER_ANNEX_COMPRESSION =
   String(
-    process.env.PORTNET_STOP_AFTER_ANNEX_COMPRESSION || "true",
+    process.env.PORTNET_STOP_AFTER_ANNEX_COMPRESSION || "false",
   ).toLowerCase() === "true";
 
 const GS_TIMEOUT_MS = Math.max(
@@ -598,6 +598,19 @@ class PortnetDsCombine {
     return [...new Set(candidates)];
   }
 
+  _isIlovePdfLimitError(err) {
+    const text = String(err?.message || "").toLowerCase();
+    return (
+      text.includes("limit") ||
+      text.includes("quota") ||
+      text.includes("remaining files") ||
+      text.includes("insufficient credits") ||
+      text.includes("too many requests") ||
+      text.includes("402") ||
+      text.includes("rate limit")
+    );
+  }
+
   /**
    * Compress a PDF to <= 2 MB.
    * Primary: iLovePDF API (fast and stable for large scanned files).
@@ -633,6 +646,13 @@ class PortnetDsCombine {
           return iloveOutPath;
         }
       } catch (err) {
+        if (this._isIlovePdfLimitError(err)) {
+          throw new Error(
+            `iLovePDF compression limit reached for "${path.basename(filePath)}". ` +
+              "Upload and Portnet submission were blocked intentionally. " +
+              "Please renew iLovePDF quota/credits or compress manually, then retry.",
+          );
+        }
         log.warn(
           `PDF compress (iLovePDF) failed: ${err?.message || "unknown error"} – fallback to Ghostscript`,
         );
