@@ -1,0 +1,339 @@
+"use strict";
+
+/**
+ * Shared annex compression: iLovePDF (primary → partner → partner2) → Adobe → first+last fallback.
+ * Used by PortnetDsCombine and scripts/compress-pdf-chain.js.
+ *
+ * @param {string} inputPath - absolute path to source PDF
+ * @param {{ info?: Function, warn?: Function }} log - logger (e.g. Portnet logger)
+ * @returns {Promise<{ uploadPath: string, mode: 'original' | 'compressed' | 'first_last' }>}
+ */
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { PDFDocument } = require("pdf-lib");
+const {
+  ServicePrincipalCredentials,
+  PDFServices,
+  MimeType,
+  CompressPDFJob,
+  CompressPDFResult,
+  CompressPDFParams,
+  CompressionLevel,
+} = require("@adobe/pdfservices-node-sdk");
+
+const MAX_BYTES = 2 * 1024 * 1024;
+
+function mb(bytes) {
+  return (bytes / (1024 * 1024)).toFixed(2);
+}
+
+function isLikelyValidPdf(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size < 32) return false;
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const head = Buffer.alloc(8);
+      fs.readSync(fd, head, 0, 8, 0);
+      if (!head.toString("latin1").startsWith("%PDF-")) return false;
+      const tailLen = Math.min(4096, stat.size);
+      const tail = Buffer.alloc(tailLen);
+      fs.readSync(fd, tail, 0, tailLen, stat.size - tailLen);
+      return tail.toString("latin1").includes("%%EOF");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+function isIloveQuotaError(err) {
+  const code =
+    err?.response?.status ||
+    err?.statusCode ||
+    err?.status ||
+    (typeof err?.code === "number" ? err.code : null);
+  if (code === 401 || code === 402 || code === 429) return true;
+  const t = String(err?.message || err || "").toLowerCase();
+  return (
+    t.includes("limit") ||
+    t.includes("quota") ||
+    t.includes("remaining") ||
+    t.includes("insufficient") ||
+    t.includes("unauthorized")
+  );
+}
+
+function isAdobeLimitError(err) {
+  const t = String(err?.message || err || "").toLowerCase();
+  return (
+    t.includes("quota") ||
+    t.includes("limit") ||
+    t.includes("429") ||
+    t.includes("403") ||
+    t.includes("402") ||
+    t.includes("401")
+  );
+}
+
+async function compressViaIlove(filePath, label, publicKey, secretKey) {
+  const ILovePDFApi = require("@ilovepdf/ilovepdf-nodejs");
+  const ILovePDFFile = require("@ilovepdf/ilovepdf-nodejs/ILovePDFFile");
+
+  const api = new ILovePDFApi(publicKey, secretKey);
+  const task = api.newTask("compress");
+  await task.start();
+  await task.addFile(new ILovePDFFile(filePath));
+  await task.process({ compression_level: "extreme" });
+  const data = await task.download();
+  if (!Buffer.isBuffer(data) || data.length < 32) {
+    throw new Error("iLovePDF empty download");
+  }
+  const outPath = path.join(
+    os.tmpdir(),
+    `portnet_annex_ilove_${label}_${Date.now()}_${path.basename(filePath)}`,
+  );
+  fs.writeFileSync(outPath, data);
+  if (!isLikelyValidPdf(outPath)) {
+    try {
+      fs.unlinkSync(outPath);
+    } catch {}
+    throw new Error("iLovePDF invalid PDF");
+  }
+  return outPath;
+}
+
+async function compressViaAdobe(filePath, clientId, clientSecret) {
+  const credentials = new ServicePrincipalCredentials({
+    clientId,
+    clientSecret,
+  });
+  const pdfServices = new PDFServices({ credentials });
+
+  const readStream = fs.createReadStream(filePath);
+  try {
+    const inputAsset = await pdfServices.upload({
+      readStream,
+      mimeType: MimeType.PDF,
+    });
+
+    const params = new CompressPDFParams({
+      compressionLevel: CompressionLevel.HIGH,
+    });
+    const job = new CompressPDFJob({ inputAsset, params });
+
+    const pollingURL = await pdfServices.submit({ job });
+    const pdfServicesResponse = await pdfServices.getJobResult({
+      pollingURL,
+      resultType: CompressPDFResult,
+    });
+
+    const resultAsset = pdfServicesResponse.result.asset;
+    const streamAsset = await pdfServices.getContent({ asset: resultAsset });
+
+    const outPath = path.join(
+      os.tmpdir(),
+      `portnet_annex_adobe_${Date.now()}_${path.basename(filePath)}`,
+    );
+    await new Promise((resolve, reject) => {
+      const output = fs.createWriteStream(outPath);
+      streamAsset.readStream.on("error", reject);
+      output.on("error", reject);
+      output.on("finish", resolve);
+      streamAsset.readStream.pipe(output);
+    });
+
+    if (!isLikelyValidPdf(outPath)) {
+      try {
+        fs.unlinkSync(outPath);
+      } catch {}
+      throw new Error("Adobe returned invalid PDF");
+    }
+    return outPath;
+  } finally {
+    readStream.destroy();
+  }
+}
+
+async function writeFirstLastPagesToPath(inputPath, outputPath) {
+  const bytes = fs.readFileSync(inputPath);
+  const src = await PDFDocument.load(bytes);
+  const n = src.getPageCount();
+  if (n < 1) throw new Error("PDF has no pages");
+  const out = await PDFDocument.create();
+  const indexes = n === 1 ? [0] : [0, n - 1];
+  const pages = await out.copyPages(src, indexes);
+  for (const p of pages) out.addPage(p);
+  const outBytes = await out.save({ useObjectStreams: true, addDefaultPage: false });
+  fs.writeFileSync(outputPath, outBytes);
+}
+
+/**
+ * @param {string} inputPath
+ * @param {{ info?: Function, warn?: Function }} log
+ */
+async function compressPdfForAnnex(inputPath, log = {}) {
+  const L = {
+    info: typeof log.info === "function" ? log.info.bind(log) : console.log,
+    warn: typeof log.warn === "function" ? log.warn.bind(log) : console.warn,
+  };
+
+  const resolved = path.resolve(inputPath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`PDF not found: ${resolved}`);
+  }
+  if (!isLikelyValidPdf(resolved)) {
+    throw new Error(`Invalid PDF: ${resolved}`);
+  }
+
+  const inSize = fs.statSync(resolved).size;
+  if (inSize <= MAX_BYTES) {
+    L.info(
+      `PDF compress: "${path.basename(resolved)}" is ${mb(inSize)} MB — already ≤ 2 MB.`,
+    );
+    return { uploadPath: resolved, mode: "original" };
+  }
+
+  L.info(
+    `PDF compress: "${path.basename(resolved)}" is ${mb(inSize)} MB — compressing (chain)…`,
+  );
+
+  const iloveAccounts = [
+    {
+      label: "ilove-primary",
+      pub: String(process.env.ILOVEPDF_PUBLIC_KEY || "").trim(),
+      sec: String(process.env.ILOVEPDF_SECRET_KEY || "").trim(),
+    },
+    {
+      label: "ilove-partner",
+      pub: String(process.env.ILOVEPDF_PARTNER_PUBLIC_KEY || "").trim(),
+      sec: String(process.env.ILOVEPDF_PARTNER_SECRET_KEY || "").trim(),
+    },
+    {
+      label: "ilove-partner2",
+      pub: String(process.env.ILOVEPDF_PARTNER2_PUBLIC_KEY || "").trim(),
+      sec: String(process.env.ILOVEPDF_PARTNER2_SECRET_KEY || "").trim(),
+    },
+  ].filter((a) => a.pub && a.sec);
+
+  const adobeClientId = String(
+    process.env.PDF_SERVICES_CLIENT_ID || process.env.ADOBE_CLIENT_ID || "",
+  ).trim();
+  const adobeClientSecret = String(
+    process.env.PDF_SERVICES_CLIENT_SECRET || process.env.ADOBE_CLIENT_SECRET || "",
+  ).trim();
+
+  function unlinkSafe(p) {
+    try {
+      if (p && fs.existsSync(p)) fs.unlinkSync(p);
+    } catch {}
+  }
+
+  for (const acc of iloveAccounts) {
+    try {
+      L.info(`PDF compress: trying ${acc.label}…`);
+      const tmp = await compressViaIlove(resolved, acc.label, acc.pub, acc.sec);
+      const sz = fs.statSync(tmp).size;
+      L.info(`PDF compress (${acc.label}): ${mb(sz)} MB`);
+      if (sz <= MAX_BYTES) {
+        L.info(
+          `PDF compress: ✓ ${mb(sz)} MB ≤ 2 MB — using compressed file`,
+        );
+        return { uploadPath: tmp, mode: "compressed" };
+      }
+      unlinkSafe(tmp);
+      L.warn(
+        `PDF compress (${acc.label}): result still > 2 MB — building first+last page PDF only (no more API calls).`,
+      );
+      const flPath = path.join(
+        os.tmpdir(),
+        `portnet_annex_firstlast_${Date.now()}_${path.basename(resolved)}`,
+      );
+      await writeFirstLastPagesToPath(resolved, flPath);
+      const fz = fs.statSync(flPath).size;
+      L.info(`PDF compress (first+last): ${mb(fz)} MB`);
+      if (fz > MAX_BYTES) {
+        unlinkSafe(flPath);
+        throw new Error(
+          `First+last page fallback still exceeds 2 MB (${mb(fz)} MB).`,
+        );
+      }
+      return { uploadPath: flPath, mode: "first_last" };
+    } catch (err) {
+      if (isIloveQuotaError(err)) {
+        L.warn(
+          `PDF compress (${acc.label}) quota/limit — ${err?.message || err}`,
+        );
+        continue;
+      }
+      L.warn(`PDF compress (${acc.label}) failed: ${err?.message || err}`);
+      continue;
+    }
+  }
+
+  if (adobeClientId && adobeClientSecret) {
+    try {
+      L.info("PDF compress: trying Adobe PDF Services…");
+      const tmp = await compressViaAdobe(resolved, adobeClientId, adobeClientSecret);
+      const sz = fs.statSync(tmp).size;
+      L.info(`PDF compress (Adobe): ${mb(sz)} MB`);
+      if (sz <= MAX_BYTES) {
+        return { uploadPath: tmp, mode: "compressed" };
+      }
+      unlinkSafe(tmp);
+      L.warn(
+        "PDF compress (Adobe): result still > 2 MB — building first+last page PDF only.",
+      );
+      const flPath = path.join(
+        os.tmpdir(),
+        `portnet_annex_firstlast_${Date.now()}_${path.basename(resolved)}`,
+      );
+      await writeFirstLastPagesToPath(resolved, flPath);
+      const fz = fs.statSync(flPath).size;
+      if (fz > MAX_BYTES) {
+        unlinkSafe(flPath);
+        throw new Error(
+          `First+last page fallback still exceeds 2 MB (${mb(fz)} MB).`,
+        );
+      }
+      return { uploadPath: flPath, mode: "first_last" };
+    } catch (err) {
+      if (isAdobeLimitError(err)) {
+        L.warn(`PDF compress (Adobe) quota/limit: ${err?.message || err}`);
+      } else {
+        L.warn(`PDF compress (Adobe) failed: ${err?.message || err}`);
+      }
+    }
+  } else {
+    L.warn(
+      "PDF compress: Adobe credentials not set (PDF_SERVICES_CLIENT_ID / SECRET).",
+    );
+  }
+
+  L.warn(
+    "PDF compress: all API steps failed — building first+last page fallback from original PDF.",
+  );
+  const flPath = path.join(
+    os.tmpdir(),
+    `portnet_annex_firstlast_${Date.now()}_${path.basename(resolved)}`,
+  );
+  await writeFirstLastPagesToPath(resolved, flPath);
+  const fz = fs.statSync(flPath).size;
+  L.info(`PDF compress (first+last fallback): ${mb(fz)} MB`);
+  if (fz > MAX_BYTES) {
+    unlinkSafe(flPath);
+    throw new Error(
+      `Annex PDF cannot be reduced under 2 MB (first+last is ${mb(fz)} MB).`,
+    );
+  }
+  return { uploadPath: flPath, mode: "first_last" };
+}
+
+module.exports = {
+  compressPdfForAnnex,
+  MAX_BYTES,
+  isLikelyValidPdf,
+};
