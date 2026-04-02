@@ -109,10 +109,18 @@ export default function AcheminementCard({
       {ach.refMismatch && (
         <div className="flex items-center gap-2 bg-red-900/40 border border-red-700/60 rounded-lg px-3 py-2">
           <span className="text-red-400 text-xs font-semibold">
-            ⚠️ La référence LTA ne correspond pas au Manifeste — vérifiez les
-            fichiers
+            ⚠️ Incohérence de référence (noms de fichiers et/ou texte du
+            manifeste PDF) — corrigez avant de lancer
           </span>
         </div>
+      )}
+
+      {ach.manifestPdfExtract?.ok && (
+        <p className="text-[11px] text-slate-500 leading-snug">
+          Données lues depuis le manifeste PDF : en-tête (MAWB / Pcs / kg /
+          devise ou colonne devise), et dernière ligne du tableau (2ᵉ des trois
+          totaux = valeur totale).
+        </p>
       )}
 
       {/* ── Form fields ────────────────────────────────────────────────────── */}

@@ -14,16 +14,24 @@
     "prestart:lotRef": "npm run autopull",
     "start:lotRef": "node index.js --lotRef=",
     "prelogin-test": "npm run autopull",
-    "login-test": "node login-portnet.js"
+    "login-test": "node login-portnet.js",
+    "compress:test": "node scripts/compress-pdf-test.js",
+    "compress:adobe": "node scripts/compress-pdf-adobe.js",
+    "compress:pdfrest": "node scripts/compress-pdf-pdfrest.js",
+    "compress:chain": "node scripts/compress-pdf-chain.js"
   },
   "keywords": [],
   "author": "Med Africa Logistics",
   "license": "ISC",
   "description": "Playwright automation for BADR + Portnet DS Combinée workflow",
   "dependencies": {
+    "@adobe/pdfservices-node-sdk": "^4.1.0",
     "@ilovepdf/ilovepdf-nodejs": "^0.3.1",
+    "adm-zip": "^0.5.17",
     "dotenv": "^16.6.1",
     "nodemailer": "^8.0.1",
+    "pdf-lib": "^1.17.1",
+    "pdf-parse": "^1.1.1",
     "playwright": "^1.58.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

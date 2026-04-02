@@ -181,6 +181,17 @@ function readAcheminementFile(folderPath) {
   }
 }
 
+/** JSON may contain "" for empty fields — treat as missing so manifest PDF can fill. */
+function pickSavedOrExtracted(savedVal, extractedVal, fallback = "") {
+  if (savedVal != null && String(savedVal).trim() !== "") {
+    return savedVal;
+  }
+  if (extractedVal != null && String(extractedVal).trim() !== "") {
+    return extractedVal;
+  }
+  return fallback;
+}
+
 function writeAcheminementFile(folderPath, data) {
   const savePath = path.join(folderPath, "acheminement.json");
   fs.writeFileSync(savePath, JSON.stringify(data, null, 2), "utf8");
@@ -197,6 +208,13 @@ function normalizeLotReference(value) {
   return `${Number.isNaN(Number(left)) ? match[1] : left}-${right}`;
 }
 
+const {
+  extractLotReferenceFromFilename,
+  extractManifestMetricsFromPdfFile,
+  pickManifestPdf,
+  pickMawbPdf,
+} = require("../src/utils/manifestPdfExtract");
+
 function extractLotReferenceFromFolder(folderPath) {
   try {
     const fileNames = fs
@@ -204,22 +222,19 @@ function extractLotReferenceFromFolder(folderPath) {
       .filter((entry) => entry.isFile())
       .map((entry) => entry.name);
 
-    const extractRef = (name) => {
-      const match = name.match(/\b\d{1,4}-\d{6,}\b/);
-      return match ? normalizeLotReference(match[0]) : "";
-    };
-
     const mawbFile = fileNames.find((name) => /\bmawb\b/i.test(name));
     const manifesteFile = fileNames.find((name) => /\bmanifeste\b/i.test(name));
 
-    const mawbRef = mawbFile ? extractRef(mawbFile) : "";
+    const mawbRef = mawbFile ? extractLotReferenceFromFilename(mawbFile) : "";
     if (mawbRef) return mawbRef;
 
-    const manifesteRef = manifesteFile ? extractRef(manifesteFile) : "";
+    const manifesteRef = manifesteFile
+      ? extractLotReferenceFromFilename(manifesteFile)
+      : "";
     if (manifesteRef) return manifesteRef;
 
     for (const name of fileNames) {
-      const ref = extractRef(name);
+      const ref = extractLotReferenceFromFilename(name);
       if (ref) return ref;
     }
   } catch {
@@ -295,8 +310,8 @@ async function prepareLotAndWeightCheck(acheminement) {
   const {
     id,
     folderPath,
-    refNumber,
-    poidTotal,
+    refNumber: refFromInput,
+    poidTotal: poidFromInput,
     sequenceNumber,
     lieuChargement,
     partiel,
@@ -312,11 +327,62 @@ async function prepareLotAndWeightCheck(acheminement) {
     return { success: false, skipped: true, reason: "partiel" };
   }
 
+  const folderLotReference = extractLotReferenceFromFolder(folderPath);
+
+  let manifestPdfMetrics = null;
+  const manifestPath = acheminement.manifeste
+    ? path.join(folderPath, acheminement.manifeste)
+    : null;
+  if (manifestPath && fs.existsSync(manifestPath)) {
+    try {
+      manifestPdfMetrics =
+        await extractManifestMetricsFromPdfFile(manifestPath);
+      if (manifestPdfMetrics?.ok) {
+        sendLog(
+          "info",
+          "BADR",
+          "Manifeste PDF: en-tête lu (réf. / Pcs / kg / devise si présents).",
+        );
+      }
+    } catch (e) {
+      console.error("[manifest pdf]", e.message);
+    }
+  }
+
+  const resolvedRef =
+    normalizeLotReference(refFromInput) ||
+    normalizeLotReference(folderLotReference) ||
+    normalizeLotReference(manifestPdfMetrics?.refNumber) ||
+    "";
+
+  if (!resolvedRef) {
+    sendLog(
+      "error",
+      "BADR",
+      "Référence LTA introuvable — vérifiez les noms de fichiers (ex. MAWB 157-54440131 (002).pdf) ou le texte du manifeste.",
+    );
+    sendProgress(id, "error", { error: "Référence LTA introuvable" });
+    return { success: false, error: "Référence LTA introuvable" };
+  }
+
+  const nombreMerged =
+    String(acheminement.nombreContenant || "").trim() ||
+    String(manifestPdfMetrics?.nombreContenant || "").trim();
+  const poidMerged =
+    String(poidFromInput || "").trim() ||
+    String(manifestPdfMetrics?.poidTotal || "").trim();
+  const currencyMerged =
+    String(acheminement.currency || "").trim() ||
+    String(manifestPdfMetrics?.currency || "").trim() ||
+    "MAD";
+  const totalMerged =
+    String(acheminement.totalValue || "").trim() ||
+    String(manifestPdfMetrics?.totalValue || "").trim();
+
   const BADRLotLookup = require("../src/badr/badrLotLookup");
   const BADRPreapurement = require("../src/badr/badrPreapurement");
 
   let lotInfo = null;
-  const folderLotReference = extractLotReferenceFromFolder(folderPath);
 
   try {
     const badrConn = await ensureBadrSession();
@@ -326,7 +392,7 @@ async function prepareLotAndWeightCheck(acheminement) {
       sendLog("info", "BADR", "No sequence number – looking up in BADR…");
       const lotLookup = new BADRLotLookup(badrConn.page);
       await lotLookup.openLotPopup();
-      lotInfo = await lotLookup.searchLot(refNumber);
+      lotInfo = await lotLookup.searchLot(resolvedRef);
       await lotLookup.close();
 
       if (lotInfo.isEmpty) {
@@ -337,7 +403,7 @@ async function prepareLotAndWeightCheck(acheminement) {
         sendLog(
           "warn",
           "BADR",
-          `Pas encours manifest pour ${refNumber} – email envoyé`,
+          `Pas encours manifest pour ${resolvedRef} – email envoyé`,
         );
         sendProgress(id, "error", { error: "Pas encours manifest" });
         return { success: false, error: "Pas encours manifest" };
@@ -352,7 +418,7 @@ async function prepareLotAndWeightCheck(acheminement) {
         sendLog(
           "warn",
           "BADR",
-          `DS Partiel détecté pour ${refNumber} (${lotInfo.rowCount} lignes) – ignoré`,
+          `DS Partiel détecté pour ${resolvedRef} (${lotInfo.rowCount} lignes) – ignoré`,
         );
         sendProgress(id, "partiel-skip");
         return { success: false, skipped: true, reason: "partiel" };
@@ -367,7 +433,7 @@ async function prepareLotAndWeightCheck(acheminement) {
       lotInfo.lotReference =
         normalizeLotReference(folderLotReference) ||
         normalizeLotReference(lotInfo.lotReference) ||
-        normalizeLotReference(refNumber) ||
+        normalizeLotReference(resolvedRef) ||
         "";
 
       const seqDisplay =
@@ -404,11 +470,11 @@ async function prepareLotAndWeightCheck(acheminement) {
         ) ||
         normalizeLotReference(existingData?.automationState?.lotReference) ||
         normalizeLotReference(existingData?.lotReference) ||
-        normalizeLotReference(refNumber) ||
+        normalizeLotReference(resolvedRef) ||
         "";
 
       lotInfo = {
-        declarationRef: refNumber
+        declarationRef: resolvedRef
           ? `301-000-${new Date().getFullYear()}-${serie}-${cle}`
           : "",
         bureau: "301",
@@ -428,10 +494,10 @@ async function prepareLotAndWeightCheck(acheminement) {
       "Restarting with MISE EN DOUANE for preapurement check…",
     );
     const preap = new BADRPreapurement(badrConn.page);
-    const poidsInfo = await preap.getPoidsBrut(lotInfo, refNumber);
+    const poidsInfo = await preap.getPoidsBrut(lotInfo, resolvedRef);
 
     const poidsBadr = parseFloat(String(poidsInfo.poidsBrut).replace(",", "."));
-    const poidsUser = parseFloat(String(poidTotal).replace(",", "."));
+    const poidsUser = parseFloat(String(poidMerged).replace(",", "."));
 
     if (!isNaN(poidsBadr) && !isNaN(poidsUser)) {
       const diff = Math.abs(poidsBadr - poidsUser);
@@ -452,7 +518,7 @@ async function prepareLotAndWeightCheck(acheminement) {
         sendLog(
           "warn",
           "ALERT_MAIL",
-          `[TODO MAIL] Écart poids critique pour ${refNumber}: ${diff.toFixed(2)} kg (BADR=${poidsBadr}, SAISIE=${poidsUser})`,
+          `[TODO MAIL] Écart poids critique pour ${resolvedRef}: ${diff.toFixed(2)} kg (BADR=${poidsBadr}, SAISIE=${poidsUser})`,
         );
         sendProgress(id, "partiel-skip", {
           badrWeight: poidsBadr,
@@ -483,7 +549,7 @@ async function prepareLotAndWeightCheck(acheminement) {
         sendLog(
           "warn",
           "ALERT_MAIL",
-          `[TODO MAIL] Écart poids > 5kg pour ${refNumber}: ${diff.toFixed(2)} kg (BADR=${poidsBadr}, SAISIE=${poidsUser})`,
+          `[TODO MAIL] Écart poids > 5kg pour ${resolvedRef}: ${diff.toFixed(2)} kg (BADR=${poidsBadr}, SAISIE=${poidsUser})`,
         );
         sendProgress(id, "weight-mismatch", {
           badrWeight: poidsBadr,
@@ -531,10 +597,19 @@ async function prepareLotAndWeightCheck(acheminement) {
       phase: "badr_checked",
       lotInfo,
       badrWeight: poidsBadr,
-      userWeight: poidTotal,
+      userWeight: poidMerged,
     });
 
-    return { success: true, lotInfo };
+    return {
+      success: true,
+      lotInfo,
+      formFields: {
+        refNumber: resolvedRef,
+        nombreContenant: nombreMerged,
+        currency: currencyMerged,
+        totalValue: totalMerged,
+      },
+    };
   } catch (err) {
     sendLog(
       "error",
@@ -964,7 +1039,7 @@ async function runAutomationTask(
       }
 
       const submitResult = await submitPortnetPhase(
-        acheminement,
+        { ...acheminement, ...(prep.formFields || {}) },
         prep.lotInfo,
         portnetPage,
       );
@@ -1089,6 +1164,8 @@ ipcMain.handle("dialog:openFolder", async () => {
 ipcMain.handle("folder:scan", async (_event, folderPath) => {
   if (!folderPath || !fs.existsSync(folderPath)) return [];
 
+  sendLog("info", "Scan", `Dossier acheminements: ${folderPath}`);
+
   const entries = fs.readdirSync(folderPath, { withFileTypes: true });
   const acheminements = [];
 
@@ -1099,32 +1176,128 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
       .readdirSync(dirPath)
       .filter((f) => f.toLowerCase().endsWith(".pdf"));
 
-    let manifeste = null;
-    let mawb = null;
-    let mawbRef = null;
-    let manifesteRef = null;
+    const mawb = pickMawbPdf(files);
+    const mawbRef = mawb ? extractLotReferenceFromFilename(mawb) || null : null;
+    const manifeste = pickManifestPdf(files);
+    const manifesteRef = manifeste
+      ? extractLotReferenceFromFilename(manifeste) || null
+      : null;
 
-    for (const file of files) {
-      const lower = file.toLowerCase();
-      // MAWB or LTA detection
-      if (lower.includes("mawb") || lower.includes("lta")) {
-        mawb = file;
-        // Extract ref: digits-digits pattern e.g. "607-52839835"
-        const match = file.match(/(\d{3}-\d+)/);
-        if (match) mawbRef = match[1];
-      } else if (lower.includes("manifest") || lower.includes("manifeste")) {
-        manifeste = file;
-        const match = file.match(/(\d{3}-\d+)/);
-        if (match) manifesteRef = match[1];
+    let manifestPdfExtract = null;
+    if (manifeste) {
+      const manifestPath = path.join(dirPath, manifeste);
+      try {
+        manifestPdfExtract =
+          await extractManifestMetricsFromPdfFile(manifestPath);
+        if (manifestPdfExtract?.ok) {
+          const bits = [
+            manifestPdfExtract.refNumber &&
+              `réf ${manifestPdfExtract.refNumber}`,
+            manifestPdfExtract.nombreContenant &&
+              `${manifestPdfExtract.nombreContenant} colis`,
+            manifestPdfExtract.poidTotal &&
+              `${manifestPdfExtract.poidTotal} kg`,
+            manifestPdfExtract.currency &&
+              `devise ${manifestPdfExtract.currency}`,
+            manifestPdfExtract.totalValue &&
+              `valeur ${manifestPdfExtract.totalValue}`,
+          ]
+            .filter(Boolean)
+            .join(", ");
+          sendLog(
+            "info",
+            "Manifeste",
+            `[${entry.name}] PDF "${manifeste}" — extrait${bits ? `: ${bits}` : ""}`,
+          );
+          if (!manifestPdfExtract.totalValue) {
+            sendLog(
+              "warn",
+              "Manifeste",
+              `[${entry.name}] Valeur totale (2ᵉ des trois totaux en bas du tableau) absente du texte PDF — saisie manuelle ou PDF image uniquement.`,
+            );
+          }
+        } else {
+          sendLog(
+            "warn",
+            "Manifeste",
+            `[${entry.name}] PDF "${manifeste}" — pas d’en-tête exploitable (${manifestPdfExtract?.error || "inconnu"})`,
+          );
+        }
+      } catch (e) {
+        manifestPdfExtract = { ok: false, error: String(e?.message || e) };
+        sendLog(
+          "error",
+          "Manifeste",
+          `[${entry.name}] lecture PDF échouée: ${manifestPdfExtract.error}`,
+        );
       }
     }
 
-    // MAWB is the primary ref; detect mismatch between the two files
-    const refNumber = mawbRef || manifesteRef;
-    const refMismatch = !!(mawbRef && manifesteRef && mawbRef !== manifesteRef);
+    if (
+      manifestPdfExtract &&
+      !manifestPdfExtract.ok &&
+      mawb &&
+      mawb !== manifeste
+    ) {
+      try {
+        const mawbPath = path.join(dirPath, mawb);
+        const fromMawb = await extractManifestMetricsFromPdfFile(mawbPath);
+        if (fromMawb.ok) {
+          manifestPdfExtract = fromMawb;
+          sendLog(
+            "info",
+            "Manifeste",
+            `[${entry.name}] en-tête lu depuis le PDF MAWB "${mawb}" (le manifeste seul n’a pas de texte exploitable)`,
+          );
+        }
+      } catch (e) {
+        /* ignore */
+      }
+    }
 
-    // Load previously saved user-input fields from acheminement.json
+    let refNumber = mawbRef || manifesteRef || "";
+    if (manifestPdfExtract?.ok && manifestPdfExtract.refNumber) {
+      refNumber =
+        refNumber || normalizeLotReference(manifestPdfExtract.refNumber) || "";
+    }
+
+    const filenameMismatch = !!(
+      mawbRef &&
+      manifesteRef &&
+      mawbRef !== manifesteRef
+    );
+    const pdfVsFilenameMismatch = !!(
+      manifestPdfExtract?.ok &&
+      manifestPdfExtract.refNumber &&
+      refNumber &&
+      normalizeLotReference(manifestPdfExtract.refNumber) !==
+        normalizeLotReference(refNumber)
+    );
+    const refMismatch = filenameMismatch || pdfVsFilenameMismatch;
+
     const saved = readAcheminementFile(dirPath);
+
+    const mergedNombre = pickSavedOrExtracted(
+      saved.nombreContenant,
+      manifestPdfExtract?.ok ? manifestPdfExtract.nombreContenant : null,
+      "",
+    );
+    const mergedPoids = pickSavedOrExtracted(
+      saved.poidTotal,
+      manifestPdfExtract?.ok ? manifestPdfExtract.poidTotal : null,
+      "",
+    );
+    // Currency & totalValue: PDF extraction wins over saved (PDF is source of truth)
+    const mergedCurrency = pickSavedOrExtracted(
+      manifestPdfExtract?.ok ? manifestPdfExtract.currency : null,
+      saved.currency,
+      "MAD",
+    );
+    const mergedTotalValue = pickSavedOrExtracted(
+      manifestPdfExtract?.ok ? manifestPdfExtract.totalValue : null,
+      saved.totalValue,
+      "",
+    );
 
     acheminements.push({
       id: entry.name,
@@ -1134,16 +1307,16 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
       mawb,
       refNumber,
       refMismatch,
+      manifestPdfExtract,
       files,
-      // User-input fields – defaults overridden by saved values
       scelle1: saved.scelle1 ?? "",
       scelle2: saved.scelle2 ?? "",
-      nombreContenant: saved.nombreContenant ?? "",
-      poidTotal: saved.poidTotal ?? "",
+      nombreContenant: mergedNombre,
+      poidTotal: mergedPoids,
       sequenceNumber: saved.sequenceNumber ?? "",
       lieuChargement: saved.lieuChargement ?? "",
-      currency: saved.currency ?? "MAD",
-      totalValue: saved.totalValue ?? "",
+      currency: mergedCurrency,
+      totalValue: mergedTotalValue,
       partiel: saved.partiel ?? false,
       automationState: saved[CHECKPOINT_KEY] ?? null,
     });

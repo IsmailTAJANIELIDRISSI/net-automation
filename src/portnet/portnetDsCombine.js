@@ -19,15 +19,15 @@
  */
 
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
-const { execFile } = require("child_process");
-const { promisify } = require("util");
 const config = require("../config/config");
 const { createLogger } = require("../utils/logger");
+const {
+  compressPdfForAnnex,
+  isLikelyValidPdf,
+} = require("../utils/compressPdfChain");
 
 const log = createLogger("PortnetDsCombine");
-const execFileAsync = promisify(execFile);
 
 // Temporary debug mode: keep compressed files in each LTA folder and stop
 // the workflow right after compression (before Annexe upload).
@@ -36,21 +36,11 @@ const STOP_AFTER_ANNEX_COMPRESSION =
     process.env.PORTNET_STOP_AFTER_ANNEX_COMPRESSION || "false",
   ).toLowerCase() === "true";
 
-const GS_TIMEOUT_MS = Math.max(
-  Number(process.env.PORTNET_GS_TIMEOUT_MS || 180000),
-  180000,
-);
-const GS_TIMEOUT_PER_MB_MS = Math.max(
-  Number(process.env.PORTNET_GS_TIMEOUT_PER_MB_MS || 12000),
-  5000,
-);
-const GS_PROFILE = String(process.env.PORTNET_GS_PROFILE || "fast")
-  .trim()
-  .toLowerCase();
-const GS_LARGE_FILE_MB = Math.max(
-  Number(process.env.PORTNET_GS_LARGE_FILE_MB || 10),
-  5,
-);
+// When true, always run iLovePDF/Adobe chain instead of reusing
+// `<LTA>/compress/<name>_compressed.pdf` (for forcing a fresh compress).
+const IGNORE_ANNEX_COMPRESS_CACHE =
+  String(process.env.PORTNET_IGNORE_COMPRESS_CACHE || "false").toLowerCase() ===
+  "true";
 
 const TIMEOUT = config.timeout;
 const FORM_CFG = config.portnet.form;
@@ -537,346 +527,12 @@ class PortnetDsCombine {
     log.info("Connaissement Ajouter clicked – row added to grid");
   }
 
-  // ── PDF compression helper ────────────────────────────────────────────────
-  _isLikelyValidPdf(filePath) {
-    try {
-      const stat = fs.statSync(filePath);
-      if (!stat.isFile() || stat.size < 32) return false;
-
-      const fd = fs.openSync(filePath, "r");
-      try {
-        const head = Buffer.alloc(8);
-        fs.readSync(fd, head, 0, head.length, 0);
-        const headText = head.toString("latin1");
-        if (!headText.startsWith("%PDF-")) return false;
-
-        const tailLen = Math.min(4096, stat.size);
-        const tail = Buffer.alloc(tailLen);
-        fs.readSync(fd, tail, 0, tail.length, stat.size - tailLen);
-        const tailText = tail.toString("latin1");
-
-        return tailText.includes("%%EOF");
-      } finally {
-        fs.closeSync(fd);
-      }
-    } catch {
-      return false;
-    }
-  }
-
-  _resolveGhostscriptExecutables() {
-    const envPath = String(process.env.PORTNET_GS_PATH || "").trim();
-    const candidates = [];
-
-    if (envPath) candidates.push(envPath);
-
-    if (process.platform === "win32") {
-      const pf64 =
-        process.env["ProgramW6432"] ||
-        process.env["ProgramFiles"] ||
-        "C:\\Program Files";
-      const pf32 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
-      const known = [
-        path.join(pf64, "gs", "gs10.05.1", "bin", "gswin64c.exe"),
-        path.join(pf64, "gs", "gs10.04.0", "bin", "gswin64c.exe"),
-        path.join(pf64, "gs", "gs10.03.1", "bin", "gswin64c.exe"),
-        path.join(pf64, "gs", "gs10.03.0", "bin", "gswin64c.exe"),
-        path.join(pf64, "gs", "gs10.02.1", "bin", "gswin64c.exe"),
-        path.join(pf64, "gs", "gs10.01.2", "bin", "gswin64c.exe"),
-        path.join(pf64, "gs", "gs10.01.1", "bin", "gswin64c.exe"),
-        path.join(pf64, "gs", "gs10.01.0", "bin", "gswin64c.exe"),
-        path.join(pf64, "gs", "gs10.00.0", "bin", "gswin64c.exe"),
-        path.join(pf32, "gs", "gs10.05.1", "bin", "gswin32c.exe"),
-      ];
-      for (const p of known) {
-        if (fs.existsSync(p)) candidates.push(p);
-      }
-    }
-
-    candidates.push("gswin64c", "gswin32c", "gs");
-
-    return [...new Set(candidates)];
-  }
-
-  _isIlovePdfLimitError(err) {
-    const text = String(err?.message || "").toLowerCase();
-    return (
-      text.includes("limit") ||
-      text.includes("quota") ||
-      text.includes("remaining files") ||
-      text.includes("insufficient credits") ||
-      text.includes("too many requests") ||
-      text.includes("402") ||
-      text.includes("rate limit")
-    );
-  }
-
   /**
-   * Compress a PDF to <= 2 MB.
-   * Primary: iLovePDF API (fast and stable for large scanned files).
-   * Fallback: local Ghostscript with explicit downsampling flags.
+   * Prepare annex PDF: iLovePDF (×3) → Adobe → first+last fallback (see compressPdfChain).
+   * @returns {Promise<{ uploadPath: string, mode: 'original' | 'compressed' | 'first_last' }>}
    */
   async _compressPdfIfNeeded(filePath) {
-    const MAX_BYTES = 2 * 1024 * 1024; // 2 MB
-    const sizeBytes = fs.statSync(filePath).size;
-    if (sizeBytes <= MAX_BYTES) return filePath;
-
-    const sizeMB = (sizeBytes / (1024 * 1024)).toFixed(1);
-    log.info(
-      `PDF compress: "${path.basename(filePath)}" is ${sizeMB} MB – compressing…`,
-    );
-
-    const ilovePrimaryPublic = String(
-      process.env.ILOVEPDF_PUBLIC_KEY || "",
-    ).trim();
-    const ilovePrimarySecret = String(
-      process.env.ILOVEPDF_SECRET_KEY || "",
-    ).trim();
-    const ilovePartnerPublic = String(
-      process.env.ILOVEPDF_PARTNER_PUBLIC_KEY || "",
-    ).trim();
-    const ilovePartnerSecret = String(
-      process.env.ILOVEPDF_PARTNER_SECRET_KEY || "",
-    ).trim();
-
-    const iloveAccounts = [];
-    if (ilovePrimaryPublic && ilovePrimarySecret) {
-      iloveAccounts.push({
-        label: "primary",
-        publicKey: ilovePrimaryPublic,
-        secretKey: ilovePrimarySecret,
-      });
-    }
-    if (ilovePartnerPublic && ilovePartnerSecret) {
-      iloveAccounts.push({
-        label: "partner",
-        publicKey: ilovePartnerPublic,
-        secretKey: ilovePartnerSecret,
-      });
-    }
-
-    if (iloveAccounts.length > 0) {
-      try {
-        let lastLimitError = null;
-        let lastNonLimitError = null;
-
-        for (const account of iloveAccounts) {
-          try {
-            const iloveOutPath = await this._compressViaIlovepdf(
-              filePath,
-              account.publicKey,
-              account.secretKey,
-            );
-            if (iloveOutPath && fs.existsSync(iloveOutPath)) {
-              const outMB = (
-                fs.statSync(iloveOutPath).size /
-                (1024 * 1024)
-              ).toFixed(1);
-              log.info(
-                `PDF compress (iLovePDF:${account.label}): ✓ compressed to ${outMB} MB → "${iloveOutPath}"`,
-              );
-              return iloveOutPath;
-            }
-          } catch (err) {
-            if (this._isIlovePdfLimitError(err)) {
-              lastLimitError = err;
-              log.warn(
-                `PDF compress (iLovePDF:${account.label}) limit reached: ${err?.message || "unknown error"}`,
-              );
-              continue;
-            }
-            lastNonLimitError = err;
-            log.warn(
-              `PDF compress (iLovePDF:${account.label}) failed: ${err?.message || "unknown error"} – trying fallback`,
-            );
-            break;
-          }
-        }
-
-        if (lastLimitError && !lastNonLimitError) {
-          throw new Error(
-            `iLovePDF compression limit reached on all configured accounts for "${path.basename(filePath)}". ` +
-              "Upload and Portnet submission were blocked intentionally. " +
-              "Please renew quota/credits or compress manually, then retry.",
-          );
-        }
-      } catch (err) {
-        log.warn(
-          `PDF compress (iLovePDF) failed: ${err?.message || "unknown error"} – fallback to Ghostscript`,
-        );
-      }
-    } else {
-      log.info(
-        "PDF compress: ILOVEPDF keys not configured (primary/partner) – using Ghostscript fallback",
-      );
-    }
-
-    return this._compressViaGhostscript(filePath, sizeBytes, MAX_BYTES);
-  }
-
-  async _compressViaIlovepdf(filePath, publicKey, secretKey) {
-    const ILovePDFApi = require("@ilovepdf/ilovepdf-nodejs");
-    const ILovePDFFile = require("@ilovepdf/ilovepdf-nodejs/ILovePDFFile");
-
-    const api = new ILovePDFApi(publicKey, secretKey);
-    const task = api.newTask("compress");
-
-    await task.start();
-    await task.addFile(new ILovePDFFile(filePath));
-    await task.process({ compression_level: "extreme" });
-
-    const data = await task.download();
-    if (!data || !Buffer.isBuffer(data) || data.length < 32) {
-      throw new Error("Empty response from iLovePDF download");
-    }
-
-    const outPath = path.join(
-      os.tmpdir(),
-      `portnet_ilovepdf_${Date.now()}_${path.basename(filePath)}`,
-    );
-    fs.writeFileSync(outPath, data);
-
-    if (!this._isLikelyValidPdf(outPath)) {
-      try {
-        fs.unlinkSync(outPath);
-      } catch {}
-      throw new Error("iLovePDF returned an invalid PDF");
-    }
-
-    return outPath;
-  }
-
-  async _compressViaGhostscript(filePath, sizeBytes, maxBytes) {
-    const gsCandidates = this._resolveGhostscriptExecutables();
-    const sizeMBNum = sizeBytes / (1024 * 1024);
-    const timeoutMs = Math.max(
-      GS_TIMEOUT_MS,
-      Math.ceil(sizeMBNum) * GS_TIMEOUT_PER_MB_MS,
-    );
-
-    let qualities =
-      GS_PROFILE === "full"
-        ? ["/printer", "/ebook", "/screen"]
-        : ["/ebook", "/screen"];
-    if (GS_PROFILE !== "full" && sizeMBNum >= GS_LARGE_FILE_MB) {
-      qualities = ["/screen"];
-    }
-
-    log.info(
-      `PDF compress config: profile=${GS_PROFILE}, timeout=${timeoutMs}ms, qualities=${qualities.join(" -> ")}`,
-    );
-
-    let bestValidOutPath = null;
-    let bestValidOutSize = Number.POSITIVE_INFINITY;
-
-    for (const gsExe of gsCandidates) {
-      for (const quality of qualities) {
-        const outPath = path.join(
-          os.tmpdir(),
-          `portnet_gs_${Date.now()}_${gsExe.replace(/\W/g, "")}_${quality.replace("/", "")}_${path.basename(filePath)}`,
-        );
-
-        const colorRes = quality === "/screen" ? "72" : "150";
-        const grayRes = quality === "/screen" ? "72" : "150";
-
-        try {
-          await execFileAsync(
-            gsExe,
-            [
-              "-sDEVICE=pdfwrite",
-              "-dCompatibilityLevel=1.4",
-              `-dPDFSETTINGS=${quality}`,
-              "-dDownsampleColorImages=true",
-              "-dDownsampleGrayImages=true",
-              "-dDownsampleMonoImages=true",
-              `-dColorImageResolution=${colorRes}`,
-              `-dGrayImageResolution=${grayRes}`,
-              "-dMonoImageResolution=300",
-              "-dDetectDuplicateImages=true",
-              "-dCompressFonts=true",
-              "-dSubsetFonts=true",
-              "-dNOPAUSE",
-              "-dQUIET",
-              "-dBATCH",
-              `-sOutputFile=${outPath}`,
-              filePath,
-            ],
-            { timeout: timeoutMs },
-          );
-
-          if (!fs.existsSync(outPath)) continue;
-          if (!this._isLikelyValidPdf(outPath)) {
-            log.warn(
-              `PDF compress (GS): invalid/corrupt output detected (${gsExe}, ${quality})`,
-            );
-            try {
-              fs.unlinkSync(outPath);
-            } catch {}
-            continue;
-          }
-
-          const outSize = fs.statSync(outPath).size;
-          const outMB = (outSize / (1024 * 1024)).toFixed(1);
-
-          if (outSize < bestValidOutSize) {
-            if (bestValidOutPath && bestValidOutPath !== outPath) {
-              try {
-                fs.unlinkSync(bestValidOutPath);
-              } catch {}
-            }
-            bestValidOutPath = outPath;
-            bestValidOutSize = outSize;
-          }
-
-          if (outSize <= maxBytes) {
-            log.info(
-              `PDF compress (GS): ✓ compressed to ${outMB} MB (${quality}) → "${outPath}"`,
-            );
-            return outPath;
-          }
-
-          log.info(
-            `PDF compress (GS): ${outMB} MB with ${quality}, trying lower quality…`,
-          );
-        } catch (err) {
-          try {
-            if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
-          } catch {}
-
-          const stderrText = String(err?.stderr || "");
-          const isMissingExecutable =
-            err?.code === "ENOENT" ||
-            stderrText.includes("not recognized") ||
-            stderrText.includes("No such file or directory");
-
-          if (isMissingExecutable) break;
-
-          const stderrSnippet = stderrText
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 400);
-
-          log.warn(
-            `PDF compress (GS) attempt failed (${gsExe}, ${quality}, timeout=${timeoutMs}ms): ${err?.message || "unknown error"}${stderrSnippet ? ` | stderr: ${stderrSnippet}` : ""}`,
-          );
-        }
-      }
-    }
-
-    if (bestValidOutPath && fs.existsSync(bestValidOutPath)) {
-      const outMB = (fs.statSync(bestValidOutPath).size / (1024 * 1024)).toFixed(
-        1,
-      );
-      log.warn(
-        `PDF compress (GS): best valid result is ${outMB} MB – proceeding with it`,
-      );
-      return bestValidOutPath;
-    }
-
-    log.warn(
-      "PDF compress: all compression attempts failed – using original file",
-    );
-    return filePath;
+    return compressPdfForAnnex(filePath, log);
   }
 
   // ── Annexe section ─────────────────────────────────────────────────────────
@@ -887,7 +543,8 @@ class PortnetDsCombine {
    */
   async fillAnnexe(folderPath) {
     const f = this.frame;
-    const compressedOutputDir = path.join(folderPath, "compressed");
+    // Prepared annex PDFs (cache for retests — avoids repeat API use)
+    const compressedOutputDir = path.join(folderPath, "compress");
 
     // Wait for the Annexe section to render after Connaissement Ajouter
     await f
@@ -938,24 +595,75 @@ class PortnetDsCombine {
       }
 
       const fullPath = path.join(folderPath, matched);
-
-      // Compress to ≤ 2 MB if needed (uses Ghostscript)
-      const uploadPath = await this._compressPdfIfNeeded(fullPath);
-      const uploadSizeKB = (fs.statSync(uploadPath).size / 1024).toFixed(0);
-      const sourceUsed = uploadPath === fullPath ? "original" : "compressed";
-
-      // Always persist the prepared (compressed or original) document in
-      // <current LTA>/compressed for manual verification.
-      fs.mkdirSync(compressedOutputDir, { recursive: true });
       const baseName = path.parse(matched).name;
-      const savedCompressedPath = path.join(
+      const cachePath = path.join(
         compressedOutputDir,
         `${baseName}_compressed.pdf`,
       );
-      fs.copyFileSync(uploadPath, savedCompressedPath);
-      log.info(
-        `Annexe: saved prepared file to "${savedCompressedPath}" (source=${sourceUsed}, size=${uploadSizeKB} KB)`,
-      );
+      const MAX_ANNEX_BYTES = 2 * 1024 * 1024;
+
+      /** Reuse last prepared PDF so retests skip API calls until the source file changes. */
+      const canUseCompressCache = () => {
+        if (IGNORE_ANNEX_COMPRESS_CACHE) return false;
+        if (!fs.existsSync(cachePath)) return false;
+        let srcStat;
+        let cacheStat;
+        try {
+          srcStat = fs.statSync(fullPath);
+          cacheStat = fs.statSync(cachePath);
+        } catch {
+          return false;
+        }
+        if (cacheStat.size > MAX_ANNEX_BYTES) return false;
+        if (cacheStat.mtimeMs < srcStat.mtimeMs) return false;
+        return isLikelyValidPdf(cachePath);
+      };
+
+      let uploadPath;
+      let sourceUsed;
+
+      if (canUseCompressCache()) {
+        uploadPath = cachePath;
+        sourceUsed = "compress_cache";
+      } else {
+        const { uploadPath: preparedPath, mode: compressMode } =
+          await this._compressPdfIfNeeded(fullPath);
+        sourceUsed =
+          preparedPath === fullPath
+            ? "original"
+            : compressMode === "first_last"
+              ? "first_last_pages"
+              : "compressed";
+
+        fs.mkdirSync(compressedOutputDir, { recursive: true });
+        fs.copyFileSync(preparedPath, cachePath);
+        if (preparedPath !== fullPath && fs.existsSync(preparedPath)) {
+          try {
+            fs.unlinkSync(preparedPath);
+          } catch {}
+        }
+        uploadPath = cachePath;
+        log.info(
+          `Annexe: wrote prepared annex to "${cachePath}" (source=${sourceUsed})`,
+        );
+      }
+
+      const uploadSizeBytes = fs.statSync(uploadPath).size;
+      const uploadSizeKB = (uploadSizeBytes / 1024).toFixed(0);
+
+      if (sourceUsed === "compress_cache") {
+        log.info(
+          `Annexe: reusing compress cache (${uploadSizeKB} KB) — skipping iLovePDF/Adobe; delete "${cachePath}" or set PORTNET_IGNORE_COMPRESS_CACHE=true to force recompress`,
+        );
+      }
+
+      if (uploadSizeBytes > MAX_ANNEX_BYTES) {
+        const uploadSizeMB = (uploadSizeBytes / (1024 * 1024)).toFixed(2);
+        throw new Error(
+          `Annexe "${matched}" remains ${uploadSizeMB} MB after maximum compression (limit is 2.00 MB). ` +
+            "Upload skipped and Portnet submission blocked to avoid draft-only request.",
+        );
+      }
 
       // Debug stop mode: stop right after compression/save, before upload.
       if (STOP_AFTER_ANNEX_COMPRESSION) {

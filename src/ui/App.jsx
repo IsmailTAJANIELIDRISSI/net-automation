@@ -3,6 +3,12 @@ import Header from "./components/Header.jsx";
 import AcheminementCard from "./components/AcheminementCard.jsx";
 import LogPanel from "./components/LogPanel.jsx";
 
+/** Keep user input unless blank — otherwise new scan values apply (acheminement.json can store ""). */
+function preferNonEmptyPrev(prev, fromScan) {
+  if (prev != null && String(prev).trim() !== "") return prev;
+  return fromScan ?? "";
+}
+
 export default function App() {
   // ── State ─────────────────────────────────────────────────────────────────
   const [folderPath, setFolderPath] = useState(null);
@@ -112,12 +118,21 @@ export default function App() {
         ...a,
         scelle1: prevMap[a.id]?.scelle1 ?? a.scelle1,
         scelle2: prevMap[a.id]?.scelle2 ?? a.scelle2,
-        nombreContenant: prevMap[a.id]?.nombreContenant ?? a.nombreContenant,
-        poidTotal: prevMap[a.id]?.poidTotal ?? a.poidTotal,
+        nombreContenant: preferNonEmptyPrev(
+          prevMap[a.id]?.nombreContenant,
+          a.nombreContenant,
+        ),
+        poidTotal: preferNonEmptyPrev(prevMap[a.id]?.poidTotal, a.poidTotal),
         sequenceNumber: prevMap[a.id]?.sequenceNumber ?? a.sequenceNumber,
         lieuChargement: prevMap[a.id]?.lieuChargement ?? a.lieuChargement,
-        currency: prevMap[a.id]?.currency ?? a.currency,
-        totalValue: prevMap[a.id]?.totalValue ?? a.totalValue,
+        currency:
+          preferNonEmptyPrev(prevMap[a.id]?.currency, a.currency) || "MAD",
+        totalValue: preferNonEmptyPrev(
+          prevMap[a.id]?.totalValue,
+          a.totalValue,
+        ),
+        manifestPdfExtract:
+          a.manifestPdfExtract ?? prevMap[a.id]?.manifestPdfExtract,
         automationState: a.automationState ?? prevMap[a.id]?.automationState,
       }));
     });
