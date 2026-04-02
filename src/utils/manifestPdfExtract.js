@@ -312,8 +312,11 @@ function extractFooterTotalValue(fullText, hints = {}) {
   // No properly-spaced triplet found — try to extract from concatenated numbers
   // PDF sometimes outputs "2544201858,67" instead of "2544 201858,67"
   // Strategy: find text ending with poids, then parse backwards to find the decimal value
-  
-  const lines = src.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  const lines = src
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
   const lastLines = lines.slice(-50);
 
   // Helper: extract value from a chunk that may have concatenated numbers
@@ -366,7 +369,7 @@ function extractFooterTotalValue(fullText, hints = {}) {
   if (poidsHint) {
     for (let i = lastLines.length - 1; i >= 0; i--) {
       const line = lastLines[i];
-      
+
       // If line IS the poids or ENDS with poids
       if (line === poidsHint || line.match(new RegExp(`\\s${poidsHint}$`))) {
         // Look at previous lines for the value
@@ -376,7 +379,7 @@ function extractFooterTotalValue(fullText, hints = {}) {
           if (val) return val;
         }
       }
-      
+
       // If line contains poids preceded by a decimal value
       // Pattern: "NNNN XXXXXX,XX PPPP" or "NNNNXXXXXX,XXPPPP" (concatenated)
       if (line.includes(poidsHint)) {
@@ -389,7 +392,11 @@ function extractFooterTotalValue(fullText, hints = {}) {
   }
 
   // Strategy 2: Find any reasonable decimal value in last lines
-  for (let i = lastLines.length - 1; i >= Math.max(0, lastLines.length - 20); i--) {
+  for (
+    let i = lastLines.length - 1;
+    i >= Math.max(0, lastLines.length - 20);
+    i--
+  ) {
     const line = lastLines[i];
     const val = extractValueFromChunk(line);
     if (val) {
