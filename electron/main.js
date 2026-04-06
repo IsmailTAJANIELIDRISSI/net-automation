@@ -686,11 +686,38 @@ async function submitPortnetPhase(acheminement, lotInfo, portnetPage) {
   sendProgress(id, "submitting-portnet");
 
   const portnetRef = await dsCombine.submitRequest(lotInfo.sequenceNum);
+  await dsCombine.openConsultationPage();
+
+  const submittedAnchor = await dsCombine.captureSubmittedRowAnchor(portnetRef, {
+    timeoutMs: 45000,
+    pollEveryMs: 1500,
+  });
+
+  if (submittedAnchor?.found && submittedAnchor.createdAtRaw) {
+    sendLog(
+      "info",
+      "Portnet",
+      `Captured submission anchor for "${id}": createdAt=${submittedAnchor.createdAtRaw}, manifeste=${submittedAnchor.numeroManifesteRaw || "N/A"}, status=${submittedAnchor.statusText || "N/A"}, matches=${submittedAnchor.matchesCount}.`,
+    );
+  } else {
+    sendLog(
+      "warn",
+      "Portnet",
+      `Could not capture Date de creation anchor immediately for "${id}" (${portnetRef}). Polling will fallback to submittedAt matching until anchor appears.`,
+    );
+  }
+
+  const initialPhase = isEnvoyeeStatus(submittedAnchor?.statusText)
+    ? "portnet_submitted"
+    : "portnet_sent_waiting";
+
   updateAutomationState(folderPath, {
-    // Mark as "sent click done" first; real submitted means consultation row = Envoyee.
-    phase: "portnet_sent_waiting",
+    // Prefer Date de creation anchor captured right after submit (per-LTA identity).
+    phase: initialPhase,
     portnetRef,
     submittedAt: new Date().toISOString(),
+    consultationCreatedAtRaw: submittedAnchor?.createdAtRaw || null,
+    consultationNumeroManifeste: submittedAnchor?.numeroManifesteRaw || null,
     attempts: 0,
     lotInfo,
     error: null,

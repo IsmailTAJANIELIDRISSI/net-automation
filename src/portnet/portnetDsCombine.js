@@ -1186,6 +1186,105 @@ class PortnetDsCombine {
     return shortRef.replace(/^0+/, "");
   }
 
+  _normalizeStatusText(statusText) {
+    return String(statusText || "")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .trim();
+  }
+
+  /**
+   * Right after submit, capture the newest consultation row for this dsReference
+   * and store its Date de creation as a stable per-LTA anchor.
+   */
+  async captureSubmittedRowAnchor(portnetRef, options = {}) {
+    const timeoutMs = Number(options.timeoutMs || 45000);
+    const pollEveryMs = Number(options.pollEveryMs || 1500);
+    const pollFrame = this.page.frameLocator('iframe[title="iframe"]');
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      await pollFrame
+        .locator('div[role="grid"]')
+        .first()
+        .waitFor({ state: "visible", timeout: 5000 })
+        .catch(() => {});
+
+      const rows = pollFrame.locator(
+        `div[role="row"]:has(div[data-field="dsReference"] div[aria-label="${portnetRef}"])`,
+      );
+
+      const count = await rows.count().catch(() => 0);
+      if (count > 0) {
+        const candidates = [];
+        for (let i = 0; i < count; i++) {
+          const row = rows.nth(i);
+
+          const statusText =
+            (await row
+              .locator(
+                'div[data-field="dsCombineStatusDescription"] div[aria-label]',
+              )
+              .getAttribute("aria-label")
+              .catch(() => "")) || "";
+
+          const createdAtRaw =
+            (await row
+              .locator('div[data-field="createdAtFormatted"] div[aria-label]')
+              .getAttribute("aria-label")
+              .catch(() => "")) || "";
+
+          const numeroManifesteRaw =
+            (await row
+              .locator('div[data-field="numeroManifeste"] div[aria-label]')
+              .getAttribute("aria-label")
+              .catch(() => "")) || "";
+
+          candidates.push({
+            rowIndex: i,
+            statusText,
+            createdAtRaw,
+            numeroManifesteRaw,
+            statusNorm: this._normalizeStatusText(statusText),
+          });
+        }
+
+        const preferred =
+          candidates.find(
+            (c) =>
+              c.statusNorm.startsWith("envoye") ||
+              c.statusNorm.startsWith("nouveau"),
+          ) ||
+          candidates[0];
+
+        if (preferred?.createdAtRaw) {
+          return {
+            found: true,
+            createdAtRaw: String(preferred.createdAtRaw || "").trim(),
+            numeroManifesteRaw: String(
+              preferred.numeroManifesteRaw || "",
+            ).trim(),
+            statusText: preferred.statusText || "",
+            matchesCount: count,
+          };
+        }
+      }
+
+      await this.page.waitForTimeout(pollEveryMs);
+      await this.page.reload({ waitUntil: "networkidle" }).catch(() => {});
+      await this._ensureConsultationSortedByCreatedAtDesc().catch(() => {});
+    }
+
+    return {
+      found: false,
+      createdAtRaw: "",
+      numeroManifesteRaw: "",
+      statusText: "",
+      matchesCount: 0,
+    };
+  }
+
   async getConsultationStatus(portnetRef, options = {}) {
     /**
      * Consultation status lookup with deterministic row anchoring.
