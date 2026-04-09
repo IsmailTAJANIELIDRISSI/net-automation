@@ -82,15 +82,21 @@ setupLogForwarding();
 
 // ── Helper: send log directly (for Electron-level messages) ──────────────────
 function sendLog(level, context, message) {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send("log", {
-      level,
-      context,
-      message,
-      ts: new Date().toISOString(),
-    });
+  try {
+    const { write } = require("../src/utils/logger");
+    write(level, context, message); // writes to file + console + emits to logEmitter → renderer
+  } catch (e) {
+    // Fallback if logger unavailable
+    console.log(`[${level.toUpperCase()}] [${context}] ${message}`);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("log", {
+        level,
+        context,
+        message,
+        ts: new Date().toISOString(),
+      });
+    }
   }
-  console.log(`[${level.toUpperCase()}] [${context}] ${message}`);
 }
 
 function sendProgress(acheminementId, status, extra = {}) {
@@ -688,10 +694,13 @@ async function submitPortnetPhase(acheminement, lotInfo, portnetPage) {
   const portnetRef = await dsCombine.submitRequest(lotInfo.sequenceNum);
   await dsCombine.openConsultationPage();
 
-  const submittedAnchor = await dsCombine.captureSubmittedRowAnchor(portnetRef, {
-    timeoutMs: 45000,
-    pollEveryMs: 1500,
-  });
+  const submittedAnchor = await dsCombine.captureSubmittedRowAnchor(
+    portnetRef,
+    {
+      timeoutMs: 45000,
+      pollEveryMs: 1500,
+    },
+  );
 
   if (submittedAnchor?.found && submittedAnchor.createdAtRaw) {
     sendLog(
@@ -801,11 +810,19 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
 
   const pending = new Map();
   const claimedAcceptedRefs = new Set();
+  // Tracks "createdAtRaw::manifeste" row anchors already assigned to an LTA.
+  // Prevents two LTAs from locking onto the same consultation row when they share portnetRef.
+  const claimedRowAnchors = new Set();
 
   for (const ach of acheminements) {
     const state = getAutomationState(ach.folderPath);
     if (state?.badrRef) {
       claimedAcceptedRefs.add(String(state.badrRef));
+    }
+    // Pre-populate from already-anchored LTAs so new assignments avoid their rows.
+    if (state?.consultationCreatedAtRaw) {
+      const key = `${state.consultationCreatedAtRaw}::${state.consultationNumeroManifeste || ""}`;
+      claimedRowAnchors.add(key);
     }
   }
 
@@ -883,6 +900,19 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
         } = await dsCombine.getConsultationStatus(state.portnetRef, {
           submittedAt: state.submittedAt || null,
           excludeRefDs: Array.from(claimedAcceptedRefs),
+          excludeCreatedAt: Array.from(claimedRowAnchors)
+            .filter((k) => {
+              // Only exclude rows that are NOT this LTA's own anchor
+              const ownKey = `${state.consultationCreatedAtRaw || ""}::${state.consultationNumeroManifeste || ""}`;
+              return k !== ownKey;
+            })
+            .map((k) => {
+              const sepIdx = k.indexOf("::");
+              return {
+                createdAtRaw: k.substring(0, sepIdx),
+                manifeste: k.substring(sepIdx + 2),
+              };
+            }),
           anchorCreatedAtRaw: state.consultationCreatedAtRaw || null,
           anchorNumeroManifesteRaw: state.consultationNumeroManifeste || null,
           preferNewest:
@@ -906,15 +936,48 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
         }
 
         if (!state.consultationCreatedAtRaw && createdAtRaw) {
+          const anchorKey = `${createdAtRaw}::${numeroManifesteRaw || ""}`;
+          if (!claimedRowAnchors.has(anchorKey)) {
+            claimedRowAnchors.add(anchorKey);
+            updateAutomationState(ach.folderPath, {
+              consultationCreatedAtRaw: createdAtRaw,
+              consultationNumeroManifeste: numeroManifesteRaw || "",
+            });
+            sendLog(
+              "info",
+              "Portnet",
+              `Anchored consultation row for "${ach.id}" at createdAt=${createdAtRaw}, manifeste=${numeroManifesteRaw || "N/A"} (will use manifeste to disambiguate if multiple rows share timestamp).`,
+            );
+          } else {
+            sendLog(
+              "warn",
+              "Portnet",
+              `Row anchor ${anchorKey} already claimed by another LTA — skipping anchor lock for "${ach.id}", will retry with a different row next poll.`,
+            );
+          }
+        }
+
+        // Recovery: if anchor is set but the row's ref keeps coming back empty
+        // (because another LTA already claimed it), clear the anchor so this LTA
+        // can re-anchor to a different row on the next poll.
+        if (
+          state.consultationCreatedAtRaw &&
+          isAcceptedStatus(statusText) &&
+          !refDsRaw &&
+          attempts > 3
+        ) {
+          const staleKey = `${state.consultationCreatedAtRaw}::${state.consultationNumeroManifeste || ""}`;
+          claimedRowAnchors.delete(staleKey);
           updateAutomationState(ach.folderPath, {
-            consultationCreatedAtRaw: createdAtRaw,
-            consultationNumeroManifeste: numeroManifesteRaw || "",
+            consultationCreatedAtRaw: null,
+            consultationNumeroManifeste: null,
           });
           sendLog(
-            "info",
+            "warn",
             "Portnet",
-            `Anchored consultation row for "${ach.id}" at createdAt=${createdAtRaw}, manifeste=${numeroManifesteRaw || "N/A"} (will use manifeste to disambiguate if multiple rows share timestamp).`,
+            `Cleared stale row anchor for "${ach.id}" (${staleKey}) — ref extraction was empty for ${attempts - 3} poll(s), anchor row likely claimed by another LTA. Will re-anchor next poll.`,
           );
+          continue;
         }
 
         sendLog(
@@ -1348,6 +1411,13 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
       automationState: saved[CHECKPOINT_KEY] ?? null,
     });
   }
+
+  // Sort by leading number in folder name (e.g. "7eme LTA" < "10eme LTA")
+  acheminements.sort((a, b) => {
+    const numA = parseInt(a.id, 10) || 0;
+    const numB = parseInt(b.id, 10) || 0;
+    return numA - numB;
+  });
 
   return acheminements;
 });

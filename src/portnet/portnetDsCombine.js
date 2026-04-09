@@ -24,6 +24,7 @@ const config = require("../config/config");
 const { createLogger } = require("../utils/logger");
 const {
   compressPdfForAnnex,
+  compressMawbGhostscript,
   isLikelyValidPdf,
 } = require("../utils/compressPdfChain");
 
@@ -573,6 +574,7 @@ class PortnetDsCombine {
       filenamePredicate,
       label,
       expectedRowCount,
+      compressFn = null,
     ) => {
       let dirEntries;
       try {
@@ -626,8 +628,9 @@ class PortnetDsCombine {
         uploadPath = cachePath;
         sourceUsed = "compress_cache";
       } else {
+        const compress = compressFn || ((fp) => this._compressPdfIfNeeded(fp));
         const { uploadPath: preparedPath, mode: compressMode } =
-          await this._compressPdfIfNeeded(fullPath);
+          await compress(fullPath);
         sourceUsed =
           preparedPath === fullPath
             ? "original"
@@ -745,6 +748,7 @@ class PortnetDsCombine {
       (n) => n.startsWith("mawb"),
       "A0004 - TITRE DE TRANSPORT",
       2,
+      (fp) => compressMawbGhostscript(fp, log),
     );
 
     if (
@@ -1255,8 +1259,7 @@ class PortnetDsCombine {
             (c) =>
               c.statusNorm.startsWith("envoye") ||
               c.statusNorm.startsWith("nouveau"),
-          ) ||
-          candidates[0];
+          ) || candidates[0];
 
         if (preferred?.createdAtRaw) {
           return {
@@ -1292,6 +1295,7 @@ class PortnetDsCombine {
      * @param {object} options
      *   - submittedAt: ISO timestamp for time-window matching
      *   - excludeRefDs: array of refDsMead already claimed
+     *   - excludeCreatedAt: array of {createdAtRaw, manifeste} row anchors claimed by OTHER LTAs
      *   - anchorCreatedAtRaw: "DD-MM-YYYY HH:MM" to lock on specific row (when shared dsReference)
      *   - anchorNumeroManifesteRaw: manifeste ID to disambiguate rows with same createdAt
      *   - preferNewest: if multi candidates, prefer latest (ignores time-window)
@@ -1308,6 +1312,13 @@ class PortnetDsCombine {
       (options.excludeRefDs || [])
         .map((ref) => this._normalizeRefDs(ref))
         .filter(Boolean),
+    );
+    // Rows claimed by other LTAs — excluded when no anchor set (fallback paths only)
+    const excludeCreatedAtSet = new Set(
+      (options.excludeCreatedAt || []).map(
+        (item) =>
+          `${String(item.createdAtRaw || "").trim()}::${String(item.manifeste || "").trim()}`,
+      ),
     );
     const pollFrame = this.page.frameLocator('iframe[title="iframe"]');
 
@@ -1428,7 +1439,16 @@ class PortnetDsCombine {
       const lowerBoundTs = submittedAtTs - 30 * 60 * 1000;
       const upperBoundTs = submittedAtTs + 180 * 60 * 1000;
 
-      const timeCandidates = allMatches.filter(
+      // Exclude rows already anchored to other LTAs (avoids collision when multiple
+      // LTAs share portnetRef and their rows appear in the same time window).
+      const unclaimedMatches = excludeCreatedAtSet.size
+        ? allMatches.filter((m) => {
+            const key = `${m.createdAtRaw}::${m.numeroManifesteRaw || ""}`;
+            return !excludeCreatedAtSet.has(key);
+          })
+        : allMatches;
+
+      const timeCandidates = unclaimedMatches.filter(
         (m) =>
           Number.isFinite(m.createdAtTs) &&
           m.createdAtTs >= lowerBoundTs &&
@@ -1440,7 +1460,7 @@ class PortnetDsCombine {
           `No consultation row in time window for ${portnetRef} (submittedAt=${options.submittedAt}). Falling back to closest row outside window.`,
         );
 
-        const sortable = allMatches
+        const sortable = unclaimedMatches
           .filter((m) => Number.isFinite(m.createdAtTs))
           .sort((a, b) => {
             const da = Math.abs(a.createdAtTs - submittedAtTs);
@@ -1449,7 +1469,7 @@ class PortnetDsCombine {
             return (b.createdAtTs || 0) - (a.createdAtTs || 0);
           });
 
-        const fallbackTarget = sortable[0] || allMatches[0];
+        const fallbackTarget = sortable[0] || unclaimedMatches[0];
         const fallbackAccepted =
           (fallbackTarget?.statusText === "Acceptée" ||
             fallbackTarget?.statusText === "Acceptee") &&
@@ -1494,11 +1514,18 @@ class PortnetDsCombine {
     }
 
     // Fallback path (no submittedAt available): prefer newest non-claimed accepted row.
+    // Also exclude rows anchored to other LTAs.
     let acceptedCandidates = allMatches.filter(
       (m) =>
         (m.statusText === "Acceptée" || m.statusText === "Acceptee") &&
         m.refDsShort &&
-        !excludeRefDs.has(m.refDsShort),
+        !excludeRefDs.has(m.refDsShort) &&
+        !(
+          excludeCreatedAtSet.size &&
+          excludeCreatedAtSet.has(
+            `${m.createdAtRaw}::${m.numeroManifesteRaw || ""}`,
+          )
+        ),
     );
 
     acceptedCandidates.sort(
