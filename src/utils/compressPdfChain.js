@@ -12,6 +12,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { execFile, execSync } = require("child_process");
 const { PDFDocument } = require("pdf-lib");
 const {
   ServicePrincipalCredentials,
@@ -167,7 +168,10 @@ async function writeFirstLastPagesToPath(inputPath, outputPath) {
   const indexes = n === 1 ? [0] : [0, n - 1];
   const pages = await out.copyPages(src, indexes);
   for (const p of pages) out.addPage(p);
-  const outBytes = await out.save({ useObjectStreams: true, addDefaultPage: false });
+  const outBytes = await out.save({
+    useObjectStreams: true,
+    addDefaultPage: false,
+  });
   fs.writeFileSync(outputPath, outBytes);
 }
 
@@ -223,7 +227,9 @@ async function compressPdfForAnnex(inputPath, log = {}) {
     process.env.PDF_SERVICES_CLIENT_ID || process.env.ADOBE_CLIENT_ID || "",
   ).trim();
   const adobeClientSecret = String(
-    process.env.PDF_SERVICES_CLIENT_SECRET || process.env.ADOBE_CLIENT_SECRET || "",
+    process.env.PDF_SERVICES_CLIENT_SECRET ||
+      process.env.ADOBE_CLIENT_SECRET ||
+      "",
   ).trim();
 
   function unlinkSafe(p) {
@@ -239,9 +245,7 @@ async function compressPdfForAnnex(inputPath, log = {}) {
       const sz = fs.statSync(tmp).size;
       L.info(`PDF compress (${acc.label}): ${mb(sz)} MB`);
       if (sz <= MAX_BYTES) {
-        L.info(
-          `PDF compress: ✓ ${mb(sz)} MB ≤ 2 MB — using compressed file`,
-        );
+        L.info(`PDF compress: ✓ ${mb(sz)} MB ≤ 2 MB — using compressed file`);
         return { uploadPath: tmp, mode: "compressed" };
       }
       unlinkSafe(tmp);
@@ -277,7 +281,11 @@ async function compressPdfForAnnex(inputPath, log = {}) {
   if (adobeClientId && adobeClientSecret) {
     try {
       L.info("PDF compress: trying Adobe PDF Services…");
-      const tmp = await compressViaAdobe(resolved, adobeClientId, adobeClientSecret);
+      const tmp = await compressViaAdobe(
+        resolved,
+        adobeClientId,
+        adobeClientSecret,
+      );
       const sz = fs.statSync(tmp).size;
       L.info(`PDF compress (Adobe): ${mb(sz)} MB`);
       if (sz <= MAX_BYTES) {
@@ -332,8 +340,183 @@ async function compressPdfForAnnex(inputPath, log = {}) {
   return { uploadPath: flPath, mode: "first_last" };
 }
 
+// ── MAWB Ghostscript compression (no API keys) ──────────────────────────────
+
+/**
+ * Find the Ghostscript binary on this system.
+ * Checks known Windows install paths (any gs version under Program Files\gs) then PATH.
+ * @returns {string|null}
+ */
+function findGsBinary() {
+  // Scan all installed GS versions under Program Files\gs (Windows), newest first
+  const gsBase = "C:\\Program Files\\gs";
+  if (fs.existsSync(gsBase)) {
+    try {
+      const versions = fs.readdirSync(gsBase).sort().reverse();
+      for (const v of versions) {
+        const p = path.join(gsBase, v, "bin", "gswin64c.exe");
+        if (fs.existsSync(p)) return p;
+      }
+    } catch {}
+  }
+  // Try PATH
+  for (const cmd of ["gswin64c", "gswin32c", "gs"]) {
+    try {
+      execSync(`"${cmd}" --version`, { stdio: "ignore", timeout: 3000 });
+      return cmd;
+    } catch {}
+  }
+  return null;
+}
+
+const MAWB_COMPRESS_THRESHOLD = 2 * 1024 * 1024; // 2 MB
+
+/**
+ * Compress a MAWB PDF using local Ghostscript (no API keys required).
+ * Only compresses if the file exceeds 2 MB.
+ * Tries /printer → /ebook → /screen progressively until ≤ 2 MB is reached.
+ * Validates the output with isLikelyValidPdf before accepting it.
+ * Returns the smallest valid result even if the 2 MB target is not met.
+ *
+ * @param {string} filePath - absolute path to MAWB PDF
+ * @param {{ info?: Function, warn?: Function }} log
+ * @returns {Promise<{ uploadPath: string, mode: 'original' | 'compressed' }>}
+ */
+async function compressMawbGhostscript(filePath, log = {}) {
+  const L = {
+    info: typeof log.info === "function" ? log.info.bind(log) : console.log,
+    warn: typeof log.warn === "function" ? log.warn.bind(log) : console.warn,
+  };
+
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved))
+    throw new Error(`MAWB PDF not found: ${resolved}`);
+  if (!isLikelyValidPdf(resolved))
+    throw new Error(`MAWB PDF invalid or corrupted: ${resolved}`);
+
+  const inSize = fs.statSync(resolved).size;
+  if (inSize <= MAWB_COMPRESS_THRESHOLD) {
+    L.info(
+      `MAWB compress: "${path.basename(resolved)}" is ${mb(inSize)} MB — already ≤ 2 MB, no compression needed.`,
+    );
+    return { uploadPath: resolved, mode: "original" };
+  }
+
+  const gsBin = findGsBinary();
+  if (!gsBin) {
+    L.warn(
+      `MAWB compress: Ghostscript not found — using original file (${mb(inSize)} MB). ` +
+        `Install Ghostscript from https://www.ghostscript.com/ to enable MAWB compression.`,
+    );
+    return { uploadPath: resolved, mode: "original" };
+  }
+
+  L.info(
+    `MAWB compress: "${path.basename(resolved)}" is ${mb(inSize)} MB — compressing with Ghostscript…`,
+  );
+
+  const levels = [
+    { setting: "/printer", label: "printer (300 dpi)" },
+    { setting: "/ebook", label: "ebook (150 dpi)" },
+    { setting: "/screen", label: "screen (72 dpi)" },
+  ];
+
+  let bestPath = null;
+  let bestSize = inSize;
+
+  for (const { setting, label } of levels) {
+    const tmpPath = path.join(
+      os.tmpdir(),
+      `mawb_gs_${Date.now()}_${path.basename(resolved)}`,
+    );
+    try {
+      await new Promise((resolve, reject) => {
+        execFile(
+          gsBin,
+          [
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            `-dPDFSETTINGS=${setting}`,
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            `-sOutputFile=${tmpPath}`,
+            resolved,
+          ],
+          { timeout: 60000 },
+          (err) => (err ? reject(err) : resolve()),
+        );
+      });
+
+      if (!fs.existsSync(tmpPath)) continue;
+
+      const outSize = fs.statSync(tmpPath).size;
+      const reduction = (((inSize - outSize) / inSize) * 100).toFixed(1);
+      L.info(
+        `MAWB compress [${label}]: ${mb(outSize)} MB (${reduction}% reduction)`,
+      );
+
+      if (!isLikelyValidPdf(tmpPath)) {
+        L.warn(
+          `MAWB compress [${label}]: output failed PDF validation — skipping`,
+        );
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {}
+        continue;
+      }
+
+      if (outSize <= MAWB_COMPRESS_THRESHOLD) {
+        // Target reached — clean up previous best candidate
+        if (bestPath) {
+          try {
+            fs.unlinkSync(bestPath);
+          } catch {}
+        }
+        L.info(`MAWB compress: ✓ target ≤ 2 MB reached with [${label}]`);
+        return { uploadPath: tmpPath, mode: "compressed" };
+      }
+
+      // Not small enough yet — keep as best candidate, try next level
+      if (bestPath) {
+        try {
+          fs.unlinkSync(bestPath);
+        } catch {}
+      }
+      bestPath = tmpPath;
+      bestSize = outSize;
+    } catch (err) {
+      L.warn(`MAWB compress [${label}]: Ghostscript error — ${err.message}`);
+      if (fs.existsSync(tmpPath)) {
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {}
+      }
+    }
+  }
+
+  // All 3 levels tried — use best result if smaller than original and valid
+  if (bestPath && bestSize < inSize && isLikelyValidPdf(bestPath)) {
+    L.warn(
+      `MAWB compress: could not reach ≤ 2 MB — best result is ${mb(bestSize)} MB (/screen). Using it.`,
+    );
+    return { uploadPath: bestPath, mode: "compressed" };
+  }
+
+  if (bestPath) {
+    try {
+      fs.unlinkSync(bestPath);
+    } catch {}
+  }
+  L.warn(
+    `MAWB compress: Ghostscript could not reduce size — using original (${mb(inSize)} MB).`,
+  );
+  return { uploadPath: resolved, mode: "original" };
+}
+
 module.exports = {
   compressPdfForAnnex,
+  compressMawbGhostscript,
   MAX_BYTES,
   isLikelyValidPdf,
 };
