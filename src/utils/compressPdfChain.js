@@ -24,7 +24,8 @@ const {
   CompressionLevel,
 } = require("@adobe/pdfservices-node-sdk");
 
-const MAX_BYTES = 2 * 1024 * 1024;
+const MAX_BYTES = 2 * 1024 * 1024; // 2 MB — Portnet hard upload limit
+const SAFE_BYTES = 1900 * 1024; // 1900 KB — acceptance threshold; above this → first+last fallback
 
 function mb(bytes) {
   return (bytes / (1024 * 1024)).toFixed(2);
@@ -244,13 +245,15 @@ async function compressPdfForAnnex(inputPath, log = {}) {
       const tmp = await compressViaIlove(resolved, acc.label, acc.pub, acc.sec);
       const sz = fs.statSync(tmp).size;
       L.info(`PDF compress (${acc.label}): ${mb(sz)} MB`);
-      if (sz <= MAX_BYTES) {
-        L.info(`PDF compress: ✓ ${mb(sz)} MB ≤ 2 MB — using compressed file`);
+      if (sz <= SAFE_BYTES) {
+        L.info(
+          `PDF compress: ✓ ${mb(sz)} MB ≤ 1900 KB — using compressed file`,
+        );
         return { uploadPath: tmp, mode: "compressed" };
       }
       unlinkSafe(tmp);
       L.warn(
-        `PDF compress (${acc.label}): result still > 2 MB — building first+last page PDF only (no more API calls).`,
+        `PDF compress (${acc.label}): result ${mb(sz)} MB > 1900 KB — building first+last page PDF only (no more API calls).`,
       );
       const flPath = path.join(
         os.tmpdir(),
@@ -288,12 +291,12 @@ async function compressPdfForAnnex(inputPath, log = {}) {
       );
       const sz = fs.statSync(tmp).size;
       L.info(`PDF compress (Adobe): ${mb(sz)} MB`);
-      if (sz <= MAX_BYTES) {
+      if (sz <= SAFE_BYTES) {
         return { uploadPath: tmp, mode: "compressed" };
       }
       unlinkSafe(tmp);
       L.warn(
-        "PDF compress (Adobe): result still > 2 MB — building first+last page PDF only.",
+        `PDF compress (Adobe): result ${mb(sz)} MB > 1900 KB — building first+last page PDF only.`,
       );
       const flPath = path.join(
         os.tmpdir(),
