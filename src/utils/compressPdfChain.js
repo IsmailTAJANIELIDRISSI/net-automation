@@ -419,15 +419,59 @@ async function compressMawbGhostscript(filePath, log = {}) {
   );
 
   const levels = [
-    { setting: "/printer", label: "printer (300 dpi)" },
-    { setting: "/ebook", label: "ebook (150 dpi)" },
-    { setting: "/screen", label: "screen (72 dpi)" },
+    // Level 1: standard preset — light touch for PDFs not already at low DPI
+    {
+      label: "printer (300 dpi)",
+      extraArgs: ["-dPDFSETTINGS=/printer"],
+    },
+    // Level 2: ebook preset
+    {
+      label: "ebook (150 dpi)",
+      extraArgs: ["-dPDFSETTINGS=/ebook"],
+    },
+    // Level 3: screen preset (72 dpi)
+    {
+      label: "screen (72 dpi)",
+      extraArgs: ["-dPDFSETTINGS=/screen"],
+    },
+    // Level 4: force-downsample to 96 dpi (handles pre-compressed JPEG images
+    //          that /screen alone cannot reduce because GS passes them through)
+    {
+      label: "screen + force downsample 96 dpi",
+      extraArgs: [
+        "-dPDFSETTINGS=/screen",
+        "-dDownsampleColorImages=true",
+        "-dColorImageDownsampleType=/Bicubic",
+        "-dColorImageResolution=96",
+        "-dDownsampleGrayImages=true",
+        "-dGrayImageDownsampleType=/Bicubic",
+        "-dGrayImageResolution=96",
+        "-dDownsampleMonoImages=true",
+        "-dMonoImageResolution=150",
+      ],
+    },
+    // Level 5: most aggressive — 72 dpi with lower JPEG quality
+    {
+      label: "screen + force downsample 72 dpi",
+      extraArgs: [
+        "-dPDFSETTINGS=/screen",
+        "-dDownsampleColorImages=true",
+        "-dColorImageDownsampleType=/Bicubic",
+        "-dColorImageResolution=72",
+        "-dDownsampleGrayImages=true",
+        "-dGrayImageDownsampleType=/Bicubic",
+        "-dGrayImageResolution=72",
+        "-dDownsampleMonoImages=true",
+        "-dMonoImageResolution=150",
+        "-dJPEGQ=60",
+      ],
+    },
   ];
 
   let bestPath = null;
   let bestSize = inSize;
 
-  for (const { setting, label } of levels) {
+  for (const { extraArgs, label } of levels) {
     const tmpPath = path.join(
       os.tmpdir(),
       `mawb_gs_${Date.now()}_${path.basename(resolved)}`,
@@ -439,7 +483,7 @@ async function compressMawbGhostscript(filePath, log = {}) {
           [
             "-sDEVICE=pdfwrite",
             "-dCompatibilityLevel=1.4",
-            `-dPDFSETTINGS=${setting}`,
+            ...extraArgs,
             "-dNOPAUSE",
             "-dQUIET",
             "-dBATCH",
@@ -501,7 +545,7 @@ async function compressMawbGhostscript(filePath, log = {}) {
   // All 3 levels tried — use best result if smaller than original and valid
   if (bestPath && bestSize < inSize && isLikelyValidPdf(bestPath)) {
     L.warn(
-      `MAWB compress: could not reach ≤ 2 MB — best result is ${mb(bestSize)} MB (/screen). Using it.`,
+      `MAWB compress: could not reach ≤ 2 MB — best result is ${mb(bestSize)} MB. Using it.`,
     );
     return { uploadPath: bestPath, mode: "compressed" };
   }

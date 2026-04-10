@@ -4,8 +4,9 @@
   "main": "electron/main.js",
   "scripts": {
     "autopull": "node scripts/auto-pull.js",
+    "postinstall": "npx playwright install chromium",
     "predev": "npm run autopull",
-    "dev": "concurrently -k -n VITE,ELECTRON -c cyan,green \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "dev": "concurrently -k -n VITE,ELECTRON -c cyan,green \"vite\" \"node scripts/wait-vite.js\"",
     "build:ui": "vite build",
     "build:app": "npm run build:ui && electron-builder",
     "prestart": "npm run autopull",

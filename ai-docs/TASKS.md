@@ -20,6 +20,10 @@ all list the same `Numéro de la DS de référence`. Without anchors, all LTAs w
 the same newest row → wrong `refDsMead` assignments. Fixed via `claimedRowAnchors` in
 `electron/main.js` + `excludeCreatedAt` in `getConsultationStatus`.
 
+### Fixed 2026-04-10: Manifeste compression safe-threshold
+
+Portnet rejected ~1994 KB compressed PDFs. Added `SAFE_BYTES = 1900 KB` in `compressPdfChain.js`—any compressed result > 1900 KB now falls through to first+last page fallback.
+
 ### Fixed 2026-04-09: MAWB PDF compression (Ghostscript, free)
 
 MAWB files > 2 MB were not compressed (iLovePDF/Adobe chain is manifeste-only).

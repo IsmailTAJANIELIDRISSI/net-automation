@@ -20,6 +20,14 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ## 2026 — Production fixes
 
+### 2026-04-10 — Manifeste compression safe-threshold 1900 KB
+
+**Problem:** Portnet sometimes rejected a compressed manifeste PDF that was ~1994 KB (just under the 2 MB limit), likely due to server-side tolerance issues.
+
+**Fix:** Added `SAFE_BYTES = 1900 * 1024` (1900 KB) as the acceptance threshold for compressed results in `src/utils/compressPdfChain.js`. If the API-compressed result is > 1900 KB (even if < 2 MB), the function now discards it and falls through to the first+last page fallback. `MAX_BYTES` (2 MB) is kept for the skip-if-small check and the hard limit in `portnetDsCombine.js`.
+
+**File changed:** `src/utils/compressPdfChain.js` — added `SAFE_BYTES` constant; replaced both iLovePDF and Adobe `sz <= MAX_BYTES` acceptance checks with `sz <= SAFE_BYTES`.
+
 ### 2026-04-09 — MAWB compression via Ghostscript (free, no API keys)
 
 **Problem:** MAWB PDFs can exceed 2 MB (Portnet hard limit). The existing iLovePDF/Adobe chain was designed for manifeste only. MAWB needs a free, local, zero-API-key approach.
