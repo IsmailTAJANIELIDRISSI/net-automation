@@ -1,8 +1,11 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "path";
+import { config as dotenvConfig } from "dotenv";
 
-const PORT = parseInt(process.env.VITE_PORT || "8081", 10);
+dotenvConfig(); // load .env into process.env before reading VITE_PORT
+
+const PORT = parseInt(process.env.VITE_PORT || "5173", 10);
 
 export default defineConfig({
   root: "src/ui",
