@@ -5,6 +5,29 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-04-13 — BADR finalize popup timeout fix + session reconnect
+
+**Problem:** `BADRDsCombineFinalize.downloadAutorisationEntree` used a single `page.waitForEvent("popup")` (default 120s timeout) immediately after expanding menus. On first run it always timed out; outer retry succeeded instantly because menus were already expanded. Additionally, if BADR tab is truly disconnected/stale during the popup wait, the error propagates with no reconnect attempt.
+
+**Root cause (popup timing):** Not a session issue — BADR was being refreshed every 2 minutes during Portnet polling (confirmed in logs). The 400ms settle after `expandMenuNode` was insufficient; `a#_436` click fired before the BADR menu was fully ready, popup never opened.
+
+**Root cause (session):** When BADR tab goes stale (e.g. Edge was closed externally or session expired mid-wait), the outer retry lands back with a dead page. Without reconnect inside the finalizer, it could fail again immediately.
+
+**Fix:** In `src/badr/badrDsCombineFinalize.js`:
+
+- Constructor now accepts optional `badrConn` (3rd param, default null)
+- Added `declarationLink.waitFor({ state: "visible" })` + `page.waitForTimeout(800)` after menu expansion
+- Replaced single 120s popup wait with 3 attempts × 20s each
+- After all 3 fail: if `badrConn` present → tries `navigateToAccueil()` (soft reconnect); if that also throws → does full `navigateAndLogin()` + `navigateToAccueil()`; updates `this.page = badrConn.page`; then rethrows so outer retry runs with a live session
+
+In `electron/main.js`: passes `badrConn` as 3rd arg to `new BADRDsCombineFinalize(badrConn.page, undefined, badrConn)`
+
+**Effect:** Self-heals on attempt 2 for UI timing flakiness (~20s), and on full session death it reconnects BADR before the outer retry (no manual intervention needed).
+
+**Files changed:** `src/badr/badrDsCombineFinalize.js`, `electron/main.js`
+
+---
+
 ## 2025 — Initial Development
 
 ### Architecture decisions made during build

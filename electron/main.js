@@ -768,7 +768,11 @@ async function finalizeAcceptedOnBadr(acheminement, badrRef) {
       normalizeLotReference(acheminement?.lotReference) ||
       "";
 
-    const finalizer = new BADRDsCombineFinalize(badrConn.page);
+    const finalizer = new BADRDsCombineFinalize(
+      badrConn.page,
+      undefined,
+      badrConn,
+    );
     const parsedSerie = badrRef.slice(0, -1);
     const parsedCle = badrRef.slice(-1);
 

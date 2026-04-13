@@ -6,10 +6,12 @@ const os = require("os");
 const log = createLogger("BADRDsCombineFinalize");
 
 class BADRDsCombineFinalize {
-  constructor(page, tempDownloadDir) {
+  constructor(page, tempDownloadDir, badrConn = null) {
     this.page = page;
     // Useful if we need an explicit path to save the PDF
     this.tempDownloadDir = tempDownloadDir;
+    // Optional BADRConnection reference — used to reconnect if popup fails
+    this.badrConn = badrConn;
   }
 
   /**
@@ -112,11 +114,49 @@ class BADRDsCombineFinalize {
       .locator('a#_436, a[href*="med_rech_ref_dec.xhtml"]')
       .first();
 
-    // Wait for the window event of popup
-    const [popup] = await Promise.all([
-      page.waitForEvent("popup"),
-      declarationLink.click(),
-    ]);
+    // Wait for the link to be visible + settle time for BADR menu animation
+    await declarationLink.waitFor({ state: "visible", timeout: 10000 });
+    await page.waitForTimeout(800);
+
+    // Retry popup up to 3× with 20s each — avoids the outer 120s timeout on transient BADR UI flakiness
+    let popup = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        [popup] = await Promise.all([
+          page.waitForEvent("popup", { timeout: 20000 }),
+          declarationLink.click(),
+        ]);
+        break;
+      } catch {
+        log.warn(
+          `Déclaration popup attempt ${attempt}/3 failed – retrying click…`,
+        );
+        await page.waitForTimeout(1500);
+      }
+    }
+    if (!popup) {
+      // Popup never opened — BADR tab may have gone stale. Reconnect before outer retry.
+      if (this.badrConn) {
+        log.warn(
+          "Déclaration popup failed — attempting BADR session reconnect…",
+        );
+        try {
+          await this.badrConn.navigateToAccueil();
+          log.info(
+            "BADR session soft-reconnect (navigateToAccueil) succeeded.",
+          );
+        } catch {
+          log.warn("navigateToAccueil failed — doing full BADR re-login…");
+          await this.badrConn.navigateAndLogin();
+          await this.badrConn.navigateToAccueil();
+          log.info("BADR session full re-login succeeded.");
+        }
+        this.page = this.badrConn.page; // update page ref for subsequent steps
+      }
+      throw new Error(
+        "Déclaration popup failed to open after 3 attempts (BADR reconnected — will retry)",
+      );
+    }
 
     await popup.waitForLoadState("domcontentloaded");
     log.info("Opened Déclaration search popup.");
