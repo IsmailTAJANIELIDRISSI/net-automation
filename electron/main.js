@@ -1082,10 +1082,18 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
         `Pending requests remain (${pending.size}). Waiting ${Math.round(waitMs / 60000)} minute(s) before refreshing consultation...`,
       );
       await portnetPage.waitForTimeout(waitMs);
-      await portnetPage.reload({ waitUntil: "networkidle" });
-
-      // Re-apply sort after reload (sort is lost when page reloads)
-      await dsCombine._ensureConsultationSortedByCreatedAtDesc();
+      try {
+        await portnetPage.reload({ waitUntil: "networkidle" });
+        // Re-apply sort after reload (sort is lost when page reloads)
+        await dsCombine._ensureConsultationSortedByCreatedAtDesc();
+      } catch (reloadErr) {
+        sendLog(
+          "warn",
+          "Portnet",
+          `Consultation page reload failed (${reloadErr.message}) — will retry next poll cycle.`,
+        );
+        await portnetPage.waitForTimeout(5000);
+      }
     }
   } finally {
     clearInterval(badrRefreshInterval);

@@ -5,6 +5,19 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-04-14 — Portnet consultation reload crash fixed (batch no longer stops)
+
+**Problem:** After each poll interval, `portnetPage.reload()` + `_ensureConsultationSortedByCreatedAtDesc()` is called. Inside that method, `createdAtHeader.waitFor({ state: "visible", timeout: 30000 })` threw a hard timeout when Portnet was slow to render the iframe (e.g. after 2+ hours of polling). The exception propagated all the way up to `runAllAutomationTasks`'s catch block → "Batch run failed" — killing all polling even though LTAs were still pending.
+
+**Fix:**
+
+1. `src/portnet/portnetDsCombine.js` — `_ensureConsultationSortedByCreatedAtDesc`: replaced `await waitFor(...)` (throws on timeout) with `.then(()=>true).catch(()=>false)`. If the header isn't visible in 30s, logs a warning and returns — sort will be retried next cycle, polling continues.
+2. `electron/main.js` — `monitorPendingPortnetRequests`: wrapped the `portnetPage.reload()` + `_ensureConsultationSortedByCreatedAtDesc()` block in try/catch. If reload itself fails, logs a warning, waits 5s, and continues the while loop — never crashes the batch.
+
+**Files changed:** `src/portnet/portnetDsCombine.js`, `electron/main.js`
+
+---
+
 ## 2026-04-14 — BADR MISE EN DOUANE expand check fixed (ui-state-active)
 
 **Problem:** `badrLotLookup.js` and `badrDsCombineFinalize.js` checked visibility of `#_150` to decide whether to click the MISE EN DOUANE header. When the menu was already expanded on the Accueil page, `#_150` could still appear invisible to Playwright (mid-animation or rendering edge case), causing the code to click the header and **collapse** it instead of expanding it.

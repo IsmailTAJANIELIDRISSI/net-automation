@@ -1071,7 +1071,16 @@ class PortnetDsCombine {
       '[role="columnheader"][data-field="createdAtFormatted"]',
     );
 
-    await createdAtHeader.waitFor({ state: "visible", timeout: 30000 });
+    const headerVisible = await createdAtHeader
+      .waitFor({ state: "visible", timeout: 30000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!headerVisible) {
+      log.warn(
+        "Consultation sort: Date de création header not visible within 30s (page loading slowly) — skipping sort, will retry next cycle.",
+      );
+      return;
+    }
 
     for (let i = 0; i < 3; i++) {
       const sort = (await createdAtHeader.getAttribute("aria-sort")) || "none";

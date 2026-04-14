@@ -20,6 +20,10 @@ all list the same `Numéro de la DS de référence`. Without anchors, all LTAs w
 the same newest row → wrong `refDsMead` assignments. Fixed via `claimedRowAnchors` in
 `electron/main.js` + `excludeCreatedAt` in `getConsultationStatus`.
 
+### Fixed 2026-04-14: Portnet consultation reload crash (batch stops on page timeout)
+
+`_ensureConsultationSortedByCreatedAtDesc` threw when Portnet's iframe was slow to render after reload → crash propagated to batch level → all monitoring stopped. Fixed with two layers: (1) non-throwing `waitFor` in the sort method, (2) try/catch around reload+sort in polling loop. A slow page load now logs a warning and continues to next poll cycle.
+
 ### Fixed 2026-04-14: BADR MISE EN DOUANE expand check (ui-state-active)
 
 Checking `#_150` visibility to decide whether to click the MISE EN DOUANE header was unreliable — when already expanded, Playwright could still see `#_150` as invisible and click to collapse it. Now checks `ui-state-active` on the h3 header (the class BADR adds only when truly expanded). Fixed in `badrLotLookup.js` and `badrDsCombineFinalize.js`.
