@@ -5,6 +5,16 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-04-14 — BADR MISE EN DOUANE expand check fixed (ui-state-active)
+
+**Problem:** `badrLotLookup.js` and `badrDsCombineFinalize.js` checked visibility of `#_150` to decide whether to click the MISE EN DOUANE header. When the menu was already expanded on the Accueil page, `#_150` could still appear invisible to Playwright (mid-animation or rendering edge case), causing the code to click the header and **collapse** it instead of expanding it.
+
+**Fix:** Replace `#_150` visibility check with a `classList.contains("ui-state-active")` check on the `h3.ui-panelmenu-header` that contains "MISE EN DOUANE". BADR adds `ui-state-active` + `ui-corner-top` classes and changes the icon to `ui-icon-triangle-1-s` only when truly expanded — this is the definitive signal. If `ui-state-active` is present → already expanded, skip click; otherwise → collapsed, click to expand.
+
+**Files changed:** `src/badr/badrLotLookup.js`, `src/badr/badrDsCombineFinalize.js`
+
+---
+
 ## 2026-04-13 — BADR finalize popup timeout fix + session reconnect
 
 **Problem:** `BADRDsCombineFinalize.downloadAutorisationEntree` used a single `page.waitForEvent("popup")` (default 120s timeout) immediately after expanding menus. On first run it always timed out; outer retry succeeded instantly because menus were already expanded. Additionally, if BADR tab is truly disconnected/stale during the popup wait, the error propagates with no reconnect attempt.

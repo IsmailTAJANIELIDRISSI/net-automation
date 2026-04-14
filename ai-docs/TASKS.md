@@ -20,6 +20,10 @@ all list the same `Numéro de la DS de référence`. Without anchors, all LTAs w
 the same newest row → wrong `refDsMead` assignments. Fixed via `claimedRowAnchors` in
 `electron/main.js` + `excludeCreatedAt` in `getConsultationStatus`.
 
+### Fixed 2026-04-14: BADR MISE EN DOUANE expand check (ui-state-active)
+
+Checking `#_150` visibility to decide whether to click the MISE EN DOUANE header was unreliable — when already expanded, Playwright could still see `#_150` as invisible and click to collapse it. Now checks `ui-state-active` on the h3 header (the class BADR adds only when truly expanded). Fixed in `badrLotLookup.js` and `badrDsCombineFinalize.js`.
+
 ### Fixed 2026-04-13: BADR finalize popup timeout (UI flakiness)
 
 `downloadAutorisationEntree` was waiting 120s for a popup that sometimes never fires on first click due to BADR menu animation not fully settled. Now waits 800ms + `waitFor visible` after menus expand, then retries popup click up to 3×20s. Self-heals on attempt 2 without full automation restart.

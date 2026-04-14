@@ -47,16 +47,19 @@ class BADRLotLookup {
     const page = this.page;
     log.info("Opening Lot de dédouanement popup…");
 
-    // 1a. Ensure MISE EN DOUANE panel content (#_150) is visible
-    const contentPanel = page.locator("#_150");
-    const isVisible = await contentPanel.isVisible().catch(() => false);
+    // 1a. Ensure MISE EN DOUANE panel is expanded.
+    // Reliable signal: h3 has 'ui-state-active' when expanded, not when collapsed.
+    // (Checking #_150 visibility is unreliable — BADR may have it in DOM but hidden mid-animation.)
+    const miseEnDouaneHeader = page
+      .locator(".ui-panelmenu-header")
+      .filter({ hasText: "MISE EN DOUANE" });
+    const isExpanded = await miseEnDouaneHeader
+      .evaluate((el) => el.classList.contains("ui-state-active"))
+      .catch(() => false);
 
-    if (!isVisible) {
+    if (!isExpanded) {
       log.info("MISE EN DOUANE collapsed – clicking header to expand…");
-      await page
-        .locator(".ui-panelmenu-header a")
-        .filter({ hasText: "MISE EN DOUANE" })
-        .click();
+      await miseEnDouaneHeader.locator("a").click();
       await page.waitForSelector("#_150", { state: "visible", timeout: 10000 });
       await page.waitForTimeout(500);
     } else {
@@ -116,7 +119,9 @@ class BADRLotLookup {
     // This avoids failing the workflow during testing when BADR data isn't ready yet.
     const windowDays = Number(process.env.BADR_SEARCH_WINDOW_DAYS || 6);
     const retryAttempts = Number(process.env.BADR_SEARCH_RETRY_ATTEMPTS || 2);
-    const retryShiftDays = Number(process.env.BADR_SEARCH_RETRY_SHIFT_DAYS || windowDays);
+    const retryShiftDays = Number(
+      process.env.BADR_SEARCH_RETRY_SHIFT_DAYS || windowDays,
+    );
 
     let lastResult = null;
 
@@ -170,7 +175,9 @@ class BADRLotLookup {
           { state: "visible", timeout: 15000 },
         );
         await p
-          .locator(`#${FORM}\\:operateurCmbId_INPUT_panel li.ui-autocomplete-item`)
+          .locator(
+            `#${FORM}\\:operateurCmbId_INPUT_panel li.ui-autocomplete-item`,
+          )
           .first()
           .click();
         await p.waitForTimeout(300);
@@ -210,8 +217,7 @@ class BADRLotLookup {
         () => {
           const panel = document.getElementById("j_id_1h:resultPanel");
           return (
-            panel &&
-            panel.textContent.includes("Nombre d'enregistrements")
+            panel && panel.textContent.includes("Nombre d'enregistrements")
           );
         },
         { timeout: 30000 },

@@ -87,17 +87,21 @@ class BADRDsCombineFinalize {
       }
     };
 
-    // Expand MISE EN DOUANE if collapsed
-    const contentPanel = page.locator("#_150");
-    const isVisible = await contentPanel.isVisible().catch(() => false);
-    if (!isVisible) {
+    // Expand MISE EN DOUANE if collapsed.
+    // Reliable signal: h3 has 'ui-state-active' when expanded, not when collapsed.
+    const miseEnDouaneHeader = page
+      .locator(".ui-panelmenu-header")
+      .filter({ hasText: "MISE EN DOUANE" });
+    const isMiseExpanded = await miseEnDouaneHeader
+      .evaluate((el) => el.classList.contains("ui-state-active"))
+      .catch(() => false);
+    if (!isMiseExpanded) {
       log.info("MISE EN DOUANE collapsed – clicking header to expand…");
-      await page
-        .locator(".ui-panelmenu-header a")
-        .filter({ hasText: "MISE EN DOUANE" })
-        .click();
+      await miseEnDouaneHeader.locator("a").click();
       await page.waitForSelector("#_150", { state: "visible", timeout: 10000 });
       await page.waitForTimeout(500);
+    } else {
+      log.info("MISE EN DOUANE already expanded");
     }
 
     // Expand Services -> Recherche par reference before clicking Déclaration
