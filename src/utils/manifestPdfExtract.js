@@ -150,6 +150,36 @@ function extractCurrencyFromTableColumn(text) {
 }
 
 /**
+ * Count all currency code occurrences across both page texts.
+ * Table rows each start with the currency → they dominate the count.
+ * Header has at most 1-2 references. Require > 2 votes to qualify.
+ * This is the source of truth when header currency mismatches the table.
+ */
+function extractCurrencyFromTableRows(text) {
+  const counts = {};
+  // No trailing word boundary — PDF often concatenates first cell with next:
+  // "USDMA1300013..." — \bUSD\b would fail because D is followed by M.
+  // We only require the code is NOT preceded by another uppercase letter
+  // (avoids matching e.g. "CASAUSD" or mid-word) but allow it to be followed
+  // by anything (digits, letters from the next table cell, etc.).
+  const re = /(?:^|[^A-Z])(MAD|USD|EUR|GBP|CHF|AED)/gim;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const c = m[1].toUpperCase();
+    counts[c] = (counts[c] || 0) + 1;
+  }
+  let best = null;
+  let bestCount = 2; // must appear more than twice to override header
+  for (const [c, cnt] of Object.entries(counts)) {
+    if (cnt > bestCount) {
+      bestCount = cnt;
+      best = c;
+    }
+  }
+  return best;
+}
+
+/**
  * If triplet regex misses (odd PDF spacing), scan last lines for "a b,c d" pattern.
  * Also handles multi-line footer and concatenated numbers like "2544201858,67".
  */
@@ -168,7 +198,17 @@ function extractFooterTotalLineFallback(fullText, hints = {}) {
   // Helper: extract value from potentially concatenated string
   // e.g., "2544201858,67" -> we want "201858,67"
   function extractValue(str) {
-    const src = String(str || "").replace(/\s/g, "");
+    // Scan space-separated tokens right-to-left first.
+    // Handles e.g. "2120  9719,03" → last token "9719,03" → 9719.03
+    // without the bug caused by stripping spaces and concatenating into "21209719,03".
+    const rawStr = String(str || "").trim();
+    const toksV = rawStr.split(/\s+/).filter(Boolean);
+    for (let ti = toksV.length - 1; ti >= 0; ti--) {
+      const tm = toksV[ti].match(/^(\d{1,7})[,.](\d{2})$/);
+      if (tm) return `${parseInt(tm[1], 10)}.${tm[2]}`;
+    }
+
+    const src = rawStr.replace(/\s/g, "");
 
     // Prefer already-isolated values (3-7 integer digits).
     // Requiring a non-digit boundary avoids slicing inside longer concatenated runs.
@@ -189,28 +229,25 @@ function extractFooterTotalLineFallback(fullText, hints = {}) {
       return `${intPart}.${decPart}`;
     }
 
-    // In this dataset, concatenation is usually: <small count><value>,
-    // where value commonly spans 6 digits before the decimal comma.
-    const candidateLengths = [6, 5, 7, 4, 8];
-    for (const len of candidateLengths) {
-      if (intPart.length <= len) continue;
-
-      const prefix = intPart.slice(0, intPart.length - len);
-      const valueInt = intPart.slice(-len);
-      const prefixNum = parseInt(prefix, 10);
+    // Iterate over PREFIX lengths (3→4→5→2) rather than value lengths.
+    // This correctly recovers e.g. "21209719" → prefix "212" + value 9719
+    // before trying the wrong prefix "21" + value 209719.
+    // Upper cap of 999999 on value prevents accepting a 7-digit wrong split.
+    const prefixLengths = [3, 4, 5, 2];
+    for (const pLen of prefixLengths) {
+      if (intPart.length <= pLen) continue;
+      const prefixStr = intPart.slice(0, pLen);
+      const valueInt = intPart.slice(pLen);
+      const prefixNum = parseInt(prefixStr, 10);
       const valueNum = parseInt(valueInt, 10);
-
       if (Number.isNaN(prefixNum) || Number.isNaN(valueNum)) continue;
-      if (prefixNum <= 0 || prefixNum > 50000) continue;
-      if (valueNum < 1000) continue;
-
-      return `${valueInt}.${decPart}`;
+      if (prefixNum <= 0 || prefixNum > 99999) continue;
+      if (valueNum < 1000 || valueNum >= 1000000) continue;
+      return `${valueNum}.${decPart}`;
     }
 
     // Last fallback: keep a bounded suffix.
-    return `${intPart.slice(-7)}.${decPart}`;
-
-    return null;
+    return `${parseInt(intPart.slice(-7), 10)}.${decPart}`;
   }
 
   // Strategy 1: triplet on same line with proper spacing
@@ -322,7 +359,17 @@ function extractFooterTotalValue(fullText, hints = {}) {
   // Helper: extract value from a chunk that may have concatenated numbers
   // e.g., "2544201858,67" -> we want "201858,67"
   function extractValueFromChunk(chunk) {
-    const src = String(chunk || "").replace(/\s/g, "");
+    // Scan space-separated tokens right-to-left first.
+    // Handles e.g. "2120  9719,03" → last token "9719,03" → 9719.03
+    // without the bug caused by stripping spaces and concatenating into "21209719,03".
+    const rawChunk = String(chunk || "").trim();
+    const toksC = rawChunk.split(/\s+/).filter(Boolean);
+    for (let ti = toksC.length - 1; ti >= 0; ti--) {
+      const tm = toksC[ti].match(/^(\d{1,7})[,.](\d{2})$/);
+      if (tm) return `${parseInt(tm[1], 10)}.${tm[2]}`;
+    }
+
+    const src = rawChunk.replace(/\s/g, "");
 
     // Prefer already-isolated values (3-7 integer digits).
     // Non-digit boundaries prevent grabbing a middle slice from a longer run.
@@ -343,23 +390,24 @@ function extractFooterTotalValue(fullText, hints = {}) {
         return `${intPart}.${decPart}`;
       }
 
-      const candidateLengths = [6, 5, 7, 4, 8];
-      for (const len of candidateLengths) {
-        if (intPart.length <= len) continue;
-
-        const prefix = intPart.slice(0, intPart.length - len);
-        const valueInt = intPart.slice(-len);
-        const prefixNum = parseInt(prefix, 10);
+      // Iterate over PREFIX lengths (3→4→5→2) rather than value lengths.
+      // This correctly recovers e.g. "21209719" → prefix "212" + value 9719
+      // before trying the wrong prefix "21" + value 209719.
+      // Upper cap of 999999 on value prevents accepting a 7-digit wrong split.
+      const prefixLengths = [3, 4, 5, 2];
+      for (const pLen of prefixLengths) {
+        if (intPart.length <= pLen) continue;
+        const prefixStr = intPart.slice(0, pLen);
+        const valueInt = intPart.slice(pLen);
+        const prefixNum = parseInt(prefixStr, 10);
         const valueNum = parseInt(valueInt, 10);
-
         if (Number.isNaN(prefixNum) || Number.isNaN(valueNum)) continue;
-        if (prefixNum <= 0 || prefixNum > 50000) continue;
-        if (valueNum < 1000) continue;
-
-        return `${valueInt}.${decPart}`;
+        if (prefixNum <= 0 || prefixNum > 99999) continue;
+        if (valueNum < 1000 || valueNum >= 1000000) continue;
+        return `${valueNum}.${decPart}`;
       }
 
-      return `${intPart.slice(-7)}.${decPart}`;
+      return `${parseInt(intPart.slice(-7), 10)}.${decPart}`;
     }
 
     return null;
@@ -456,7 +504,13 @@ async function extractManifestMetricsFromPdfFile(pdfPath) {
         `${firstPageText}\n${lastPageText}`,
       );
     }
-    if (!parsed.currency) {
+    // Currency: table rows are the source of truth — count occurrences across both pages.
+    // Header may say MAD but every row in the table says USD; dominant count wins.
+    const fullTextForCurrency = `${firstPageText}\n${lastPageText}`;
+    const fromTableRows = extractCurrencyFromTableRows(fullTextForCurrency);
+    if (fromTableRows) {
+      parsed.currency = fromTableRows;
+    } else if (!parsed.currency) {
       const fromTable = extractCurrencyFromTableColumn(firstPageText);
       if (fromTable) parsed.currency = fromTable;
     }

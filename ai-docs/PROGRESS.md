@@ -5,6 +5,18 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-04-15 — Manifest PDF extraction: leading zero in value + currency source of truth
+
+**Problem 1 — Leading zero in extracted value:** Footer value `13683,15` was extracted as `013683.15` instead of `13683.15`. Root cause: PDF text concatenates footer columns as `354013683,15` (no space). The split-by-6-digits logic sliced `013683` as a raw string and returned it verbatim — not stripping the leading zero.
+**Fix:** Replace `return \`${valueInt}.${decPart}\``with`return \`${parseInt(valueInt, 10)}.${decPart}\`` in both helper functions (`extractValue`in`extractFooterTotalLineFallback`and`extractValueFromChunk`in`extractFooterTotalValue`). Also fixed the `intPart.slice(-7)` last-resort return the same way.
+
+**Problem 2 — Wrong currency from header vs table:** Manifest sender sometimes writes wrong currency in the first-page header (e.g. `Currency:MAD`) while every table row actually says `USD`. The code trusted the header.
+**Fix:** Added `extractCurrencyFromTableRows(text)` that counts all `MAD/USD/EUR/...` occurrences across both page texts. Table rows each start with the currency → they dominate the count (100s of occurrences) vs header (1-2). Threshold: >2 votes. In `extractManifestMetricsFromPdfFile`, this is now applied **unconditionally** — it overrides the header currency whenever the table gives a dominant result. The old `extractCurrencyFromTableColumn` is kept as a fallback when no dominant currency is found.
+
+**File changed:** `src/utils/manifestPdfExtract.js`
+
+---
+
 ## 2026-04-14 — Portnet consultation reload crash fixed (batch no longer stops)
 
 **Problem:** After each poll interval, `portnetPage.reload()` + `_ensureConsultationSortedByCreatedAtDesc()` is called. Inside that method, `createdAtHeader.waitFor({ state: "visible", timeout: 30000 })` threw a hard timeout when Portnet was slow to render the iframe (e.g. after 2+ hours of polling). The exception propagated all the way up to `runAllAutomationTasks`'s catch block → "Batch run failed" — killing all polling even though LTAs were still pending.
