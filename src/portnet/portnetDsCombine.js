@@ -413,19 +413,6 @@ class PortnetDsCombine {
     await this._muiSelect("mui-component-select-numeroDecisionId", "821");
     await this.page.waitForTimeout(500);
 
-    // Portnet added a "Contactez-nous" (Click2Connect) widget that overlays the form.
-    // Remove it from the iframe DOM before clicking Créer so it doesn't block the button.
-    await f
-      .locator('[class*="Click2ConnectButton"]')
-      .first()
-      .evaluate((el) => {
-        const root =
-          el.closest('[style*="--verticalGradientStartColor"]') ||
-          el.parentElement;
-        root?.remove();
-      })
-      .catch(() => {}); // widget may not be present on every session
-
     // Click Créer (submit)
     await f.locator('button[type="submit"]:has-text("Créer")').click();
     log.info("Caution Créer clicked – waiting for Connaissement form…");
