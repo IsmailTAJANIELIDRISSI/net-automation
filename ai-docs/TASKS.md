@@ -20,6 +20,12 @@ all list the same `Numéro de la DS de référence`. Without anchors, all LTAs w
 the same newest row → wrong `refDsMead` assignments. Fixed via `claimedRowAnchors` in
 `electron/main.js` + `excludeCreatedAt` in `getConsultationStatus`.
 
+### Fixed 2026-04-21: Portnet "Contactez-nous" widget blocks Créer button
+
+Portnet added a Click2Connect floating widget inside the form iframe that overlays the `Créer` submit button in `fillCaution`. Fixed by evaluating JS to remove the widget root (`[style*="--verticalGradientStartColor"]` container) from the iframe DOM before clicking `Créer`. Uses `.catch(() => {})` so it's a no-op if the widget isn't present.
+
+**File changed:** `src/portnet/portnetDsCombine.js`
+
 ### Fixed 2026-04-15: Manifest PDF extraction — leading zero in value + currency source of truth
 
 Two extraction bugs: (1) footer value `13683,15` extracted as `013683.15` — fixed by using `parseInt(valueInt, 10)` instead of raw string slice when stripping prefix digits. (2) header currency (e.g. `MAD`) overrode table rows which all said `USD` — added `extractCurrencyFromTableRows` that counts currency occurrences; table rows dominate the count so they win. Both fixed in `src/utils/manifestPdfExtract.js`.

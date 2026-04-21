@@ -5,6 +5,16 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-04-21 — Portnet "Contactez-nous" widget removed before Créer click
+
+**Problem:** Portnet added a Click2Connect "Contactez-nous" floating widget inside the iframe. It renders on top of the form and intercepts clicks on the `Créer` submit button in `fillCaution`, causing the automation to click the widget instead of submitting the form.
+
+**Fix:** In `fillCaution()`, before clicking `Créer`, use `locator.evaluate()` to remove the widget's root container from the iframe DOM. The widget is identified by `[class*="Click2ConnectButton"]`; its root container is found via `closest('[style*="--verticalGradientStartColor"]')`. The `.catch(() => {})` makes it a no-op when the widget is absent (other sessions / future rollback).
+
+**File changed:** `src/portnet/portnetDsCombine.js`
+
+---
+
 ## 2026-04-15 — Manifest PDF extraction: leading zero in value + currency source of truth
 
 **Problem 1 — Leading zero in extracted value:** Footer value `13683,15` was extracted as `013683.15` instead of `13683.15`. Root cause: PDF text concatenates footer columns as `354013683,15` (no space). The split-by-6-digits logic sliced `013683` as a raw string and returned it verbatim — not stripping the leading zero.
