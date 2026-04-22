@@ -5,6 +5,39 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-04-22 — Manifest PDF total value extraction: footer concatenation bug fixed
+
+**Problem:** `extractedValue 216555.04` instead of correct `16555,04`. Root cause: `renderPageToText` concatenated same-Y items without spaces, so the footer row `2112 | 16555,04 | 870` became `"211216555,04870"`. The prefix-split fallback then tried prefix-length 3 first: prefix=`211`, value=`216555` → wrong `216555.04`.
+
+**Fix 1 — `renderPageToText`:** Added a space between consecutive items on the same Y coordinate (`if (text !== "" && lastY != null) text += " "`). The triplet pattern `(\d+)\s+(\d+,\d{2})\s+(\d+)` now cleanly matches `2112 16555,04 870`.
+
+**Fix 2 — coordinate-aware footer extraction (user's suggestion):** Added `extractPageFooterText(page)` that:
+
+- Filters text items to the bottom third of the page (Y ≤ minY + range/3)
+- Groups items by approximate Y row (±3 units), sorts each row left→right by X coordinate
+- Joins with spaces → clean `"2112 16555,04 870"`
+
+`extractFirstAndLastPageTexts` now returns an additional `footerText` field. `extractManifestMetricsFromPdfFile` tries `footerText` first (most reliable), then falls back to `lastPageText` as before.
+
+**File changed:** `src/utils/manifestPdfExtract.js`
+
+---
+
+## 2026-04-22 — Editable "Manifest ref LTA" field for refMismatch cases
+
+**Problem:** When Abdelhak creates a manifest with a wrong LTA reference (filename says `157-53609710` but PDF header says a different ref), the app showed a red mismatch warning and blocked the Lancer button. The only fix was to email Abdelhak and wait for him to fix the manifest PDF — slow.
+
+**Fix:** Added an editable "Manifest ref LTA" input that appears inside the mismatch warning block in `AcheminementCard`. It pre-fills with the manifest PDF's extracted `refNumber`. When the user types the correct reference:
+
+- It is saved to `acheminement.json` via the existing `acheminement:save` IPC channel (new `manifestRef` field added to `SAVED_FIELDS`).
+- `prepareLotAndWeightCheck` now resolves `refNumber` with `manifestRef` as highest priority (before filename-based ref).
+- `runAllAutomationTasks` filter now allows acheminements with `refMismatch` through if `manifestRef` is set.
+- The Lancer button becomes enabled once `manifestRef` is non-empty (disabled condition updated).
+
+**Files changed:** `src/ui/components/AcheminementCard.jsx`, `electron/main.js`
+
+---
+
 ## 2026-04-21 — Portnet "Contactez-nous" widget removed before Créer click
 
 **Problem:** Portnet added a Click2Connect "Contactez-nous" floating widget inside the iframe. It renders on top of the form and intercepts clicks on the `Créer` submit button in `fillCaution`, causing the automation to click the widget instead of submitting the form.

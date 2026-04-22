@@ -357,6 +357,7 @@ async function prepareLotAndWeightCheck(acheminement) {
   }
 
   const resolvedRef =
+    normalizeLotReference(acheminement.manifestRef) ||
     normalizeLotReference(refFromInput) ||
     normalizeLotReference(folderLotReference) ||
     normalizeLotReference(manifestPdfMetrics?.refNumber) ||
@@ -1194,7 +1195,9 @@ async function runAllAutomationTasks(acheminements) {
   let portnetPage = null;
 
   try {
-    const toProcess = acheminements.filter((a) => !a.refMismatch);
+    const toProcess = acheminements.filter(
+      (a) => !a.refMismatch || !!a.manifestRef,
+    );
     const needsPortnet = toProcess.some((ach) => {
       const phase = getAutomationState(ach.folderPath)?.phase;
       return !["badr_done", "partiel_skip", "weight_mismatch"].includes(phase);
@@ -1421,6 +1424,7 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
       currency: mergedCurrency,
       totalValue: mergedTotalValue,
       partiel: saved.partiel ?? false,
+      manifestRef: saved.manifestRef ?? "",
       automationState: saved[CHECKPOINT_KEY] ?? null,
     });
   }
@@ -1446,6 +1450,7 @@ const SAVED_FIELDS = [
   "currency",
   "totalValue",
   "partiel",
+  "manifestRef",
 ];
 ipcMain.handle("acheminement:save", (_event, { folderPath: fp, data }) => {
   try {

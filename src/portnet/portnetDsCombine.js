@@ -942,7 +942,7 @@ class PortnetDsCombine {
     await this.navigate();
     await this.selectAgrement();
     await this.selectAnticipationNon();
-    await this.selectTypeDSReference();
+    // await this.selectTypeDSReference();
     await this.searchAndSelectDSReference(formData.sequenceNum);
 
     await this.page.waitForTimeout(1500);

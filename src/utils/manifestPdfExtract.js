@@ -28,6 +28,9 @@ async function renderPageToText(page) {
   let text = "";
   for (const item of textContent.items) {
     if (lastY === item.transform[5] || lastY == null) {
+      // Add a space between items on the same text line so that footer numbers
+      // like "2112", "16555,04", "870" don't concatenate into "211216555,04870".
+      if (text !== "" && lastY != null) text += " ";
       text += item.str;
     } else {
       text += `\n${item.str}`;
@@ -35,6 +38,64 @@ async function renderPageToText(page) {
     lastY = item.transform[5];
   }
   return text;
+}
+
+/**
+ * Extract text only from the bottom third of a page, using X/Y coordinates.
+ * Items within the same row (Y within 3 units) are sorted left-to-right and
+ * joined with spaces. This gives a clean "2112 16555,04 870" footer line
+ * without leaking data-row noise from the table above.
+ */
+async function extractPageFooterText(page) {
+  try {
+    const textContent = await page.getTextContent({
+      normalizeWhitespace: false,
+    });
+    const items = textContent.items.filter(
+      (item) => typeof item.str === "string" && item.str.trim(),
+    );
+    if (items.length === 0) return "";
+
+    // PDF Y=0 is at the bottom; compute the bottom-third cutoff from all items.
+    const ys = items.map((item) => item.transform[5]);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const cutoffY = minY + (maxY - minY) / 3;
+
+    const footerItems = items.filter((item) => item.transform[5] <= cutoffY);
+    if (footerItems.length === 0) return "";
+
+    // Group items into rows by approximate Y position (within 3 units = same row)
+    footerItems.sort((a, b) => a.transform[5] - b.transform[5]);
+    const rows = [];
+    let currentRowY = null;
+    let currentRow = [];
+    for (const item of footerItems) {
+      const y = item.transform[5];
+      if (currentRowY === null || Math.abs(y - currentRowY) > 3) {
+        if (currentRow.length > 0) rows.push([...currentRow]);
+        currentRow = [item];
+        currentRowY = y;
+      } else {
+        currentRow.push(item);
+      }
+    }
+    if (currentRow.length > 0) rows.push(currentRow);
+
+    // Each row: sort by X (left→right), join with space
+    return rows
+      .map((row) =>
+        row
+          .sort((a, b) => a.transform[4] - b.transform[4])
+          .map((item) => item.str.trim())
+          .filter(Boolean)
+          .join(" "),
+      )
+      .filter(Boolean)
+      .join("\n");
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -56,11 +117,16 @@ async function extractFirstAndLastPageTexts(dataBuffer) {
     texts.push(await renderPageToText(page));
   }
 
+  // Coordinate-aware footer text from the last page (bottom third only)
+  const lastPage = await doc.getPage(n);
+  const footerText = await extractPageFooterText(lastPage);
+
   await doc.destroy();
 
   return {
     firstPageText: texts[0] || "",
     lastPageText: texts[texts.length - 1] || "",
+    footerText,
     numpages: n,
   };
 }
@@ -482,10 +548,12 @@ async function extractManifestMetricsFromPdfFile(pdfPath) {
     let firstPageText;
     let lastPageText;
 
+    let footerText = "";
     try {
       const pages = await extractFirstAndLastPageTexts(buf);
       firstPageText = pages.firstPageText;
       lastPageText = pages.lastPageText;
+      footerText = pages.footerText || "";
     } catch (pageErr) {
       const data = await pdfParse(buf);
       const fullText = String(data.text || "");
@@ -515,9 +583,27 @@ async function extractManifestMetricsFromPdfFile(pdfPath) {
       if (fromTable) parsed.currency = fromTable;
     }
 
-    let totalValue = extractFooterTotalValue(lastPageText, {
-      poidsKg: parsed.poidTotal,
-    });
+    // 1. Try coordinate-extracted footer text first (bottom third of last page).
+    //    This avoids the same-line concatenation problem (e.g. "211216555,04870").
+    let totalValue = null;
+    if (footerText) {
+      totalValue = extractFooterTotalValue(footerText, {
+        poidsKg: parsed.poidTotal,
+      });
+      if (!totalValue) totalValue = extractFooterTotalValue(footerText, {});
+      if (!totalValue)
+        totalValue = extractFooterTotalLineFallback(footerText, {
+          poidsKg: parsed.poidTotal,
+        });
+      if (!totalValue)
+        totalValue = extractFooterTotalLineFallback(footerText, {});
+    }
+    // 2. Fall back to full last-page text.
+    if (!totalValue) {
+      totalValue = extractFooterTotalValue(lastPageText, {
+        poidsKg: parsed.poidTotal,
+      });
+    }
     if (!totalValue) {
       totalValue = extractFooterTotalValue(lastPageText, {});
     }

@@ -20,6 +20,18 @@ all list the same `Numéro de la DS de référence`. Without anchors, all LTAs w
 the same newest row → wrong `refDsMead` assignments. Fixed via `claimedRowAnchors` in
 `electron/main.js` + `excludeCreatedAt` in `getConsultationStatus`.
 
+### Fixed 2026-04-22: Manifest PDF total value wrong (216555 instead of 16555)
+
+Root cause: `renderPageToText` concatenated same-Y items without spaces → footer `2112 16555,04 870` became `211216555,04870` → prefix-split returned `216555`. Fixed by: (1) adding a space between same-Y items in `renderPageToText`; (2) new `extractPageFooterText` function that crops to bottom third of last page using X/Y coordinates and sorts items left→right. `footerText` is now tried first in extraction chain.
+
+**File changed:** `src/utils/manifestPdfExtract.js`
+
+### Fixed 2026-04-22: Editable "Manifest ref LTA" to bypass refMismatch
+
+When manifest PDF has wrong LTA ref, users can now type the correct reference in a new "Manifest ref LTA" input (shown in the mismatch warning area). Once filled, the Lancer button unlocks and the corrected ref is used at every automation step. Persisted to `acheminement.json` as `manifestRef`.
+
+**Files changed:** `src/ui/components/AcheminementCard.jsx`, `electron/main.js`
+
 ### Fixed 2026-04-21: Portnet "Contactez-nous" widget blocks Créer button
 
 Portnet added a Click2Connect floating widget inside the form iframe that overlays the `Créer` submit button in `fillCaution`. Fixed by evaluating JS to remove the widget root (`[style*="--verticalGradientStartColor"]` container) from the iframe DOM before clicking `Créer`. Uses `.catch(() => {})` so it's a no-op if the widget isn't present.

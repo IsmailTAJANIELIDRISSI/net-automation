@@ -107,11 +107,28 @@ export default function AcheminementCard({
 
       {/* ── Ref mismatch warning ────────────────────────────────────────── */}
       {ach.refMismatch && (
-        <div className="flex items-center gap-2 bg-red-900/40 border border-red-700/60 rounded-lg px-3 py-2">
+        <div className="flex flex-col gap-2 bg-red-900/40 border border-red-700/60 rounded-lg px-3 py-2">
           <span className="text-red-400 text-xs font-semibold">
             ⚠️ Incohérence de référence (noms de fichiers et/ou texte du
-            manifeste PDF) — corrigez avant de lancer
+            manifeste PDF) — corrigez la référence ci-dessous
           </span>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-slate-400 font-medium">
+              Manifest ref LTA
+            </label>
+            <input
+              type="text"
+              value={ach.manifestRef ?? ach.manifestPdfExtract?.refNumber ?? ""}
+              placeholder="ex: 157-53609710"
+              disabled={isGlobalRunning}
+              onChange={(e) => onChange(id, "manifestRef", e.target.value)}
+              className="bg-slate-900 border border-amber-600/60 rounded px-2.5 py-1.5 text-sm
+                         text-slate-100 placeholder-slate-600
+                         focus:border-amber-400 focus:ring-1 focus:ring-amber-400/50
+                         disabled:opacity-50 disabled:cursor-not-allowed
+                         transition-colors"
+            />
+          </div>
         </div>
       )}
 
@@ -191,7 +208,9 @@ export default function AcheminementCard({
       {/* ── Run button ─────────────────────────────────────────────────────── */}
       <button
         onClick={() => onRun(ach)}
-        disabled={isGlobalRunning || isDone || !!ach.refMismatch}
+        disabled={
+          isGlobalRunning || isDone || (!!ach.refMismatch && !ach.manifestRef)
+        }
         className={`mt-1 w-full py-2 rounded-lg text-sm font-semibold transition-all duration-200
           ${
             isDone
