@@ -198,6 +198,16 @@ class PortnetDsCombine {
     await iframeLoc.waitFor({ timeout: TIMEOUT });
     this.frame = this.page.frameLocator("main iframe");
 
+    // Zoom out to 65% for better visibility
+    try {
+      await this.frame.locator("body").evaluate(() => {
+        document.body.style.zoom = "0.67";
+      });
+      log.info("Zoomed out Portnet iframe to 65%.");
+    } catch (e) {
+      log.warn("Failed to zoom out Portnet iframe", { message: e.message });
+    }
+
     // Wait for the React MUI form to mount inside the iframe
     await this.frame
       .locator("#mui-component-select-declarationAnticipation")
@@ -415,6 +425,7 @@ class PortnetDsCombine {
 
     // Robustly remove all possible "Contactez-nous" (Click2Connect) widgets that overlay the form.
     // Try multiple strategies: remove all matching elements, retry after a delay, and also by text.
+    let widgetRemoved = false;
     for (let attempt = 0; attempt < 3; attempt++) {
       await f.locator("body").evaluate(() => {
         // Remove all containers with the Click2ConnectButton class
@@ -440,8 +451,16 @@ class PortnetDsCombine {
       const stillPresent = await f
         .locator('[class*="Click2ConnectButton"]')
         .count();
-      if (stillPresent === 0) break;
+      if (stillPresent === 0) {
+        widgetRemoved = true;
+        break;
+      }
       await this.page.waitForTimeout(700);
+    }
+    if (!widgetRemoved) {
+      log.info(
+        'No "Contactez-nous" widget found to remove, proceeding to submit.',
+      );
     }
 
     // Click Créer (submit)
