@@ -416,7 +416,7 @@ class PortnetDsCombine {
     // Robustly remove all possible "Contactez-nous" (Click2Connect) widgets that overlay the form.
     // Try multiple strategies: remove all matching elements, retry after a delay, and also by text.
     for (let attempt = 0; attempt < 3; attempt++) {
-      await f.evaluate(() => {
+      await f.locator("body").evaluate(() => {
         // Remove all containers with the Click2ConnectButton class
         document
           .querySelectorAll('[class*="Click2ConnectButton"]')
