@@ -413,18 +413,36 @@ class PortnetDsCombine {
     await this._muiSelect("mui-component-select-numeroDecisionId", "821");
     await this.page.waitForTimeout(500);
 
-    // Portnet added a "Contactez-nous" (Click2Connect) widget that overlays the form.
-    // Remove it from the iframe DOM before clicking Créer so it doesn't block the button.
-    await f
-      .locator('[class*="Click2ConnectButton"]')
-      .first()
-      .evaluate((el) => {
-        const root =
-          el.closest('[style*="--verticalGradientStartColor"]') ||
-          el.parentElement;
-        root?.remove();
-      })
-      .catch(() => {}); // widget may not be present on every session
+    // Robustly remove all possible "Contactez-nous" (Click2Connect) widgets that overlay the form.
+    // Try multiple strategies: remove all matching elements, retry after a delay, and also by text.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await f.evaluate(() => {
+        // Remove all containers with the Click2ConnectButton class
+        document
+          .querySelectorAll('[class*="Click2ConnectButton"]')
+          ?.forEach((el) => {
+            const root =
+              el.closest('[style*="--verticalGradientStartColor"]') ||
+              el.parentElement;
+            if (root) root.remove();
+          });
+        // Remove any floating Contactez-nous by text
+        document.querySelectorAll("body *").forEach((el) => {
+          if (
+            el.textContent?.trim() === "Contactez-nous" &&
+            el.closest('[style*="--verticalGradientStartColor"]')
+          ) {
+            el.closest('[style*="--verticalGradientStartColor"]').remove();
+          }
+        });
+      });
+      // If still present, wait and retry
+      const stillPresent = await f
+        .locator('[class*="Click2ConnectButton"]')
+        .count();
+      if (stillPresent === 0) break;
+      await this.page.waitForTimeout(700);
+    }
 
     // Click Créer (submit)
     await f.locator('button[type="submit"]:has-text("Créer")').click();

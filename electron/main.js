@@ -1124,8 +1124,7 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
               );
             } else if (!retryResult?.success) {
               const error =
-                retryResult?.error ||
-                "Re-submit after Nouveau status failed";
+                retryResult?.error || "Re-submit after Nouveau status failed";
               updateAutomationState(ach.folderPath, { phase: "error", error });
               sendProgress(ach.id, "error", { error });
               sendLog(
