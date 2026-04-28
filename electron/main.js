@@ -313,6 +313,10 @@ function isRejectedStatus(statusText) {
   return normalizePortnetStatus(statusText).startsWith("rejetee");
 }
 
+function isNouveauStatus(statusText) {
+  return normalizePortnetStatus(statusText).startsWith("nouveau");
+}
+
 async function prepareLotAndWeightCheck(acheminement) {
   const {
     id,
@@ -1061,6 +1065,76 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
           sendProgress(ach.id, "error", { error });
           sendLog("error", "Automation", `Failed for "${ach.id}": ${error}`);
           pending.delete(ach.id);
+        } else if (isNouveauStatus(statusText) && attempts > 2) {
+          // "Nouveau" means the form was saved as a draft — the Envoyer click did
+          // not actually send the request. Re-fill the entire Portnet form.
+          const MAX_NOUVEAU_RETRIES = 3;
+          const nouveauRetries = state.nouveauRetryCount || 0;
+
+          if (nouveauRetries >= MAX_NOUVEAU_RETRIES) {
+            const error = `DS Combinée for "${ach.id}" (${state.portnetRef}) is stuck at Nouveau status after ${MAX_NOUVEAU_RETRIES} retries — manual intervention required.`;
+            updateAutomationState(ach.folderPath, { phase: "error", error });
+            sendProgress(ach.id, "error", { error });
+            sendLog("error", "Automation", `Failed for "${ach.id}": ${error}`);
+            pending.delete(ach.id);
+          } else {
+            sendLog(
+              "warn",
+              "Portnet",
+              `Status "Nouveau" (draft, not sent) detected for "${ach.id}" (${state.portnetRef}) at attempt ${attempts}. Re-filling Portnet form from scratch (retry ${nouveauRetries + 1}/${MAX_NOUVEAU_RETRIES})...`,
+            );
+
+            // Release the claimed anchor so it won't block the re-submit
+            const staleKey = `${state.consultationCreatedAtRaw}::${state.consultationNumeroManifeste || ""}`;
+            claimedRowAnchors.delete(staleKey);
+
+            // Preserve lotInfo (BADR-confirmed data) before clearing submission fields
+            const savedLotInfo = state.lotInfo;
+
+            updateAutomationState(ach.folderPath, {
+              phase: "badr_checked",
+              portnetRef: null,
+              submittedAt: null,
+              consultationCreatedAtRaw: null,
+              consultationNumeroManifeste: null,
+              attempts: 0,
+              nouveauRetryCount: nouveauRetries + 1,
+              lotInfo: savedLotInfo,
+              error: null,
+            });
+
+            pending.delete(ach.id);
+
+            // Read the latest user-saved acheminement data for the retry
+            const freshAchData = readAcheminementFile(ach.folderPath);
+            const retryAch = { ...ach, ...(freshAchData || {}) };
+
+            const retryResult = await submitPortnetPhase(
+              retryAch,
+              savedLotInfo,
+              portnetPage,
+            );
+
+            if (retryResult?.success && !retryResult?.debugStop) {
+              pending.set(ach.id, ach);
+              sendLog(
+                "info",
+                "Portnet",
+                `Re-submission succeeded for "${ach.id}" after Nouveau retry ${nouveauRetries + 1} — resuming monitoring.`,
+              );
+            } else if (!retryResult?.success) {
+              const error =
+                retryResult?.error ||
+                "Re-submit after Nouveau status failed";
+              updateAutomationState(ach.folderPath, { phase: "error", error });
+              sendProgress(ach.id, "error", { error });
+              sendLog(
+                "error",
+                "Automation",
+                `Re-submit after Nouveau failed for "${ach.id}": ${error}`,
+              );
+            }
+          }
         }
       }
 

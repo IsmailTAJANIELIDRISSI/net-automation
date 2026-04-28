@@ -323,38 +323,59 @@ class BADRDsCombineFinalize {
     // Go back to main BADR window
     await page.bringToFront();
 
-    // Expand "DEDOUANEMENT"
-    const dedouanementPanel = page.locator(
-      'h3.ui-panelmenu-header:has-text("DEDOUANEMENT")',
-    );
-    const isExpanded =
-      (await dedouanementPanel.getAttribute("aria-expanded")) === "true";
-    if (!isExpanded) {
-      log.info("Clicking DEDOUANEMENT to expand...");
-      await dedouanementPanel.click();
-      await page.waitForTimeout(500);
+    // Expand DEDOUANEMENT → DS MEAD COMBINEE → Déclarer scellés, with retry on
+    // hidden-element timeouts (PrimeFaces menu can render items as hidden after
+    // a previous popup closes). On failure, refresh Accueil and re-expand.
+    const MAX_MENU_RETRIES = 3;
+    for (let menuAttempt = 1; menuAttempt <= MAX_MENU_RETRIES; menuAttempt++) {
+      try {
+        // Expand "DEDOUANEMENT"
+        const dedouanementPanel = page.locator(
+          'h3.ui-panelmenu-header:has-text("DEDOUANEMENT")',
+        );
+        const isExpanded =
+          (await dedouanementPanel.getAttribute("aria-expanded")) === "true";
+        if (!isExpanded) {
+          log.info("Clicking DEDOUANEMENT to expand...");
+          await dedouanementPanel.click();
+          await page.waitForTimeout(700);
+        }
+
+        // Expand "DS MEAD COMBINEE"
+        log.info("Expanding DS MEAD COMBINEE...");
+        const dsMeadCombineeNode = page
+          .locator(
+            'a#_205151, a.ui-menuitem-link:has(span.ui-menuitem-text:text-is("DS MEAD COMBINEE"))',
+          )
+          .first();
+        await dsMeadCombineeNode.waitFor({ state: "visible", timeout: 15000 });
+        await dsMeadCombineeNode.click();
+        await page.waitForTimeout(700);
+
+        // Click "Déclarer scellés DS MEAD combinée"
+        log.info("Clicking Déclarer scellés...");
+        const declarerLink = page
+          .locator(
+            'a#_12251, a[title*="codeFonctionnalite=cf12251"], a[href*="dsMeadCombineeScelle.xhtml"]',
+          )
+          .first();
+        await declarerLink.waitFor({ state: "visible", timeout: 15000 });
+        await declarerLink.click();
+
+        break; // menu navigation succeeded — exit retry loop
+      } catch (menuErr) {
+        if (menuAttempt >= MAX_MENU_RETRIES) throw menuErr;
+        log.warn(
+          `DEDOUANEMENT menu stuck (attempt ${menuAttempt}/${MAX_MENU_RETRIES}): ${menuErr.message}. Refreshing BADR Accueil and retrying...`,
+        );
+        if (this.badrConn) {
+          await this.badrConn.navigateToAccueil();
+        } else {
+          await page.reload({ waitUntil: "networkidle" });
+          await page.waitForTimeout(2000);
+        }
+      }
     }
-
-    // Expand "DS MEAD COMBINEE" using a deterministic selector to avoid strict-mode collisions.
-    log.info("Expanding DS MEAD COMBINEE...");
-    const dsMeadCombineeNode = page
-      .locator(
-        'a#_205151, a.ui-menuitem-link:has(span.ui-menuitem-text:text-is("DS MEAD COMBINEE"))',
-      )
-      .first();
-    await dsMeadCombineeNode.waitFor({ state: "visible", timeout: 15000 });
-    await dsMeadCombineeNode.click();
-    await page.waitForTimeout(500);
-
-    // Click "Déclarer scellés DS MEAD combinée"
-    log.info("Clicking Déclarer scellés..."); // Handle UTF-8 safely
-    const declarerLink = page
-      .locator(
-        'a#_12251, a[title*="codeFonctionnalite=cf12251"], a[href*="dsMeadCombineeScelle.xhtml"]',
-      )
-      .first();
-    await declarerLink.waitFor({ state: "visible", timeout: 15000 });
-    await declarerLink.click();
 
     const resolveVisibleLocator = async (
       contexts,
