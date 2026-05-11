@@ -27,6 +27,7 @@
   "description": "Playwright automation for BADR + Portnet DS Combinée workflow",
   "dependencies": {
     "@adobe/pdfservices-node-sdk": "^4.1.0",
+    "@google/genai": "^1.52.0",
     "@ilovepdf/ilovepdf-nodejs": "^0.3.1",
     "adm-zip": "^0.5.17",
     "dotenv": "^16.6.1",

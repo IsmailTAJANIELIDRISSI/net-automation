@@ -215,12 +215,44 @@ class BADRConnection {
   }
 
   /**
+   * Returns true when the current page is the BADR session-expired screen.
+   * Detected by URL path OR by the visible error message in the DOM.
+   */
+  async _isSessionExpired() {
+    if (!this.page || this.page.isClosed()) return false;
+    if (this.page.url().includes("session_timeout")) return true;
+    return await this.page
+      .locator(".ui-messages-error-detail")
+      .filter({ hasText: /expir/i })
+      .isVisible()
+      .catch(() => false);
+  }
+
+  /**
    * Navigate to BADR Accueil and wait for page to stabilize.
    * Resets the DOM context to a known state before starting new operations.
+   * Automatically recovers from session-timeout by re-logging in.
    */
   async navigateToAccueil() {
     if (!this.page || this.page.isClosed()) {
       log.warn("BADR page is closed – cannot navigate to Accueil");
+      return;
+    }
+
+    // ── Session timeout detection: click the recovery button → re-login ─────
+    if (await this._isSessionExpired()) {
+      log.warn(
+        "BADR session expired — clicking recovery button and re-logging in…",
+      );
+      // The timeout page has an 'Accueil' button that calls allerLogin('/badr')
+      // Clicking it navigates to the login page automatically.
+      await this.page
+        .locator("#j_id32_j_id_1b")
+        .click()
+        .catch(() => {});
+      await this.page.waitForTimeout(1500);
+      await this.navigateAndLogin();
+      log.info("Session recovery complete — BADR re-login successful.");
       return;
     }
 

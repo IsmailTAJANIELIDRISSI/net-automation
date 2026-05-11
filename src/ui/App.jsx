@@ -17,6 +17,8 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [isRunning, setIsRunning] = useState(false);
   const [logPanelOpen, setLogPanelOpen] = useState(true);
+  // Set of card ids currently running a shipper MAWB extraction
+  const [shipperLoadingIds, setShipperLoadingIds] = useState(new Set());
 
   const checkpointToStatus = (state) => {
     switch (state?.phase) {
@@ -127,10 +129,7 @@ export default function App() {
         lieuChargement: prevMap[a.id]?.lieuChargement ?? a.lieuChargement,
         currency:
           preferNonEmptyPrev(prevMap[a.id]?.currency, a.currency) || "MAD",
-        totalValue: preferNonEmptyPrev(
-          prevMap[a.id]?.totalValue,
-          a.totalValue,
-        ),
+        totalValue: preferNonEmptyPrev(prevMap[a.id]?.totalValue, a.totalValue),
         manifestPdfExtract:
           a.manifestPdfExtract ?? prevMap[a.id]?.manifestPdfExtract,
         automationState: a.automationState ?? prevMap[a.id]?.automationState,
@@ -146,9 +145,44 @@ export default function App() {
     // Persist to acheminement.json inside the folder so data survives restarts
     const ach = achRef.current.find((a) => a.id === id);
     if (ach) {
+      // If toggling partiel ON and no shipperName yet, show skeleton loading
+      const willExtract =
+        key === "partiel" && value === true && !ach.shipperName;
+      if (willExtract) {
+        setShipperLoadingIds((prev) => new Set([...prev, id]));
+      }
       window.api
         .saveAcheminement(ach.folderPath, { ...ach, [key]: value })
-        .catch(() => {});
+        .then((result) => {
+          // If saving partiel=true triggered extraction, update the fields
+          if (
+            result?.shipperName ||
+            result?.mawbCurrency ||
+            result?.fretValue
+          ) {
+            setAcheminements((prev) =>
+              prev.map((a) => {
+                if (a.id !== id) return a;
+                const patch = {};
+                if (result.shipperName) patch.shipperName = result.shipperName;
+                if (result.mawbCurrency)
+                  patch.mawbCurrency = result.mawbCurrency;
+                if (result.fretValue) patch.fretValue = result.fretValue;
+                return { ...a, ...patch };
+              }),
+            );
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (willExtract) {
+            setShipperLoadingIds((prev) => {
+              const next = new Set(prev);
+              next.delete(id);
+              return next;
+            });
+          }
+        });
     }
   }, []);
 
@@ -331,6 +365,7 @@ export default function App() {
                   ach={ach}
                   status={statuses[ach.id]?.status ?? "idle"}
                   isGlobalRunning={isRunning}
+                  shipperLoading={shipperLoadingIds.has(ach.id)}
                   onChange={handleChange}
                   onRun={handleRun}
                 />

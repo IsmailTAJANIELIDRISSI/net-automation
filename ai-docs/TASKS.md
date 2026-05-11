@@ -8,10 +8,77 @@ The core automation flow is **fully implemented and working in production**:
 - BADR pré-apurement weight check ✅
 - Portnet DS Combinée form (all 9 steps) ✅
 - PDF compression chain (iLovePDF → Adobe → fallback) ✅
+- **DUM Normale Partiel (BADR DUM 085) — fully implemented, in active testing ✅**
+  - 4 UI inputs per partiel LTA (shipperName, fretValue, mawbCurrency, qteFacturee)
+  - Exchange rate utility (BAM → frankfurter → OXR)
+  - MAWB shipper extraction
+  - Lot lookup collects all partiel rows (partiels[] array)
+  - `badrDumNormalPartiel.js`: 10-step BADR form, checkpointed per tab
+  - 12-phase state machine in main.js
+  - Step 1: radio + reference fields + checkbox ✅
+  - Step 5: lieu autocomplete wait + item matching ✅; ref cleaned ✅
+  - Step 5: poids rounding correction (≤1 kg → auto-fix Entête + Articles) ✅
+  - Step 6: compressPdfForAnnex wired; short filename (≤49 chars); upload waitFor ✅
+  - Devise MAWB: free-text input (auto-uppercase), any ISO code accepted ✅
+- **MAWB auto-extraction: shipper + currency + fret value ✅** (2026-05-08)
+  - Scanned PDFs: Gemini Vision reads image-based MAWBs natively (no OCR tool needed)
+  - Text-based PDFs: regex extracts currency code + Total Prepaid amount
+  - `mawbCurrency` and `fretValue` auto-populated when partiel checkbox is enabled
+
+## Next Steps / Testing
+
+- [ ] Verify upload table selector `#mainTab:form7:listFichiersAnnexeDT_data` matches real DOM — if upload verify still fails, paste table HTML
+- [ ] Verify Caution `li[data-label='S2021000002']` label matches exact BADR UI text
+- [ ] Verify Demandes Diverses textarea structure (scellés replace pattern)
+- [ ] Check if `a[href='#mainTab:tab11']` is the correct transport tab anchor
+- [ ] Check if `a[href='#mainTab:tab0']` is the correct Entête tab anchor (used in `_correctEntePoids`)
+- [ ] Email notifications — TODOMAIL poids mismatch > 1 kg is now logged; wire nodemailer
+
 - Portnet polling for Acceptée/Rejetée ✅
 - BADR finalize (scellés declaration) ✅
 - Electron UI with per-LTA cards and live log panel ✅
 - Checkpoint/resume system ✅
+
+---
+
+## Next: DUM Normale Partiel Automation (spec ready in DUM-NORMAL-PARTIEL-PROMPT.md)
+
+Full implementation spec written. Implement in this order:
+
+### Phase 0 — Prep (no BADR automation yet)
+
+- [ ] `manifestPdfExtract.js` — add `qteFacturee` (1st footer triplet number) to returned object
+- [ ] `mawbShipperExtract.js` — create: extract shipper name from MAWB PDF via `know_companies.json`
+- [ ] `AcheminementCard.jsx` — add 4 conditional inputs when `partiel=true`: `shipperName`, `fretValue`, `mawbCurrency`, `qteFacturee`
+- [ ] `electron/main.js` — add 4 fields to `SAVED_FIELDS`; auto-populate `shipperName` + `qteFacturee` from scan
+- [ ] `index.js` — add `/exchange-rate` endpoint (BAM → frankfurter → OXR fallback)
+
+### Phase 1 — BADR Lot Lookup (Partiel)
+
+- [ ] `badrLotLookup.js` — when `partiel=true` and ≥2 rows: collect all into `partiels[]` array; if <2 rows return `{ waitForMoreLots: true }`
+
+### Phase 2 — BADR DUM Declaration
+
+- [ ] `badrDumNormalPartiel.js` — CREATE: 10-step flow (Entête → Transport → Caution → Préapurement loop → Documents → Demandes → Articles → Print)
+- [ ] `electron/main.js` — add 12 new partiel phases to state machine; orchestration path for `partiel=true` LTAs
+
+---
+
+Some LTAs were running BADR finalization again after `Workflow fully complete`. Root cause was a resume path in `monitorPendingPortnetRequests()` that finalized any `badrRef` checkpoint, even when `phase` was already `badr_done`. Fixed by gating the resume call to only run when `state.badrRef && state.phase !== "badr_done"`.
+
+**File changed:** `electron/main.js`
+
+### Fixed 2026-04-23: BADR DEDOUANEMENT menu items hidden after popup closes
+
+`declarerScelles()` was timing out because `a#_205151` (DS MEAD COMBINEE) and `a#_12251` (Déclarer scellés) resolved as hidden in PrimeFaces after the prior download popup closed. Fixed by wrapping the full DEDOUANEMENT → DS MEAD COMBINEE → Déclarer scellés click sequence in a retry loop (max 3 attempts) that calls `badrConn.navigateToAccueil()` on timeout before re-expanding.
+
+**File changed:** `src/badr/badrDsCombineFinalize.js`
+
+### Fixed 2026-04-23: "Nouveau" status after submit → retry full Portnet form fill
+
+After clicking Envoyer, if the consultation row shows status `Nouveau` (draft, not actually sent), the monitoring loop now detects it at attempt > 2 and re-fills the entire Portnet form from scratch using saved `lotInfo` (no BADR re-query). Up to 3 retries; 4th stuck → error state.
+
+**File changed:** `electron/main.js`
 
 ### Fixed 2026-04-09: Multi-LTA consultation row collision
 
@@ -35,6 +102,24 @@ When manifest PDF has wrong LTA ref, users can now type the correct reference in
 ### Fixed 2026-04-21: Portnet "Contactez-nous" widget blocks Créer button
 
 Portnet added a Click2Connect floating widget inside the form iframe that overlays the `Créer` submit button in `fillCaution`. Fixed by evaluating JS to remove the widget root (`[style*="--verticalGradientStartColor"]` container) from the iframe DOM before clicking `Créer`. Uses `.catch(() => {})` so it's a no-op if the widget isn't present.
+
+**File changed:** `src/portnet/portnetDsCombine.js`
+
+### Fixed 2026-04-22: Manifest PDF total value wrong (216555 instead of 16555)
+
+Root cause: `renderPageToText` concatenated same-Y items without spaces → footer `2112 16555,04 870` became `211216555,04870` → prefix-split returned `216555`. Fixed by: (1) adding a space between same-Y items in `renderPageToText`; (2) new `extractPageFooterText` function that crops to bottom third of last page using X/Y coordinates and sorts items left→right. `footerText` is now tried first in extraction chain.
+
+**File changed:** `src/utils/manifestPdfExtract.js`
+
+### Fixed 2026-04-22: Editable "Manifest ref LTA" to bypass refMismatch
+
+When manifest PDF has wrong LTA ref, users can now type the correct reference in a new "Manifest ref LTA" input (shown in the mismatch warning area). Once filled, the Lancer button unlocks and the corrected ref is used at every automation step. Persisted to `acheminement.json` as `manifestRef`.
+
+**Files changed:** `src/ui/components/AcheminementCard.jsx`, `electron/main.js`
+
+### Fixed 2026-04-21: Portnet "Contactez-nous" widget blocks Créer again
+
+The floating "Contactez-nous" (Click2Connect) widget was again blocking the Créer button in the Portnet caution form. The removal logic in `fillCaution()` is now robust: it removes all matching elements, also by text, and retries up to 3 times if needed.
 
 **File changed:** `src/portnet/portnetDsCombine.js`
 

@@ -221,6 +221,10 @@ const {
   pickManifestPdf,
   pickMawbPdf,
 } = require("../src/utils/manifestPdfExtract");
+const {
+  extractShipperName,
+  extractMawbMeta,
+} = require("../src/utils/mawbShipperExtract");
 
 function extractLotReferenceFromFolder(folderPath) {
   try {
@@ -275,11 +279,25 @@ function mapCheckpointToStatus(state) {
     case "portnet_accepted":
       return "portnet-accepted";
     case "badr_done":
+    case "partiel_done":
       return "done";
     case "weight_mismatch":
+    case "partiel_poids_mismatch":
       return "weight-mismatch";
     case "partiel_skip":
       return "partiel-skip";
+    case "partiel_waiting_lots":
+      return "partiel-waiting-lots";
+    case "partiel_lots_found":
+    case "partiel_declaration_opened":
+    case "partiel_entete_saved":
+    case "partiel_transport_saved":
+    case "partiel_caution_saved":
+    case "partiel_preapurement_done":
+    case "partiel_documents_saved":
+    case "partiel_demandes_saved":
+    case "partiel_articles_saved":
+      return "running";
     case "error":
       return "error";
     default:
@@ -840,7 +858,9 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
     const state = getAutomationState(ach.folderPath);
     if (!state) continue;
 
-    if (state.badrRef) {
+    // Only resume BADR finalization for accepted-but-not-completed LTAs.
+    // LTAs already marked as badr_done must never run finalization again.
+    if (state.badrRef && state.phase !== "badr_done") {
       await finalizeAcceptedOnBadr(ach, state.badrRef);
       continue;
     }
@@ -874,7 +894,7 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
     } finally {
       badrRefreshInProgress = false;
     }
-  }, 120000); // 120 seconds = 2 minutes
+  }, 45000); // 45 seconds — frequent enough to keep BADR session alive
 
   const maxAttempts = 240;
   try {
@@ -1175,6 +1195,133 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
   }
 }
 
+// ── Partiel DUM Normale — full BADR flow (no Portnet) ────────────────────────
+
+async function runPartielDumFlow(acheminement) {
+  const { id, folderPath } = acheminement;
+  sendLog("info", "Automation", `Partiel DUM Normale flow for: ${id}`);
+  sendProgress(id, "running");
+
+  const checkpoint = getAutomationState(folderPath);
+  if (checkpoint?.phase === "partiel_done") {
+    sendProgress(id, "done");
+    return { success: true, skipped: true };
+  }
+  if (checkpoint?.phase === "partiel_poids_mismatch") {
+    sendProgress(id, "weight-mismatch");
+    return { success: false, error: checkpoint.errorMessage };
+  }
+  if (checkpoint?.phase === "partiel_waiting_lots") {
+    sendLog("info", "BADR", `"${id}" en attente du 2ème vol — rien à faire`);
+    sendProgress(id, "partiel-waiting-lots");
+    return { success: false, skipped: true, reason: "partiel_waiting_lots" };
+  }
+
+  try {
+    const BADRLotLookup = require("../src/badr/badrLotLookup");
+    const BADRDumNormalPartiel = require("../src/badr/badrDumNormalPartiel");
+
+    const badrConn = await ensureBadrSession();
+    await badrConn.navigateToAccueil();
+
+    // ── Lot lookup
+    const resolvedRef = acheminement.refNumber || acheminement.id;
+    const lotLookup = new BADRLotLookup(badrConn.page);
+    await lotLookup.openLotPopup();
+    const lotResult = await lotLookup.searchLot(resolvedRef);
+    await lotLookup.close();
+
+    if (lotResult.isEmpty) {
+      updateAutomationState(folderPath, {
+        phase: "error",
+        error: "Pas encours manifest",
+      });
+      sendProgress(id, "error", { error: "Pas encours manifest" });
+      return { success: false, error: "Pas encours manifest" };
+    }
+
+    if (lotResult.isPartiel && !lotResult.partiels) {
+      // rowCount >= 2 but partiels array not populated — should not happen with new code
+      updateAutomationState(folderPath, {
+        phase: "error",
+        error: "Partiels not collected",
+      });
+      sendProgress(id, "error", { error: "Partiels not collected" });
+      return { success: false, error: "Partiels not collected" };
+    }
+
+    if (!lotResult.isPartiel && lotResult.rowCount === 1) {
+      // Only 1 lot found — waiting for second flight
+      updateAutomationState(folderPath, { phase: "partiel_waiting_lots" });
+      sendLog(
+        "warn",
+        "BADR",
+        `"${id}" — 1 seul lot trouvé, en attente du 2ème vol`,
+      );
+      sendProgress(id, "partiel-waiting-lots");
+      return { success: false, skipped: true, reason: "partiel_waiting_lots" };
+    }
+
+    // Persist partiels array + lots_found phase
+    const existing = readAcheminementFile(folderPath);
+    existing.partiels = lotResult.partiels;
+    writeAcheminementFile(folderPath, existing);
+    updateAutomationState(folderPath, { phase: "partiel_lots_found" });
+    sendLog(
+      "info",
+      "BADR",
+      `"${id}" — ${lotResult.partiels.length} lots collectés`,
+    );
+
+    // ── Run DUM declaration
+    const freshAch = {
+      ...acheminement,
+      partiels: lotResult.partiels,
+      automationState: getAutomationState(folderPath),
+    };
+    const { BadrSessionError } = BADRDumNormalPartiel;
+    const MAX_BADR_RETRIES = 3;
+    for (let attempt = 1; attempt <= MAX_BADR_RETRIES; attempt++) {
+      // Re-read saved phase on every attempt so we resume from the last checkpoint
+      const attemptAch = {
+        ...freshAch,
+        automationState: getAutomationState(folderPath),
+      };
+      const dum = new BADRDumNormalPartiel(badrConn.page);
+      try {
+        await dum.run(attemptAch, badrConn, (patch) => {
+          updateAutomationState(folderPath, patch);
+          attemptAch.automationState = getAutomationState(folderPath);
+        });
+        break; // success — exit retry loop
+      } catch (err) {
+        if (err instanceof BadrSessionError && attempt < MAX_BADR_RETRIES) {
+          sendLog(
+            "warn",
+            "Automation",
+            `BADR erreur interne détectée — tentative ${attempt + 1}/${MAX_BADR_RETRIES}…`,
+          );
+          await new Promise((r) => setTimeout(r, 3000));
+          continue;
+        }
+        throw err; // non-BADR error or exhausted retries
+      }
+    }
+
+    sendProgress(id, "done");
+    return { success: true };
+  } catch (err) {
+    updateAutomationState(folderPath, { phase: "error", error: err.message });
+    sendLog(
+      "error",
+      "Automation",
+      `Partiel flow failed for "${id}": ${err.message}`,
+    );
+    sendProgress(id, "error", { error: err.message });
+    return { success: false, error: err.message };
+  }
+}
+
 async function runAutomationTask(
   acheminement,
   { stopAfterSubmit = false, sharedPortnetPage = null } = {},
@@ -1192,6 +1339,11 @@ async function runAutomationTask(
     sendLog("info", "Automation", `Skipping "${id}" — already completed.`);
     sendProgress(id, "done", { declarationRef: checkpoint.badrRef });
     return { success: true, declarationRef: checkpoint.badrRef, skipped: true };
+  }
+
+  // ── Partiel DUM Normale path ──────────────────────────────────────────────
+  if (acheminement.partiel === true) {
+    return await runPartielDumFlow(acheminement);
   }
 
   if (hasAcceptedPortnet) {
@@ -1273,7 +1425,13 @@ async function runAllAutomationTasks(acheminements) {
     );
     const needsPortnet = toProcess.some((ach) => {
       const phase = getAutomationState(ach.folderPath)?.phase;
-      return !["badr_done", "partiel_skip", "weight_mismatch"].includes(phase);
+      return ![
+        "badr_done",
+        "partiel_done",
+        "partiel_skip",
+        "partiel_waiting_lots",
+        "weight_mismatch",
+      ].includes(phase);
     });
 
     if (needsPortnet) {
@@ -1287,6 +1445,14 @@ async function runAllAutomationTasks(acheminements) {
 
       if (checkpoint?.phase === "badr_done") {
         sendProgress(ach.id, "done", { declarationRef: checkpoint.badrRef });
+        continue;
+      }
+      if (checkpoint?.phase === "partiel_done") {
+        sendProgress(ach.id, "done");
+        continue;
+      }
+      if (ach.partiel === true) {
+        await runPartielDumFlow(ach);
         continue;
       }
       if (hasSubmittedPortnet && !hasAcceptedPortnet) {
@@ -1440,6 +1606,55 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
         refNumber || normalizeLotReference(manifestPdfExtract.refNumber) || "";
     }
 
+    // ── Auto-extract shipper name from MAWB PDF (partiel LTAs) ──────────
+    const savedForShipper = readAcheminementFile(dirPath);
+    if (savedForShipper.partiel && !savedForShipper.shipperName && mawb) {
+      try {
+        const mawbPath = path.join(dirPath, mawb);
+        const knowCompaniesPath = path.join(
+          __dirname,
+          "..",
+          "known_companies.json",
+        );
+        sendLog(
+          "info",
+          "MAWB",
+          `[${entry.name}] Extraction expéditeur depuis: ${mawb}`,
+        );
+        const meta = await extractMawbMeta(mawbPath, knowCompaniesPath, (msg) =>
+          sendLog("info", "MAWB", `[${entry.name}] ${msg}`),
+        );
+        if (meta.shipperName || meta.mawbCurrency || meta.fretValue) {
+          savedForShipper.shipperName =
+            meta.shipperName || savedForShipper.shipperName;
+          // Persist back so it shows up on next scan
+          const current = readAcheminementFile(dirPath);
+          const patch = {};
+          if (meta.shipperName) patch.shipperName = meta.shipperName;
+          if (meta.mawbCurrency) patch.mawbCurrency = meta.mawbCurrency;
+          if (meta.fretValue) patch.fretValue = meta.fretValue;
+          writeAcheminementFile(dirPath, { ...current, ...patch });
+          sendLog(
+            "info",
+            "MAWB",
+            `[${entry.name}] ✓ Extrait: expéditeur="${meta.shipperName}" devise=${meta.mawbCurrency} fret=${meta.fretValue}`,
+          );
+        } else {
+          sendLog(
+            "warn",
+            "MAWB",
+            `[${entry.name}] Extraction retournée null — aucun expéditeur trouvé`,
+          );
+        }
+      } catch (e) {
+        sendLog(
+          "warn",
+          "MAWB",
+          `[${entry.name}] Extraction expéditeur échouée: ${e.message}`,
+        );
+      }
+    }
+
     const filenameMismatch = !!(
       mawbRef &&
       manifesteRef &&
@@ -1498,6 +1713,15 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
       totalValue: mergedTotalValue,
       partiel: saved.partiel ?? false,
       manifestRef: saved.manifestRef ?? "",
+      shipperName: saved.shipperName ?? "",
+      fretValue: saved.fretValue ?? "",
+      mawbCurrency: saved.mawbCurrency ?? "",
+      qteFacturee: pickSavedOrExtracted(
+        saved.qteFacturee,
+        manifestPdfExtract?.ok ? manifestPdfExtract.qteFacturee : null,
+        "",
+      ),
+      partiels: saved.partiels ?? null,
       automationState: saved[CHECKPOINT_KEY] ?? null,
     });
   }
@@ -1524,22 +1748,119 @@ const SAVED_FIELDS = [
   "totalValue",
   "partiel",
   "manifestRef",
+  "shipperName",
+  "fretValue",
+  "mawbCurrency",
+  "qteFacturee",
+  "partiels",
 ];
-ipcMain.handle("acheminement:save", (_event, { folderPath: fp, data }) => {
-  try {
-    const existing = readAcheminementFile(fp);
-    const toSave = Object.fromEntries(
-      SAVED_FIELDS.map((k) => [k, data[k] ?? null]),
-    );
-    if (existing[CHECKPOINT_KEY]) {
-      toSave[CHECKPOINT_KEY] = existing[CHECKPOINT_KEY];
+ipcMain.handle(
+  "acheminement:save",
+  async (_event, { folderPath: fp, data }) => {
+    try {
+      const existing = readAcheminementFile(fp);
+      const toSave = Object.fromEntries(
+        SAVED_FIELDS.map((k) => [k, data[k] ?? null]),
+      );
+      if (existing[CHECKPOINT_KEY]) {
+        toSave[CHECKPOINT_KEY] = existing[CHECKPOINT_KEY];
+      }
+      writeAcheminementFile(fp, toSave);
+
+      // ── Auto-extract shipper name when partiel is newly enabled ──────────
+      let extractedShipperName = null;
+      let extractedMeta = null;
+      if (data.partiel === true && !data.shipperName) {
+        const folderName = path.basename(fp);
+        sendLog(
+          "info",
+          "MAWB",
+          `[${folderName}] partiel=true détecté — recherche MAWB PDF dans: ${fp}`,
+        );
+        try {
+          const files = fs
+            .readdirSync(fp)
+            .filter((f) => f.toLowerCase().endsWith(".pdf"));
+          sendLog(
+            "info",
+            "MAWB",
+            `[${folderName}] PDFs trouvés: ${files.join(", ") || "(aucun)"}`,
+          );
+          const mawbFile = pickMawbPdf(files);
+          if (!mawbFile) {
+            sendLog(
+              "warn",
+              "MAWB",
+              `[${folderName}] Aucun MAWB PDF trouvé (pickMawbPdf → null)`,
+            );
+          } else {
+            sendLog(
+              "info",
+              "MAWB",
+              `[${folderName}] MAWB sélectionné: ${mawbFile} — extraction expéditeur...`,
+            );
+            const mawbPath = path.join(fp, mawbFile);
+            const knowCompaniesPath = path.join(
+              __dirname,
+              "..",
+              "known_companies.json",
+            );
+            const knowExists = fs.existsSync(knowCompaniesPath);
+            sendLog(
+              "info",
+              "MAWB",
+              `[${folderName}] known_companies.json: ${knowExists ? "trouvé" : "ABSENT (fallback actif)"}`,
+            );
+            const meta = await extractMawbMeta(
+              mawbPath,
+              knowCompaniesPath,
+              (msg) => sendLog("info", "MAWB", `[${folderName}] ${msg}`),
+            );
+            extractedMeta = meta;
+            extractedShipperName = meta.shipperName || null;
+            if (meta.shipperName || meta.mawbCurrency || meta.fretValue) {
+              const refreshed = readAcheminementFile(fp);
+              const patch = {};
+              if (meta.shipperName) patch.shipperName = meta.shipperName;
+              if (meta.mawbCurrency) patch.mawbCurrency = meta.mawbCurrency;
+              if (meta.fretValue) patch.fretValue = meta.fretValue;
+              writeAcheminementFile(fp, { ...refreshed, ...patch });
+              sendLog(
+                "info",
+                "MAWB",
+                `[${folderName}] ✓ Extrait: expéditeur="${meta.shipperName}" devise=${meta.mawbCurrency} fret=${meta.fretValue}`,
+              );
+            } else {
+              sendLog(
+                "warn",
+                "MAWB",
+                `[${folderName}] Extraction retournée null — aucun expéditeur trouvé dans le PDF`,
+              );
+            }
+          }
+        } catch (e) {
+          sendLog(
+            "error",
+            "MAWB",
+            `[${folderName}] Extraction expéditeur échouée: ${e.message}`,
+          );
+        }
+      } else if (data.partiel === true && data.shipperName) {
+        // Already has a shipper name, skip silently
+      }
+
+      return {
+        ok: true,
+        shipperName: extractedShipperName,
+        mawbCurrency: extractedMeta?.mawbCurrency ?? null,
+        fretValue: extractedMeta?.fretValue ?? null,
+      };
+    } catch (e) {
+      console.error("[acheminement:save] Failed:", e.message);
+      return { ok: false };
     }
-    writeAcheminementFile(fp, toSave);
-  } catch (e) {
-    console.error("[acheminement:save] Failed:", e.message);
-  }
-  return { ok: true };
-});
+  },
+);
 
 // ── IPC: Open file in OS explorer ────────────────────────────────────────────
 ipcMain.handle("shell:openPath", async (_event, filePath) => {

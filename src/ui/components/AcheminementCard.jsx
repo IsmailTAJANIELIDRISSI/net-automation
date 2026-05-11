@@ -9,6 +9,7 @@ export default function AcheminementCard({
   ach,
   status = "idle",
   isGlobalRunning,
+  shipperLoading = false,
   onChange,
   onRun,
 }) {
@@ -199,11 +200,58 @@ export default function AcheminementCard({
         />
         <span className="text-xs text-slate-400">
           LTA Partielle
-          <span className="ml-1 text-slate-600">
-            (attente 2ème vol – ignorer)
-          </span>
+          <span className="ml-1 text-slate-600">(DUM Normale — 2 vols)</span>
         </span>
       </label>
+
+      {/* ── Partiel extra fields ──────────────────────────────────────────── */}
+      {ach.partiel && (
+        <div className="grid grid-cols-2 gap-2 border border-yellow-700/40 bg-yellow-900/10 rounded-lg p-3">
+          <div className="col-span-2">
+            <label className="text-xs text-yellow-400 font-semibold mb-1 block">
+              Champs DUM Normale Partiel
+            </label>
+          </div>
+          {/* Expéditeur field — shows skeleton while MAWB extraction is running */}
+          <div className="col-span-2">
+            {shipperLoading ? (
+              <div className="flex flex-col gap-1">
+                <label className="text-xs text-slate-400 font-medium">Expéditeur (société)</label>
+                <div className="relative h-9 rounded overflow-hidden bg-slate-900 border border-slate-700">
+                  <div className="absolute inset-0 bg-gradient-to-r from-slate-900 via-slate-700/60 to-slate-900
+                                  animate-shimmer
+                                  bg-[length:200%_100%]" />
+                  <span className="absolute inset-0 flex items-center px-3 text-xs text-slate-500 italic">
+                    Extraction MAWB en cours…
+                  </span>
+                </div>
+              </div>
+            ) : (
+              field("shipperName", "Expéditeur (société)", "ex: SHANGHAI FIXLINK...")
+            )}
+          </div>
+          {field("fretValue", "Valeur fret MAWB", "ex: 1200.00", "number")}
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-slate-400 font-medium">
+              Devise MAWB
+            </label>
+            <input
+              type="text"
+              value={ach.mawbCurrency ?? ""}
+              disabled={isGlobalRunning}
+              maxLength={3}
+              placeholder="USD"
+              onChange={(e) =>
+                onChange(id, "mawbCurrency", e.target.value.toUpperCase())
+              }
+              className="bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-sm
+                         text-slate-100 focus:border-yellow-500 focus:ring-1 focus:ring-yellow-500/50
+                         disabled:opacity-50 disabled:cursor-not-allowed transition-colors w-24"
+            />
+          </div>
+          {field("qteFacturee", "Quantité facturée", "ex: 1618", "number")}
+        </div>
+      )}
 
       {/* ── Run button ─────────────────────────────────────────────────────── */}
       <button

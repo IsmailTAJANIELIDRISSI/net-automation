@@ -48,20 +48,29 @@ class BADRLotLookup {
     log.info("Opening Lot de dédouanement popup…");
 
     // 1a. Ensure MISE EN DOUANE panel is expanded.
-    // Reliable signal: h3 has 'ui-state-active' when expanded, not when collapsed.
-    // (Checking #_150 visibility is unreliable — BADR may have it in DOM but hidden mid-animation.)
-    const miseEnDouaneHeader = page
-      .locator(".ui-panelmenu-header")
-      .filter({ hasText: "MISE EN DOUANE" });
-    const isExpanded = await miseEnDouaneHeader
-      .evaluate((el) => el.classList.contains("ui-state-active"))
-      .catch(() => false);
+    // Most reliable signal: #_150 aria-hidden="false" when expanded, "true" when collapsed.
+    // (Checking header classes or visibility is flaky — ui-helper-hidden is present in both states.)
+    const isMiseEnDouaneExpanded = () =>
+      page
+        .locator("#_150")
+        .evaluate((el) => el.getAttribute("aria-hidden") === "false")
+        .catch(() => false);
 
-    if (!isExpanded) {
+    if (!(await isMiseEnDouaneExpanded())) {
       log.info("MISE EN DOUANE collapsed – clicking header to expand…");
-      await miseEnDouaneHeader.locator("a").click();
-      await page.waitForSelector("#_150", { state: "visible", timeout: 10000 });
-      await page.waitForTimeout(500);
+      await page
+        .locator(".ui-panelmenu-header")
+        .filter({ hasText: "MISE EN DOUANE" })
+        .locator("a")
+        .click();
+      // Wait for aria-hidden to flip to "false" — not for visibility (ui-helper-hidden stays)
+      await page.waitForFunction(
+        () =>
+          document.querySelector("#_150")?.getAttribute("aria-hidden") ===
+          "false",
+        { timeout: 10000 },
+      );
+      await page.waitForTimeout(300);
     } else {
       log.info("MISE EN DOUANE already expanded");
     }
@@ -270,10 +279,49 @@ class BADRLotLookup {
       return { isEmpty: true, isPartiel: false, rowCount: 0, lotReference };
     }
 
-    // ── 2+ results → DS Partiel → caller must skip ────────────────────────────
+    // ── 2+ results → DS Partiel → collect all rows ────────────────────────────
     if (rowCount >= 2) {
-      log.warn(`${rowCount} rows → DS Partiel detected – skipping`);
-      return { isEmpty: false, isPartiel: true, rowCount, lotReference };
+      log.info(`${rowCount} rows → DS Partiel — collecting all lots`);
+      const partiels = [];
+      const rows = p.locator("#j_id_1h\\:ListelotdataTable tbody tr");
+      const count = await rows.count();
+      for (let i = 0; i < count; i++) {
+        const cells = rows.nth(i).locator("td");
+        const lieu = (
+          await cells
+            .nth(1)
+            .textContent()
+            .catch(() => "")
+        ).trim();
+        const refText = (
+          await cells
+            .nth(2)
+            .locator("a")
+            .first()
+            .textContent()
+            .catch(() => "")
+        ).trim();
+        const ref = (
+          await cells
+            .nth(0)
+            .textContent()
+            .catch(() => "")
+        ).trim();
+        // Parse "301-000-2026-0005406-X" → serie="5406", cle="X"
+        const rParts = refText.split("-");
+        const rawSerie = rParts[3] || "";
+        const cle = rParts[4] || "";
+        const serie = String(parseInt(rawSerie, 10) || rawSerie);
+        partiels.push({ serie, cle, lieu, ref });
+      }
+      log.info("Partiel lots collected", partiels);
+      return {
+        isEmpty: false,
+        isPartiel: true,
+        rowCount,
+        lotReference,
+        partiels,
+      };
     }
 
     // ── 1 result → DS Combiné ─────────────────────────────────────────────────

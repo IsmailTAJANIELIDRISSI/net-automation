@@ -5,6 +5,203 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-05-11 — BADR session timeout: auto-recovery + faster refresh
+
+**Problem:** During Portnet polling, BADR's session expired (page: `hab_session_timeout.xhtml`, error: "Votre session est expirée !"). The 2-minute refresh was too slow (BADR times out sooner). When the popup failed, `navigateToAccueil()` was called but it just navigated to the Accueil URL without detecting the timeout state, so it arrived at the same expired-session error page, causing the whole run to fail.
+
+**Fix (2 files):**
+
+1. **`src/badr/badrConnection.js`**:
+   - Added `_isSessionExpired()`: checks URL contains `session_timeout` OR `.ui-messages-error-detail` containing "expir" is visible
+   - Added recovery block at the top of `navigateToAccueil()`: if expired → click the page's `#j_id32_j_id_1b` "Accueil" button (which calls `allerLogin('/badr')`) → wait 1.5s → call `navigateAndLogin()` → return. Full re-login happens transparently.
+
+2. **`electron/main.js`**:
+   - Reduced BADR session refresh interval from `120000` ms → `45000` ms (45 seconds) to prevent timeout from occurring in the first place.
+
+**Result:** Any call to `navigateToAccueil()` (during polling refresh, popup reconnect, or step retry) now auto-heals a timed-out session before proceeding.
+
+---
+
+## 2026-05-11 — Python script: Gemini Vision extraction for scanned MAWBs
+
+**Task:** Mirror the JS `extractVisionMeta` pattern from `mawbShipperExtract.js` into the Python script `extract_shipper_example/script_all_fuzy_match.py`.
+
+**Changes:**
+
+- Added `extract_vision_meta(pdf_path)` function:
+  - Reads the PDF as base64
+  - Sends it to Gemini Vision (`application/pdf` inline data) with a single prompt asking for shipper name, currency, and total prepaid
+  - Falls back through `GEMINI_MODEL_FALLBACKS` (gemini-3.1-flash-lite-preview → gemini-2.5-flash → gemini-1.5-flash)
+  - Returns `(shipper_name, mawb_currency, fret_value)` tuple — any value may be `None`
+  - Strips markdown code fences from Gemini response before JSON parse
+- Modified `extract_shipper_name()` image-based branch:
+  - If `setup_gemini_api()` succeeds → calls `extract_vision_meta(pdf_path)` first
+  - If Vision returns a shipper name → cleans it with `clean_company_name`, adds to DB, returns immediately (skip OCR pipeline entirely)
+  - If Vision returns nothing → falls through to existing OCR pipeline (ocrmypdf → tesseract → pdftotext)
+
+**Why:** OCR pipeline (tesseract/ocrmypdf) is slow, requires system tools, and is fragile on flattened-layout scanned MAWBs. Gemini Vision handles these in one API call with no system dependencies.
+
+---
+
+## 2026-05-11 — Devise MAWB: free-text input + remove USD fallback
+
+**Problem:** Devise MAWB was a fixed `<select>` (USD/EUR/HKD/CNY/GBP/AED/MAD). When extraction returned an unlisted code (e.g. `MYR`), the `?? "USD"` fallback in `folder:scan` silently substituted USD, causing wrong exchange rate in the Articles tab.
+
+**Fix:**
+
+- Replaced `<select>` with a free-text `<input maxLength={3}>` that auto-uppercases on change (`e.target.value.toUpperCase()`). Any 3-letter ISO currency code works without a code change.
+- Removed `?? "USD"` fallback in `main.js` folder:scan handler — empty string is returned when extraction finds nothing, so the user sees a blank field and must fill it manually.
+- `MYR` was already in `KNOWN_CURRENCY_RE` in `mawbShipperExtract.js` — extraction was correct, only the UI/fallback was broken.
+
+**Files changed:**
+
+- `src/ui/components/AcheminementCard.jsx` — select → input with toUpperCase
+- `electron/main.js` — `?? "USD"` → `?? ""`
+
+---
+
+## 2026-05-08 — DUM Normale Partiel: progressive fixes (selectors, lieu autocomplete, documents, poids correction)
+
+**Problems fixed (in order):**
+
+1. **Radio "Création à partir d'une déclaration existante" never clicked** — `<input>` is inside `div.ui-helper-hidden-accessible`; Playwright blocks hidden elements. `.catch(() => {})` silently swallowed the failure. Fixed: click `table#rootForm:modeTransport_radioId2 .ui-radiobutton-box` (the visible PrimeFaces widget). AJAX populates `#rootForm:panelRefDecExistante`; reference fields filled by exact IDs (`refExist_bureauId`, `refExist_anneeId`, `refExist_serieId`, `refExist_cleId`). Régime is readonly (085), skipped.
+
+2. **Lieu de chargement autocomplete not selected** — was using `isVisible({ timeout })` which doesn't poll, so script moved on before dropdown appeared. Fixed: `waitFor({ state: "visible", timeout: 10000 })` + `.filter({ hasText: p.lieu })` to pick the right item (e.g. `ISTAMBOUL ATATUR(IST)` not `ISTAMBOUL(TRIST)`).
+
+3. **`p.ref` contained scraped whitespace + ETAT trailer** — `"235-97484855\n\t\t\t...ETAT : PreapureAcquisCaution"`. Fixed: `String(p.ref).split(/[\r\n]/)[0].trim()` keeps only first line.
+
+4. **`compressPdfChain is not a function`** — export name is `compressPdfForAnnex`, not `compressPdfChain`. Also return value is `{ uploadPath, mode }` not a plain string. Fixed import and destructuring.
+
+5. **Upload verification used `isVisible` (single check)** — changed to `waitFor({ state: "visible", timeout: 15000 })` so it retries until the table row appears.
+
+6. **Filename > 50 chars** — iLovePDF temp file `portnet_annex_ilove_primary_<ts>_Manifeste 235-97484855.pdf` exceeded BADR's 50-char limit. Fixed: build short name from `<reference>_<originalStem>.slice(0, 45).pdf` (e.g. `fac_Manifeste_235-97484855.pdf` = 29 chars).
+
+7. **Poids rounding mismatch (1583 vs 1583.1)** — BADR lots report fractional kg while manifest stores integer. Old threshold was > 20 kg → mismatch error. New logic:
+   - diff > 1 kg → log `TODOMAIL`, throw error, mark `partiel_poids_mismatch`
+   - diff ≤ 1 kg → update `ach.poidTotal` in-memory, navigate back to Entête tab and re-fill `poidBrutTotal_input` with authoritative value, then save. Subsequent steps (Articles: poids net, qté normalisée) use corrected value naturally.
+   - New helper `_correctEntePoids(iframe, poids)` added.
+
+**Files changed:**
+
+- `src/badr/badrDumNormalPartiel.js` — all 7 fixes above
+
+---
+
+## 2026-05-08 — MAWB: scanned PDF support + currency + fret value auto-extraction
+
+**What:** Extended MAWB extraction to handle scanned (image-based) PDFs and to auto-extract `mawbCurrency` and `fretValue` (Total Prepaid) in addition to the shipper name.
+
+**Problem:** Scanned MAWBs (e.g. 065-46093530.pdf from Saudi Arabian Airlines) produced only 2 characters via `pdf-parse`, so shipper extraction returned null. Also, `mawbCurrency` and `fretValue` were never auto-populated — users had to type them manually.
+
+**Solution:**
+
+- Replaced single-purpose `extractWithGeminiVision` with `extractVisionMeta` — sends raw PDF bytes (base64) to Gemini Vision, asks for **all 3 fields** (`shipper_name`, `currency`, `total_prepaid`) in one API call. No local OCR/Tesseract needed.
+- Added `extractMetaFromText(text, log)` — regex-based fallback for text-based PDFs: finds currency code near the "Currency" label; finds amount near "Total Prepaid" label.
+- Added `extractMawbMeta(pdfPath, knowCompaniesPath, log)` as the new main entry point → returns `{ shipperName, mawbCurrency, fretValue }`.
+- Kept `extractShipperName` as a backward-compat thin wrapper.
+
+**Files changed:**
+
+- `src/utils/mawbShipperExtract.js` — `extractVisionMeta`, `extractMetaFromText`, `extractMawbMeta`, updated `module.exports`
+- `electron/main.js` — import `extractMawbMeta`, both call sites updated, all 3 fields persisted to `acheminement.json`, returned in IPC response
+- `src/ui/App.jsx` — `.then` handler updated to apply `mawbCurrency` and `fretValue` to card state
+
+**Decisions:**
+
+- Gemini Vision gets one call for all 3 fields (scanned path) — avoids 2–3 separate API calls
+- Text-based path uses regex; currency code from within 120-char window after "Currency" label
+
+---
+
+**What:** Implemented all 8 tasks for DUM Normale Partiel BADR automation.
+
+**Files changed:**
+
+- `src/utils/manifestPdfExtract.js` — added `extractFooterTriplet()`, wired `qteFacturee` into output
+- `src/utils/mawbShipperExtract.js` — CREATED: extracts shipper from MAWB PDF via `known_companies.json`
+- `src/utils/exchangeRate.js` — CREATED: `fetchMADRate(currency)` with 3-provider fallback (BAM→frankfurter→OXR), `roundBADR(value)`
+- `src/ui/components/AcheminementCard.jsx` — added 4 partiel inputs (`shipperName`, `fretValue`, `mawbCurrency`, `qteFacturee`) in yellow panel
+- `src/badr/badrLotLookup.js` — `rowCount>=2` now collects all rows into `partiels[]` array (serie/cle/lieu/ref per row)
+- `src/badr/badrDumNormalPartiel.js` — CREATED: 10-step BADR DUM 085 class, all tabs, checkpointed per phase
+- `electron/main.js` — SAVED_FIELDS + scan shipper wiring + `runPartielDumFlow()` function + partiel routing in `runAutomationTask` + `runAllAutomationTasks` + phase map extended with 12 partiel phases
+
+**Decisions:**
+
+- Exchange rate is a direct Node utility (not an HTTP endpoint on `index.js`) — simpler, no network round-trip
+- `prepareLotAndWeightCheck` partiel-skip guard kept (harmless; partiel is intercepted earlier in `runAutomationTask`)
+- Poids mismatch threshold for partiel: >20 kg → hard stop with `partiel_poids_mismatch` phase
+
+---
+
+## 2026-05-07 — DUM Normale Partiel — structured automation spec written
+
+**What:** Reformulated and structured `DUM-NORMAL-PARTIEL-PROMPT.md` from raw notes into a full implementation spec for automating the BADR DUM 085 (Transit à l'import) declaration flow for partiel LTAs.
+
+**Spec covers:**
+
+- 4 new AcheminementCard inputs when `partiel=true`: `shipperName`, `fretValue`, `mawbCurrency`, `qteFacturee`
+- `manifestPdfExtract.js` change: extract `qteFacturee` (1st number of footer triplet)
+- New `mawbShipperExtract.js` for shipper name from MAWB PDF via `know_companies.json`
+- `/exchange-rate` endpoint in `index.js` (BAM → frankfurter → OXR fallback chain)
+- `badrLotLookup.js` partiel mode: collect all rows into `partiels[]` array; halt if <2
+- New `badrDumNormalPartiel.js` class with 10-step BADR form flow, checkpointed per tab
+- 12-phase state machine for partiel LTAs (`partiel_lots_found` → `partiel_done`)
+- Validation: poids sum check after Préapurement loop; clear error phases on mismatch
+
+**Files touched:** `DUM-NORMAL-PARTIEL-PROMPT.md` (rewritten), `ai-docs/PROGRESS.md`, `ai-docs/TASKS.md`
+
+---
+
+## 2026-04-28 — Prevent duplicate BADR finalization after LTA already completed
+
+**Problem:** Some LTAs were finalized twice on BADR. Logs showed `Workflow fully complete for "7eme LTA"!` followed immediately by another `Proceeding to finalize on BADR for "7eme LTA"...` sequence.
+
+**Root cause:** In `monitorPendingPortnetRequests()`, the pre-loop resume block called `finalizeAcceptedOnBadr()` for any state with `badrRef`, including LTAs already marked `phase = "badr_done"`.
+
+**Fix:** Added a phase guard so resume finalization only runs for accepted-but-not-completed LTAs:
+
+- From: `if (state.badrRef) { ... }`
+- To: `if (state.badrRef && state.phase !== "badr_done") { ... }`
+
+This prevents re-running BADR finalization once an LTA is already completed.
+
+**File changed:** `electron/main.js`
+
+---
+
+## 2026-04-23 — BADR DEDOUANEMENT menu stuck (hidden items) — retry with Accueil refresh
+
+**Problem:** After phase 1 (PDF download popup closes), calling `declarerScelles()` expands DEDOUANEMENT but the PrimeFaces menu items `a#_205151` (DS MEAD COMBINEE) and `a#_12251` (Déclarer scellés) resolve as hidden elements, causing 15 s timeouts. Example log: `locator resolved to hidden <a id="_205151"...>` repeated 32×.
+
+**Root cause:** The PrimeFaces accordion menu doesn't always re-render child items as visible after a prior popup closes in the same BADR page session. A full Accueil navigation resets the menu state.
+
+**Fix:** Wrapped the DEDOUANEMENT → DS MEAD COMBINEE → Déclarer scellés click sequence in a `for` loop (max 3 attempts). On `waitFor({ state: "visible" })` timeout, logs a warning and calls `badrConn.navigateToAccueil()` (falls back to `page.reload()` if no badrConn) before retrying from the beginning of the DEDOUANEMENT expansion. Also bumped `waitForTimeout` after each menu click from 500 ms to 700 ms for extra stability.
+
+**File changed:** `src/badr/badrDsCombineFinalize.js`
+
+---
+
+## 2026-04-23 — Retry full Portnet form fill when status is "Nouveau" (draft) after submit
+
+**Problem:** After clicking Envoyer on the Portnet DS Combinée form, the consultation page sometimes showed status `Nouveau` (draft — not actually sent). The monitoring loop had no handling for this: it kept polling indefinitely, never detecting the form was never submitted.
+
+**Fix:** Two changes in `electron/main.js`:
+
+1. Added `isNouveauStatus(statusText)` helper (mirrors `isEnvoyeeStatus` / `isRejectedStatus`) using `normalizePortnetStatus(statusText).startsWith("nouveau")`.
+
+2. In `monitorPendingPortnetRequests`, added a new `else if (isNouveauStatus(statusText) && attempts > 2)` branch in the status-check chain. When triggered:
+   - Releases the claimed row anchor (`claimedRowAnchors.delete`)
+   - Preserves `state.lotInfo` (BADR-confirmed sequence + weight — no need to re-query BADR)
+   - Clears `portnetRef`, `submittedAt`, `consultationCreatedAtRaw`, `consultationNumeroManifeste`, `attempts` from checkpoint
+   - Increments `nouveauRetryCount` (max 3 retries; 4th attempt marks as error requiring manual intervention)
+   - Reads fresh user data from `readAcheminementFile` for any last-minute edits
+   - Calls `submitPortnetPhase(retryAch, savedLotInfo, portnetPage)` to re-fill and re-send the form
+   - On success, re-adds the LTA to the `pending` Map so monitoring continues
+
+**File changed:** `electron/main.js`
+
+---
+
 ## 2026-04-22 — Manifest PDF total value extraction: footer concatenation bug fixed
 
 **Problem:** `extractedValue 216555.04` instead of correct `16555,04`. Root cause: `renderPageToText` concatenated same-Y items without spaces, so the footer row `2112 | 16555,04 | 870` became `"211216555,04870"`. The prefix-split fallback then tried prefix-length 3 first: prefix=`211`, value=`216555` → wrong `216555.04`.
@@ -43,6 +240,20 @@ _Format: `## YYYY-MM-DD — <title>`_
 **Problem:** Portnet added a Click2Connect "Contactez-nous" floating widget inside the iframe. It renders on top of the form and intercepts clicks on the `Créer` submit button in `fillCaution`, causing the automation to click the widget instead of submitting the form.
 
 **Fix:** In `fillCaution()`, before clicking `Créer`, use `locator.evaluate()` to remove the widget's root container from the iframe DOM. The widget is identified by `[class*="Click2ConnectButton"]`; its root container is found via `closest('[style*="--verticalGradientStartColor"]')`. The `.catch(() => {})` makes it a no-op when the widget is absent (other sessions / future rollback).
+
+**File changed:** `src/portnet/portnetDsCombine.js`
+
+---
+
+## 2026-04-28 — Portnet "Contactez-nous" widget blocks Créer again — robust multi-pass removal
+
+**Problem:** The floating "Contactez-nous" (Click2Connect) widget overlays the Portnet form and blocks the Créer button, preventing form submission. The widget's DOM structure or injection timing changed, so the previous single-pass removal was not always effective.
+
+**Fix:** In `fillCaution()` (PortnetDsCombine), replaced the old single `.first().evaluate()` widget removal with a robust multi-pass strategy:
+
+- Removes _all_ elements matching `[class*="Click2ConnectButton"]` and their closest parent with the vertical gradient style
+- Also removes any element with text `Contactez-nous` and a suspicious style
+- Retries up to 3 times with a short delay if the widget is still present
 
 **File changed:** `src/portnet/portnetDsCombine.js`
 

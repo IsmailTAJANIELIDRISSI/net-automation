@@ -356,6 +356,66 @@ function extractFooterTotalLineFallback(fullText, hints = {}) {
 
 /**
  * Last page footer: three values — e.g. "2781 243596,74 2530" (possibly line-broken).
+ * Returns { qteFacturee: string|null, totalValue: string|null }.
+ * The **first** value is quantité facturée (integer).
+ * The **second** value is Valeur totale (French decimal comma).
+ * @param {string} fullText
+ * @param {{ poidsKg?: string }} [hints] — third number matches header "…2530 kg" when possible
+ */
+function extractFooterTriplet(fullText, hints = {}) {
+  const poidsHint =
+    hints.poidsKg != null && String(hints.poidsKg).trim() !== ""
+      ? String(parseInt(String(hints.poidsKg).replace(/[^\d]/g, ""), 10) || "")
+      : "";
+
+  const src = String(fullText)
+    .replace(/\r/g, "\n")
+    .replace(/\t/g, " ")
+    .replace(/\u00A0/g, " ")
+    .replace(/\u202f|\u2009|\u2007/g, " ")
+    .replace(/，/g, ",");
+
+  const patterns = [
+    /(\d+)\s+(\d{1,3}(?:\s\d{3})*,\d{2})\s+(\d+)/g,
+    /(\d+)\s+(\d+,\d{2})\s+(\d+)/g,
+    /(\d+)\s+(\d+\.\d{2})\s+(\d+)/g,
+  ];
+
+  const all = [];
+  for (const re of patterns) {
+    let m;
+    re.lastIndex = 0;
+    while ((m = re.exec(src)) !== null) {
+      all.push({ qty: m[1], midRaw: m[2], third: m[3] });
+    }
+  }
+
+  if (all.length) {
+    let chosen = null;
+    if (poidsHint) {
+      const filtered = all.filter((x) => String(x.third) === poidsHint);
+      if (filtered.length) chosen = filtered[filtered.length - 1];
+    }
+    if (!chosen) {
+      const scored = all.filter((x) => {
+        const intPart = String(x.midRaw).replace(/\s/g, "").split(/[,.]/)[0];
+        return intPart.length >= 4 && intPart.length <= 8;
+      });
+      chosen = scored.length ? scored[scored.length - 1] : all[all.length - 1];
+    }
+
+    let mid = String(chosen.midRaw).replace(/\s/g, "");
+    if (mid.includes(",")) mid = mid.replace(",", ".");
+    return {
+      qteFacturee: String(parseInt(chosen.qty, 10)),
+      totalValue: mid,
+    };
+  }
+  return { qteFacturee: null, totalValue: null };
+}
+
+/**
+ * Last page footer: three values — e.g. "2781 243596,74 2530" (possibly line-broken).
  * The **second** value is Valeur totale (French decimal comma).
  * @param {string} fullText
  * @param {{ poidsKg?: string }} [hints] — third number matches header "…2530 kg" when possible
@@ -586,10 +646,15 @@ async function extractManifestMetricsFromPdfFile(pdfPath) {
     // 1. Try coordinate-extracted footer text first (bottom third of last page).
     //    This avoids the same-line concatenation problem (e.g. "211216555,04870").
     let totalValue = null;
+    let qteFacturee = null;
     if (footerText) {
-      totalValue = extractFooterTotalValue(footerText, {
+      const triplet = extractFooterTriplet(footerText, {
         poidsKg: parsed.poidTotal,
       });
+      if (triplet.totalValue) {
+        totalValue = triplet.totalValue;
+        qteFacturee = triplet.qteFacturee;
+      }
       if (!totalValue) totalValue = extractFooterTotalValue(footerText, {});
       if (!totalValue)
         totalValue = extractFooterTotalLineFallback(footerText, {
@@ -599,6 +664,15 @@ async function extractManifestMetricsFromPdfFile(pdfPath) {
         totalValue = extractFooterTotalLineFallback(footerText, {});
     }
     // 2. Fall back to full last-page text.
+    if (!totalValue) {
+      const triplet2 = extractFooterTriplet(lastPageText, {
+        poidsKg: parsed.poidTotal,
+      });
+      if (triplet2.totalValue) {
+        totalValue = triplet2.totalValue;
+        if (!qteFacturee) qteFacturee = triplet2.qteFacturee;
+      }
+    }
     if (!totalValue) {
       totalValue = extractFooterTotalValue(lastPageText, {
         poidsKg: parsed.poidTotal,
@@ -617,6 +691,9 @@ async function extractManifestMetricsFromPdfFile(pdfPath) {
     }
     if (totalValue) {
       parsed.totalValue = totalValue;
+    }
+    if (qteFacturee) {
+      parsed.qteFacturee = qteFacturee;
     }
     const hasAny =
       parsed.refNumber ||
