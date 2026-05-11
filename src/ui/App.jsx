@@ -95,6 +95,30 @@ export default function App() {
     };
   }, []);
 
+  // ── Helper: offer to delete done folders, re-scan if any deleted ──────────
+  const offerDeleteDone = useCallback(async (scanned, currentFolderPath) => {
+    const doneFolders = scanned
+      .filter((a) => {
+        const phase = a.automationState?.phase;
+        return phase === "badr_done" || phase === "partiel_done";
+      })
+      .map((a) => a.folderPath)
+      .filter(Boolean);
+
+    if (doneFolders.length === 0) return scanned;
+
+    const { deleted } = await window.api.deleteDoneFolders(doneFolders);
+    if (deleted.length === 0) return scanned;
+
+    addLog(
+      "info",
+      "UI",
+      `${deleted.length} dossier(s) supprimé(s) — actualisation…`,
+    );
+    const refreshed = await window.api.scanFolder(currentFolderPath);
+    return refreshed;
+  }, []);
+
   // ── Select folder and scan ────────────────────────────────────────────────
   const handleSelectFolder = useCallback(async () => {
     const selected = await window.api.selectFolder();
@@ -104,9 +128,10 @@ export default function App() {
     setLogs([]);
 
     const scanned = await window.api.scanFolder(selected);
-    setAcheminements(scanned);
-    setStatuses(statusesFromScan(scanned));
-  }, []);
+    const final = await offerDeleteDone(scanned, selected);
+    setAcheminements(final);
+    setStatuses(statusesFromScan(final));
+  }, [offerDeleteDone]);
 
   // ── Refresh (re-scan current folder) ──────────────────────────────────────
   const handleRefresh = useCallback(async () => {
@@ -228,9 +253,9 @@ export default function App() {
         addLog("error", "UI", `Échec batch: ${result.error || "inconnu"}`);
       }
 
-      // After batch completes, offer to delete folders of finished LTAs.
-      if (result.doneFolders?.length > 0) {
-        const { deleted, cancelled } = await window.api.deleteDoneFolders(
+      // After batch completes, offer to delete done folders and re-scan.
+      if (result.doneFolders?.length > 0 && folderPath) {
+        const { deleted } = await window.api.deleteDoneFolders(
           result.doneFolders,
         );
         if (deleted.length > 0) {
@@ -239,14 +264,9 @@ export default function App() {
             "UI",
             `${deleted.length} dossier(s) supprimé(s) — actualisation…`,
           );
-          // Re-scan so deleted cards disappear from the UI.
-          if (folderPath) {
-            const scanned = await window.api.scanFolder(folderPath);
-            setAcheminements(scanned);
-            setStatuses(statusesFromScan(scanned));
-          }
-        } else if (!cancelled) {
-          addLog("info", "UI", "Aucun dossier supprimé.");
+          const scanned = await window.api.scanFolder(folderPath);
+          setAcheminements(scanned);
+          setStatuses(statusesFromScan(scanned));
         }
       }
     } catch (err) {
