@@ -5,6 +5,24 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-05-11 — Auto-delete completed LTA folders after batch run
+
+**Problem:** After a batch run where all LTAs finish, the old folders stay on disk. The next day the user must manually delete them before treating new LTAs — easy to forget.
+
+**Fix (3 files):**
+
+1. **`electron/main.js` — `runAllAutomationTasks`**: After `monitorPendingPortnetRequests`, collect `doneFolders` = all `toProcess` entries whose final `automationState.phase` is `badr_done` or `partiel_done`. Return `{ success: true, doneFolders }` instead of just `{ success: true }`.
+
+2. **`electron/main.js` — new IPC handler `folder:delete-done`**: Takes `{ folders: string[] }`, shows a native `dialog.showMessageBox` confirm (Yes/Cancel) listing the folder names. If confirmed, calls `fs.rmSync(p, { recursive: true, force: true })` for each path. Returns `{ deleted: string[], cancelled: bool }`.
+
+3. **`electron/preload.js`**: Added `deleteDoneFolders: (folders) => ipcRenderer.invoke("folder:delete-done", { folders })` to `window.api`.
+
+4. **`src/ui/App.jsx` — `handleRunAll`**: After the batch result, if `result.doneFolders?.length > 0`, calls `window.api.deleteDoneFolders(result.doneFolders)`. If any were deleted, re-scans the folder via `window.api.scanFolder` and updates `acheminements` + `statuses` so the deleted cards disappear from the UI.
+
+**Result:** When a batch finishes and all LTAs are done, the user gets a native dialog: "X LTA(s) ont le statut Terminé — Supprimer leurs dossiers?" with folder names listed. Yes → folders deleted, UI refreshes. Cancel → nothing deleted.
+
+---
+
 ## 2026-05-11 — Run-All ordering: non-partial LTAs always before partials
 
 **Problem:** "Start All" processed LTAs in the order the UI sent them (alphabetical by folder name). A partial LTA named e.g. "1er LTA" would run before a normal "2ème LTA", blocking normal LTAs unnecessarily.

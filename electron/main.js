@@ -1493,7 +1493,16 @@ async function runAllAutomationTasks(acheminements) {
       await monitorPendingPortnetRequests(toProcess, portnetPage);
     }
 
-    return { success: true };
+    // Collect folders of LTAs that are now fully done so the UI can offer to delete them.
+    const doneFolders = toProcess
+      .filter((ach) => {
+        const phase = getAutomationState(ach.folderPath)?.phase;
+        return phase === "badr_done" || phase === "partiel_done";
+      })
+      .map((ach) => ach.folderPath)
+      .filter(Boolean);
+
+    return { success: true, doneFolders };
   } catch (err) {
     sendLog("error", "Automation", `Batch run failed: ${err.message}`);
     return { success: false, error: err.message };
@@ -1507,6 +1516,50 @@ ipcMain.handle("dialog:openFolder", async () => {
     title: "Sélectionner le dossier des acheminements",
   });
   return result.canceled ? null : result.filePaths[0];
+});
+
+// ── IPC: Delete completed LTA folders after user confirmation ─────────────────
+ipcMain.handle("folder:delete-done", async (_event, { folders }) => {
+  if (!Array.isArray(folders) || folders.length === 0) {
+    return { deleted: [], cancelled: false };
+  }
+
+  const names = folders.map((f) => path.basename(f)).join("\n  • ");
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    type: "question",
+    buttons: ["Supprimer", "Annuler"],
+    defaultId: 0,
+    cancelId: 1,
+    title: "Supprimer les dossiers terminés ?",
+    message: `${folders.length} LTA(s) ont le statut Terminé.\nSupprimer leurs dossiers ?`,
+    detail: `  • ${names}`,
+  });
+
+  if (response === 1) {
+    // User cancelled
+    return { deleted: [], cancelled: true };
+  }
+
+  const deleted = [];
+  for (const folderPath of folders) {
+    try {
+      fs.rmSync(folderPath, { recursive: true, force: true });
+      sendLog(
+        "info",
+        "Cleanup",
+        `Dossier supprimé: ${path.basename(folderPath)}`,
+      );
+      deleted.push(folderPath);
+    } catch (err) {
+      sendLog(
+        "warn",
+        "Cleanup",
+        `Impossible de supprimer ${path.basename(folderPath)}: ${err.message}`,
+      );
+    }
+  }
+
+  return { deleted, cancelled: false };
 });
 
 // ── IPC: Scan folder for acheminements ────────────────────────────────────────

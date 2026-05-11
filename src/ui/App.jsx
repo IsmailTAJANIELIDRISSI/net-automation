@@ -227,12 +227,34 @@ export default function App() {
       if (!result.success) {
         addLog("error", "UI", `Échec batch: ${result.error || "inconnu"}`);
       }
+
+      // After batch completes, offer to delete folders of finished LTAs.
+      if (result.doneFolders?.length > 0) {
+        const { deleted, cancelled } = await window.api.deleteDoneFolders(
+          result.doneFolders,
+        );
+        if (deleted.length > 0) {
+          addLog(
+            "info",
+            "UI",
+            `${deleted.length} dossier(s) supprimé(s) — actualisation…`,
+          );
+          // Re-scan so deleted cards disappear from the UI.
+          if (folderPath) {
+            const scanned = await window.api.scanFolder(folderPath);
+            setAcheminements(scanned);
+            setStatuses(statusesFromScan(scanned));
+          }
+        } else if (!cancelled) {
+          addLog("info", "UI", "Aucun dossier supprimé.");
+        }
+      }
     } catch (err) {
       addLog("error", "UI", `Exception batch: ${err.message}`);
     } finally {
       setIsRunning(false);
     }
-  }, [acheminements]);
+  }, [acheminements, folderPath]);
 
   // ── Helper: add a local log entry ─────────────────────────────────────────
   const addLog = (level, context, message) => {

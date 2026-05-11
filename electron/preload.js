@@ -22,6 +22,9 @@ contextBridge.exposeInMainWorld("api", {
   runAllAutomation: (acheminements) =>
     ipcRenderer.invoke("automation:run-all", acheminements),
 
+  deleteDoneFolders: (folders) =>
+    ipcRenderer.invoke("folder:delete-done", { folders }),
+
   // ── Persist form data ──────────────────────────────────────────────────────
   saveAcheminement: (folderPath, data) =>
     ipcRenderer.invoke("acheminement:save", { folderPath, data }),
