@@ -5,6 +5,21 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-05-11 — Run-All ordering: non-partial LTAs always before partials
+
+**Problem:** "Start All" processed LTAs in the order the UI sent them (alphabetical by folder name). A partial LTA named e.g. "1er LTA" would run before a normal "2ème LTA", blocking normal LTAs unnecessarily.
+
+**Fix (`electron/main.js` — `runAllAutomationTasks`):**
+Added `.sort()` after the `.filter()` on `toProcess`:
+
+```js
+.sort((a, b) => (a.partiel === true ? 1 : 0) - (b.partiel === true ? 1 : 0))
+```
+
+Non-partial LTAs (weight 0) sort before partials (weight 1). Relative order within each group is preserved (stable sort).
+
+---
+
 ## 2026-05-11 — BADR session timeout: auto-recovery + faster refresh
 
 **Problem:** During Portnet polling, BADR's session expired (page: `hab_session_timeout.xhtml`, error: "Votre session est expirée !"). The 2-minute refresh was too slow (BADR times out sooner). When the popup failed, `navigateToAccueil()` was called but it just navigated to the Accueil URL without detecting the timeout state, so it arrived at the same expired-session error page, causing the whole run to fail.

@@ -1420,9 +1420,13 @@ async function runAllAutomationTasks(acheminements) {
   let portnetPage = null;
 
   try {
-    const toProcess = acheminements.filter(
-      (a) => !a.refMismatch || !!a.manifestRef,
-    );
+    const toProcess = acheminements
+      .filter((a) => !a.refMismatch || !!a.manifestRef)
+      // Non-partial LTAs always run first; partials are appended at the end.
+      .sort(
+        (a, b) => (a.partiel === true ? 1 : 0) - (b.partiel === true ? 1 : 0),
+      );
+
     const needsPortnet = toProcess.some((ach) => {
       const phase = getAutomationState(ach.folderPath)?.phase;
       return ![
