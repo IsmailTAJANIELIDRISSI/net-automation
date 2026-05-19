@@ -12,6 +12,7 @@ export default function AcheminementCard({
   shipperLoading = false,
   onChange,
   onRun,
+  onDelete,
 }) {
   const { id, name, folderPath, manifeste, mawb, refNumber } = ach;
 
@@ -216,18 +217,26 @@ export default function AcheminementCard({
           <div className="col-span-2">
             {shipperLoading ? (
               <div className="flex flex-col gap-1">
-                <label className="text-xs text-slate-400 font-medium">Expéditeur (société)</label>
+                <label className="text-xs text-slate-400 font-medium">
+                  Expéditeur (société)
+                </label>
                 <div className="relative h-9 rounded overflow-hidden bg-slate-900 border border-slate-700">
-                  <div className="absolute inset-0 bg-gradient-to-r from-slate-900 via-slate-700/60 to-slate-900
+                  <div
+                    className="absolute inset-0 bg-gradient-to-r from-slate-900 via-slate-700/60 to-slate-900
                                   animate-shimmer
-                                  bg-[length:200%_100%]" />
+                                  bg-[length:200%_100%]"
+                  />
                   <span className="absolute inset-0 flex items-center px-3 text-xs text-slate-500 italic">
                     Extraction MAWB en cours…
                   </span>
                 </div>
               </div>
             ) : (
-              field("shipperName", "Expéditeur (société)", "ex: SHANGHAI FIXLINK...")
+              field(
+                "shipperName",
+                "Expéditeur (société)",
+                "ex: SHANGHAI FIXLINK...",
+              )
             )}
           </div>
           {field("fretValue", "Valeur fret MAWB", "ex: 1200.00", "number")}
@@ -253,31 +262,47 @@ export default function AcheminementCard({
         </div>
       )}
 
-      {/* ── Run button ─────────────────────────────────────────────────────── */}
-      <button
-        onClick={() => onRun(ach)}
-        disabled={
-          isGlobalRunning || isDone || (!!ach.refMismatch && !ach.manifestRef)
-        }
-        className={`mt-1 w-full py-2 rounded-lg text-sm font-semibold transition-all duration-200
-          ${
-            isDone
-              ? "bg-emerald-900/40 text-emerald-400 cursor-not-allowed border border-emerald-700/40"
-              : isError
+      {/* ── Run button (or Terminé + delete row) ──────────────────────────── */}
+      {isDone ? (
+        <div className="mt-1 flex gap-1.5">
+          {/* 80% — Terminé indicator */}
+          <div
+            className="flex-1 py-2 rounded-lg text-sm font-semibold text-center
+                       bg-emerald-900/40 text-emerald-400 border border-emerald-700/40
+                       cursor-not-allowed select-none"
+          >
+            ✓ Terminé
+          </div>
+          {/* 20% — delete button */}
+          <button
+            onClick={() => onDelete?.(ach)}
+            disabled={isGlobalRunning}
+            title="Supprimer ce dossier"
+            className="w-[20%] py-2 rounded-lg text-sm font-semibold transition-all duration-200
+                       bg-red-900/40 hover:bg-red-700/60 text-red-400 hover:text-red-200
+                       border border-red-700/40 hover:border-red-600
+                       disabled:opacity-50 disabled:cursor-not-allowed
+                       flex items-center justify-center"
+          >
+            🗑
+          </button>
+        </div>
+      ) : (
+        <button
+          onClick={() => onRun(ach)}
+          disabled={isGlobalRunning || (!!ach.refMismatch && !ach.manifestRef)}
+          className={`mt-1 w-full py-2 rounded-lg text-sm font-semibold transition-all duration-200
+            ${
+              isError
                 ? "bg-red-600 hover:bg-red-500 text-white border border-red-500 disabled:opacity-50"
                 : isRunning
                   ? "bg-blue-700/40 text-blue-300 cursor-not-allowed border border-blue-700/40 animate-pulse"
                   : "bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
-          }`}
-      >
-        {isDone
-          ? "✓ Terminé"
-          : isRunning
-            ? "En cours…"
-            : isError
-              ? "↺ Réessayer"
-              : "Lancer"}
-      </button>
+            }`}
+        >
+          {isRunning ? "En cours…" : isError ? "↺ Réessayer" : "Lancer"}
+        </button>
+      )}
     </div>
   );
 }

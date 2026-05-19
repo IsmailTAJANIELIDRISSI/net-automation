@@ -5,6 +5,24 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-05-19 — Per-card delete button for done LTAs + partiel_done fix
+
+**Problem:** When an LTA finishes, the user had no way to delete just that one card/folder without running a full batch. Also `partiel_done` was not mapped to `"done"` status so partiel LTAs never showed "Terminé".
+
+**Fix (2 files):**
+
+1. **`src/ui/App.jsx`**:
+   - `checkpointToStatus`: added `case "partiel_done": return "done"` alongside `badr_done`
+   - Added `handleDelete(ach)` callback: calls `window.api.deleteDoneFolders([ach.folderPath])`, re-scans on success
+   - Passes `onDelete={handleDelete}` to every `<AcheminementCard>`
+
+2. **`src/ui/components/AcheminementCard.jsx`**:
+   - Added `onDelete` prop
+   - When `isDone`: replaced single button with a flex row — left 80% is a non-clickable "✓ Terminé" indicator (emerald), right 20% is a red 🗑 trash button that calls `onDelete(ach)`
+   - When not done: same "Lancer" / "En cours…" / "↺ Réessayer" button as before (no `isDone` logic needed there anymore)
+
+---
+
 ## 2026-05-11 — Auto-delete completed LTA folders after batch run
 
 **Problem:** After a batch run where all LTAs finish, the old folders stay on disk. The next day the user must manually delete them before treating new LTAs — easy to forget.

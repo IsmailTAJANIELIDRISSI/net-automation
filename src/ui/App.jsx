@@ -27,6 +27,7 @@ export default function App() {
       case "portnet_accepted":
         return "portnet-accepted";
       case "badr_done":
+      case "partiel_done":
         return "done";
       case "weight_mismatch":
         return "weight-mismatch";
@@ -210,6 +211,22 @@ export default function App() {
         });
     }
   }, []);
+
+  // ── Delete a single done LTA folder ────────────────────────────────────
+  const handleDelete = useCallback(
+    async (ach) => {
+      const { deleted } = await window.api.deleteDoneFolders([ach.folderPath]);
+      if (deleted.length > 0) {
+        addLog("info", "UI", `Dossier supprimé: ${ach.name}`);
+        if (folderPath) {
+          const scanned = await window.api.scanFolder(folderPath);
+          setAcheminements(scanned);
+          setStatuses(statusesFromScan(scanned));
+        }
+      }
+    },
+    [folderPath],
+  );
 
   // ── Run one acheminement ───────────────────────────────────────────────────
   const handleRun = useCallback(async (ach) => {
@@ -410,6 +427,7 @@ export default function App() {
                   shipperLoading={shipperLoadingIds.has(ach.id)}
                   onChange={handleChange}
                   onRun={handleRun}
+                  onDelete={handleDelete}
                 />
               ))}
             </div>

@@ -24,6 +24,10 @@ The core automation flow is **fully implemented and working in production**:
   - Scanned PDFs: Gemini Vision reads image-based MAWBs natively (no OCR tool needed)
   - Text-based PDFs: regex extracts currency code + Total Prepaid amount
   - `mawbCurrency` and `fretValue` auto-populated when partiel checkbox is enabled
+- **Per-card delete button for done LTAs ✅** (2026-05-19)
+  - When status = Terminé: button row splits 80% "✓ Terminé" (unclickable) + 20% 🗑 trash button
+  - Trash click → native confirm dialog → folder deleted → UI re-scans
+  - `partiel_done` now correctly maps to `"done"` status (was falling to `"idle"`)
 
 ## Next Steps / Testing
 
