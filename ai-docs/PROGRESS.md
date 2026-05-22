@@ -5,6 +5,18 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-05-22 — DUM Normale Partiel PDF also copied to system Downloads folder
+
+**Problem:** The printed DUM PDF was only saved inside the LTA subfolder (`Acheminements/3eme LTA/...pdf`). User had to navigate to the folder to find it — not visible in the default Downloads folder.
+
+**Fix (`src/badr/badrDumNormalPartiel.js`):**
+
+- Added `const os = require("os")` import
+- After `download.saveAs(destPath)` in `_step10_print()`, added `fs.copyFileSync(destPath, path.join(os.homedir(), "Downloads", safeName + ".pdf"))`
+- Errors during copy are caught and logged as `warn` (non-fatal — LTA folder copy is authoritative)
+
+---
+
 ## 2026-05-19 — Per-card delete button for done LTAs + partiel_done fix
 
 **Problem:** When an LTA finishes, the user had no way to delete just that one card/folder without running a full batch. Also `partiel_done` was not mapped to `"done"` status so partiel LTAs never showed "Terminé".

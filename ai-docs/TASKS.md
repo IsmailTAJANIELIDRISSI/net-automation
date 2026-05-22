@@ -28,6 +28,9 @@ The core automation flow is **fully implemented and working in production**:
   - When status = Terminé: button row splits 80% "✓ Terminé" (unclickable) + 20% 🗑 trash button
   - Trash click → native confirm dialog → folder deleted → UI re-scans
   - `partiel_done` now correctly maps to `"done"` status (was falling to `"idle"`)
+- **DUM Normale Partiel PDF copied to system Downloads ✅** (2026-05-22)
+  - After saving PDF in LTA folder, also `copyFileSync` to `~/Downloads/` with same filename
+  - Copy failure is non-fatal (warn log only)
 
 ## Next Steps / Testing
 

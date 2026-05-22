@@ -14,6 +14,7 @@
 
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const { createLogger } = require("../utils/logger");
 const { fetchMADRate, roundBADR } = require("../utils/exchangeRate");
 const {
@@ -997,8 +998,20 @@ class BADRDumNormalPartiel {
       sanitizeFilename(`${ach.name}-DUM-NORMAL-${ach.refNumber}`) + refPart;
     const destPath = path.join(ach.folderPath, `${safeName}.pdf`);
     await download.saveAs(destPath);
-
     log.info("Step 9 — PDF saved", { destPath });
+
+    // Also copy to the system Downloads folder so the user can find it easily.
+    try {
+      const downloadsDir = path.join(os.homedir(), "Downloads");
+      const downloadsCopy = path.join(downloadsDir, `${safeName}.pdf`);
+      fs.copyFileSync(destPath, downloadsCopy);
+      log.info("Step 9 — PDF copied to Downloads", { downloadsCopy });
+    } catch (copyErr) {
+      log.warn("Step 9 — Could not copy PDF to Downloads folder", {
+        error: copyErr.message,
+      });
+    }
+
     return destPath;
   }
 
