@@ -97,17 +97,41 @@ class BADRLotLookup {
     }
 
     // 1c. Wait until #_437 is clickable then open popup
-    await page.waitForSelector("#_437", { state: "visible", timeout: 10000 });
+    await page.waitForSelector("#_437", { state: "visible", timeout: 20000 });
     log.info('Clicking "Lot de dédouanement" – waiting for popup window…');
 
     const [newPage] = await Promise.all([
-      page.context().waitForEvent("page", { timeout: 30000 }),
+      page.context().waitForEvent("page", { timeout: 60000 }),
       page.click("#_437"),
     ]);
 
+    // Wait for HTML to be parsed, then for the network to settle (slow connections).
     await newPage.waitForLoadState("domcontentloaded");
+    await newPage
+      .waitForLoadState("networkidle", { timeout: 30_000 })
+      .catch(() =>
+        log.warn(
+          "Popup networkidle timed-out – waiting for form input instead",
+        ),
+      );
+
+    // Final guard: the lot-reference input must exist before we try to fill it.
+    await newPage
+      .waitForSelector(`#${FORM}\\:j_id_1p`, {
+        state: "visible",
+        timeout: 30_000,
+      })
+      .catch(async () => {
+        log.warn("Form input not visible after 30 s – reloading popup page…");
+        await newPage.reload({ waitUntil: "domcontentloaded" });
+        await newPage.waitForSelector(`#${FORM}\\:j_id_1p`, {
+          state: "visible",
+          timeout: 30_000,
+        });
+      });
+
     this.popupPage = newPage;
-    log.info("Lot de dédouanement popup opened");
+    log.info("Lot de dédouanement popup opened and form ready");
     return newPage;
   }
 

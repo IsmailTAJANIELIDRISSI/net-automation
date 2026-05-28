@@ -5,6 +5,27 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-05-28 — Slow-network resilience: Portnet login, DS Combinée navigate, BADR lot popup
+
+**Problem:** On bad connections (1) Portnet home page URL changed but page wasn't fully loaded yet → subsequent steps failed. (2) DS Combinée creation page iframe wasn't ready when automation tried to interact. (3) BADR Lot de dédouanement popup took too long to appear and/or the search form wasn't ready, causing timeouts.
+
+**Fix (3 files):**
+
+1. **`src/portnet/portnetLogin.js`**:
+   - Extended `waitForURL` timeout: 120 s → 180 s
+   - Added `waitForLoadState("networkidle", { timeout: 60_000 })` after URL confirmed; failure is non-fatal (warn + continue)
+
+2. **`src/portnet/portnetDsCombine.js` — `navigate()`**:
+   - Added `waitForLoadState("networkidle", { timeout: 60_000 })` after `domcontentloaded` goto, before touching the iframe; failure is non-fatal
+
+3. **`src/badr/badrLotLookup.js` — `openLotPopup()`**:
+   - `#_437` waitForSelector timeout: 10 s → 20 s
+   - Popup `waitForEvent("page")` timeout: 30 s → 60 s
+   - After `domcontentloaded`: also `waitForLoadState("networkidle", 30 s)` (non-fatal)
+   - Final guard: wait for `#j_id_1h:j_id_1p` (lot reference input) to be visible (30 s); if it times out, reloads the popup page and waits again before returning
+
+---
+
 ## 2026-05-22 — DUM Normale Partiel PDF also copied to system Downloads folder
 
 **Problem:** The printed DUM PDF was only saved inside the LTA subfolder (`Acheminements/3eme LTA/...pdf`). User had to navigate to the folder to find it — not visible in the default Downloads folder.

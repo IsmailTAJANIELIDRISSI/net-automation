@@ -193,6 +193,13 @@ class PortnetDsCombine {
       { waitUntil: "domcontentloaded", timeout: TIMEOUT },
     );
 
+    // On slow connections the outer page may still be loading JS after DOMContentLoaded.
+    await this.page
+      .waitForLoadState("networkidle", { timeout: 60_000 })
+      .catch(() =>
+        log.warn("networkidle timed-out on DS Combinée page – proceeding"),
+      );
+
     // The real form is inside an iframe (manifeste-prod.portnet.ma/combineEnteteMead)
     const iframeLoc = this.page.locator("main iframe");
     await iframeLoc.waitFor({ timeout: TIMEOUT });

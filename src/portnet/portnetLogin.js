@@ -1,4 +1,4 @@
-'use strict';
+"use strict";
 /**
  * PortnetLogin – reusable Playwright login module for Portnet.
  *
@@ -8,17 +8,17 @@
  * - Supports both manual CAPTCHA flow and headless (future)
  */
 
-const { chromium }     = require('playwright');
-const config           = require('../config/config');
-const { createLogger } = require('../utils/logger');
+const { chromium } = require("playwright");
+const config = require("../config/config");
+const { createLogger } = require("../utils/logger");
 
-const log = createLogger('PortnetLogin');
+const log = createLogger("PortnetLogin");
 
 class PortnetLogin {
   constructor() {
     this.browser = null;
     this.context = null;
-    this.page    = null;
+    this.page = null;
   }
 
   /**
@@ -28,49 +28,57 @@ class PortnetLogin {
    * @returns {import('playwright').Page} the authenticated Portnet page
    */
   async login() {
-    log.info('Launching Chromium for Portnet…');
+    log.info("Launching Chromium for Portnet…");
 
     this.browser = await chromium.launch({
       headless: config.headless,
-      slowMo:   config.slowMo,
+      slowMo: config.slowMo,
     });
 
     this.context = await this.browser.newContext();
-    this.page    = await this.context.newPage();
+    this.page = await this.context.newPage();
     this.page.setDefaultTimeout(config.timeout);
 
-    log.info('Navigating to Portnet…');
-    await this.page.goto('https://www.portnet.ma/', {
-      waitUntil: 'domcontentloaded',
+    log.info("Navigating to Portnet…");
+    await this.page.goto("https://www.portnet.ma/", {
+      waitUntil: "domcontentloaded",
     });
 
     // Try closing the promotional popup
     try {
-      await this.page.locator('.closeP').click({ timeout: 5000 });
-      log.info('Popup closed');
+      await this.page.locator(".closeP").click({ timeout: 5000 });
+      log.info("Popup closed");
     } catch (_) {
-      log.info('No popup found – continuing');
+      log.info("No popup found – continuing");
     }
 
     // Fill credentials
     const { username, password } = config.portnet;
-    await this.page.locator('#j_username').fill(username);
-    await this.page.locator('#j_password').fill(password);
-    log.info('Credentials filled');
+    await this.page.locator("#j_username").fill(username);
+    await this.page.locator("#j_password").fill(password);
+    log.info("Credentials filled");
 
     // ── Manual CAPTCHA ───────────────────────────────────────────────────────
-    console.log('\n========================================');
-    console.log('  Solve the CAPTCHA and click LOGIN.');
-    console.log('  Automation will continue automatically.');
-    console.log('========================================\n');
+    console.log("\n========================================");
+    console.log("  Solve the CAPTCHA and click LOGIN.");
+    console.log("  Automation will continue automatically.");
+    console.log("========================================\n");
 
-    // Wait up to 2 minutes for authenticated URL
+    // Wait up to 3 minutes for the authenticated URL (slow networks need more time).
     await this.page.waitForURL(
-      (url) => url.toString().includes('cargo.portnet.ma/home'),
-      { timeout: 120_000 }
+      (url) => url.toString().includes("cargo.portnet.ma/home"),
+      { timeout: 180_000 },
     );
 
-    log.info('Portnet authentication successful', { url: this.page.url() });
+    // Extra safety: wait for the page to fully settle before handing it back.
+    // On bad connections the DOM can still be loading after the URL change.
+    await this.page
+      .waitForLoadState("networkidle", { timeout: 60_000 })
+      .catch(() =>
+        log.warn("networkidle timed-out after login – proceeding anyway"),
+      );
+
+    log.info("Portnet authentication successful", { url: this.page.url() });
     return this.page;
   }
 
@@ -81,7 +89,7 @@ class PortnetLogin {
     if (this.browser) {
       await this.browser.close();
       this.browser = null;
-      log.info('Portnet browser closed');
+      log.info("Portnet browser closed");
     }
   }
 }

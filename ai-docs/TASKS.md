@@ -31,6 +31,10 @@ The core automation flow is **fully implemented and working in production**:
 - **DUM Normale Partiel PDF copied to system Downloads ✅** (2026-05-22)
   - After saving PDF in LTA folder, also `copyFileSync` to `~/Downloads/` with same filename
   - Copy failure is non-fatal (warn log only)
+- **Slow-network resilience ✅** (2026-05-28)
+  - `portnetLogin.js`: `waitForURL` 120 s → 180 s; `networkidle` wait after URL confirmed
+  - `portnetDsCombine.js` `navigate()`: `networkidle` wait before touching iframe
+  - `badrLotLookup.js`: popup event timeout 30 s → 60 s; form input guard with auto-reload fallback
 
 ## Next Steps / Testing
 
