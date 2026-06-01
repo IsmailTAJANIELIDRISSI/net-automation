@@ -5,6 +5,18 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-01 — Fix consultation page goto timing out on slow networks
+
+**Problem:** After "Envoyer DS MEAD Combinée" is clicked and the app navigates to the consultation page to poll status, `page.goto(..., {waitUntil:"networkidle"})` timed out at 120 000 ms because lingering background XHR/fetch requests on the Portnet cargo page never allowed `networkidle` to fire.
+
+**Fix — `src/portnet/portnetDsCombine.js` `openConsultationPage()`:**
+
+- Changed `waitUntil: "networkidle"` → `waitUntil: "domcontentloaded"` + explicit `timeout: TIMEOUT` so the goto completes as soon as the HTML is parsed
+- Added a non-fatal `waitForLoadState("networkidle", 30 s)` after the goto; failure logs a warning and continues
+- `_ensureConsultationSortedByCreatedAtDesc` already handles a not-yet-visible DataGrid header gracefully, so polling is unaffected
+
+---
+
 ## 2026-05-28 — Slow-network resilience: Portnet login, DS Combinée navigate, BADR lot popup
 
 **Problem:** On bad connections (1) Portnet home page URL changed but page wasn't fully loaded yet → subsequent steps failed. (2) DS Combinée creation page iframe wasn't ready when automation tried to interact. (3) BADR Lot de dédouanement popup took too long to appear and/or the search form wasn't ready, causing timeouts.

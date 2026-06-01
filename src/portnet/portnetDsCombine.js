@@ -1114,9 +1114,21 @@ class PortnetDsCombine {
 
   async openConsultationPage() {
     log.info("Navigating to Consultation page to poll status...");
+    // Use domcontentloaded so the goto doesn't time-out on slow connections
+    // (networkidle can block indefinitely when the page has background XHR).
     await this.page.goto("https://cargo.portnet.ma/dsCombine/consultation", {
-      waitUntil: "networkidle",
+      waitUntil: "domcontentloaded",
+      timeout: TIMEOUT,
     });
+    // Best-effort: let the network settle; failures are non-fatal because the
+    // DataGrid poller below already handles a not-yet-visible header gracefully.
+    await this.page
+      .waitForLoadState("networkidle", { timeout: 30_000 })
+      .catch(() =>
+        log.warn(
+          "Consultation networkidle timed-out – page may still be loading, proceeding anyway",
+        ),
+      );
 
     // Ensure newest rows are shown first to reduce ambiguity on shared dsReference.
     await this._ensureConsultationSortedByCreatedAtDesc();
