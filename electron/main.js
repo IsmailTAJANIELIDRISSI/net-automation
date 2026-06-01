@@ -887,8 +887,26 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
         "Refreshing BADR session to prevent timeout during Portnet polling...",
       );
       const badrConn = await ensureBadrSession();
+      // Always do a real page reload so the BADR *server* receives an HTTP request
+      // and its session idle timer is reset.  Merely checking the URL with
+      // navigateToAccueil() when already on Accueil sends NO request to the server
+      // and the JSF session will silently expire after the server's idle timeout.
+      await badrConn.page
+        .reload({ waitUntil: "domcontentloaded", timeout: 30_000 })
+        .catch((reloadErr) =>
+          sendLog(
+            "warn",
+            "BADR",
+            `BADR keepalive reload failed: ${reloadErr.message} — trying navigateToAccueil`,
+          ),
+        );
+      // Ensure we end up on Accueil (handles session-expiry redirects after reload).
       await badrConn.navigateToAccueil();
-      sendLog("info", "BADR", "BADR session refreshed successfully.");
+      sendLog(
+        "info",
+        "BADR",
+        "BADR session keepalive sent — session refreshed.",
+      );
     } catch (err) {
       sendLog("warn", "BADR", `Failed to refresh BADR session: ${err.message}`);
     } finally {
@@ -1177,7 +1195,15 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
       );
       await portnetPage.waitForTimeout(waitMs);
       try {
-        await portnetPage.reload({ waitUntil: "networkidle" });
+        // Use domcontentloaded to avoid timing out on slow networks;
+        // non-fatal networkidle wait follows as a best-effort.
+        await portnetPage.reload({
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        });
+        await portnetPage
+          .waitForLoadState("networkidle", { timeout: 30_000 })
+          .catch(() => {});
         // Re-apply sort after reload (sort is lost when page reloads)
         await dsCombine._ensureConsultationSortedByCreatedAtDesc();
       } catch (reloadErr) {

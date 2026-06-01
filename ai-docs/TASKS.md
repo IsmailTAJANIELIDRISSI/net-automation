@@ -31,6 +31,9 @@ The core automation flow is **fully implemented and working in production**:
 - **DUM Normale Partiel PDF copied to system Downloads ✅** (2026-05-22)
   - After saving PDF in LTA folder, also `copyFileSync` to `~/Downloads/` with same filename
   - Copy failure is non-fatal (warn log only)
+- **BADR session silent expiry fix ✅** (2026-06-01)
+  - Refresh interval now forces `page.reload(domcontentloaded)` before `navigateToAccueil()` — real HTTP request every 45 s
+  - Consultation poll reload: `networkidle` → `domcontentloaded` + non-fatal `networkidle` wait
 - **Consultation page goto timeout fix ✅** (2026-06-01)
   - `openConsultationPage()`: `waitUntil:"networkidle"` → `"domcontentloaded"` + non-fatal `networkidle` wait
   - Prevents 120 s hard crash on slow networks after DS submission

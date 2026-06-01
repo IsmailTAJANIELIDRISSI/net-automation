@@ -5,6 +5,21 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-01 — Fix BADR session silently expiring during long Portnet polls + poll reload networkidle crash
+
+**Problem 1 — BADR session expired after long poll:**
+`navigateToAccueil()` has an early-return guard: when the page is already on Accueil and the menu is visible it logs "BADR session refreshed" but **returns immediately without sending any HTTP request to the BADR server**. The server-side JSF session has its own idle timer (≈ 30 min). After a long Portnet polling window, the server silently expired the session; by the time BADR was used again the browser was actually on the login/session-timeout page, requiring manual reconnect.
+
+**Problem 2 — Consultation page poll reload timing out:**
+`portnetPage.reload({ waitUntil: "networkidle" })` in the polling loop used the same networkidle pattern that caused the `goto` crash fixed earlier. On bad networks it threw `Timeout 120000ms exceeded`, logging a warning each cycle.
+
+**Fix — `electron/main.js`:**
+
+1. BADR refresh interval: added `badrConn.page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 })` **before** `navigateToAccueil()` — this sends a real HTTP request to the BADR server on every 45-second tick, resetting the server-side session idle timer. Failure is non-fatal (warn log).
+2. Consultation poll reload: `waitUntil: "networkidle"` → `"domcontentloaded"` + `timeout: 60_000`, followed by a non-fatal `waitForLoadState("networkidle", 30 s)`.
+
+---
+
 ## 2026-06-01 — Fix consultation page goto timing out on slow networks
 
 **Problem:** After "Envoyer DS MEAD Combinée" is clicked and the app navigates to the consultation page to poll status, `page.goto(..., {waitUntil:"networkidle"})` timed out at 120 000 ms because lingering background XHR/fetch requests on the Portnet cargo page never allowed `networkidle` to fire.
