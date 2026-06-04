@@ -5,6 +5,37 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-04 — MAWB shipper extraction: second pass — mightBeCompany false positives
+
+**Problem (follow-up to same-day fix):** After the EXCLUDE_PATTERNS + 1500-char window fix, two new false positives appeared:
+
+- `"LIABILITY.Shipper may **INC**rease such limitation of liability…"` — `"INC"` was matching as substring of `"increase"`
+- `"(**incl**.Dimensions or Volume)"` — `"INC"` matching as substring of `"incl"`
+
+Both passed `mightBeCompany()`, so Gemini received garbage candidates and returned the first one as the shipper name.
+
+**Fix — `src/utils/mawbShipperExtract.js`:**
+
+1. Added `WORD_BOUNDARY_SHORT` set — short purely-alphabetic indicators (≤ 4 chars: `INC`, `LTD`, `CORP`, `TECH`) now use `\bIND\b` regex instead of `includes()`, preventing substring false positives.
+2. Added **90-char length cap** to `mightBeCompany()` — sentences can never qualify as company names regardless of indicator matches.
+3. Added boilerplate sentence patterns to `EXCLUDE_PATTERNS`: `limitation of liability`, `declaring a higher value`, `(incl. dimensions`, `nature and quantity`, `paying a supplemental`.
+
+**Result:** Both false positives are now rejected → anchor window yields 0 company candidates → code falls through to full-document `allLines` scan → finds `"FUJIAN ANPORT LOGISTICS"` correctly.
+
+---
+
+## 2026-06-04 — MAWB shipper name extraction picks form label instead of company name
+
+**Problem:** For MAWBs where pdf-parse reads the two-column layout by concatenating all header labels first (e.g. `"Shipper's Name and AddressConsignee's Name and AddressNot negotlable…"`), the anchor "Shipper's Name and Address" was found at position 0 but the 400-char window after it contained only other column labels — never reaching the actual company name further in the text. The candidates array was `["Consignee's Name and Address", "Not negotlable", "It is agreed…", …]`. Gemini received only garbage and fell back to returning the first line as the shipper name.
+
+**Fix — `src/utils/mawbShipperExtract.js`:**
+
+1. Added MAWB form-field column headers to `EXCLUDE_PATTERNS`: `consignee's name`, `shipper's name/account/reference`, `name and address`, `it is agreed`, `conditions of contract`, `shipper's attention`, `carrier's limitation`, `not neg[ao]t` (OCR variant), `copies N`, `apparent good order`, etc.
+2. Increased anchor search window from **400 → 1500 chars** to skip past all header rows and reach cell content.
+3. Changed anchor-path candidate filter to require `mightBeCompany()` in addition to `!shouldExclude()`. If zero company-like candidates exist in the window, logs a warning and **falls through to the full-document scan** instead of feeding garbage labels to Gemini.
+
+---
+
 ## 2026-06-01 — Fix BADR session silently expiring during long Portnet polls + poll reload networkidle crash
 
 **Problem 1 — BADR session expired after long poll:**

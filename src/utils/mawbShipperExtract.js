@@ -55,10 +55,28 @@ const EXCLUDE_PATTERNS = [
   /FREIGHT\s+(PREPAID|COLLECT)/i,
   /AIR\s+WAYBILL/i,
   /ISSUED\s+BY/i,
-  /NOT\s+NEGOTIABLE/i,
+  /NOT\s+NEG[AO]T/i, // "Not Negotiable" / "Not negotlable" (OCR variant)
   /HS\s+CODE/i,
   /ATTACHED\s+LIST/i,
   /^\d{3,}/,
+  // ── MAWB form-field column headers ──────────────────────────────────────────
+  /consignee['']?s?\s+name/i,
+  /shipper['']?s?\s+(name|account|reference)/i,
+  /name\s+and\s+address/i,
+  /it\s+is\s+agreed/i,
+  /conditions\s+of\s+contract/i,
+  /shipper['']?s?\s+attention/i,
+  /carrier['']?s?\s+limitation/i,
+  /copies\s+\d/i,
+  /originals?\s+and\s+have/i,
+  /apparent\s+good\s+order/i,
+  /SUBJECT\s+TO\s+THE\s+CONDITIONS/i,
+  // ── Air Waybill boilerplate sentences ─────────────────────────────────────────
+  /limitation\s+of\s+liability/i,
+  /declaring\s+a\s+higher\s+value/i,
+  /\(incl\.\s*dimensions/i,
+  /nature\s+and\s+quantity/i,
+  /paying\s+a\s+supplemental/i,
 ];
 
 const COMPANY_INDICATORS = [
@@ -92,11 +110,24 @@ const COMPANY_INDICATORS = [
   "ENTERPRISES",
 ];
 
+// Short purely-alphabetic indicators (≤ 4 chars) appear as substrings of common
+// English words: INC→increase, LTD→(rare), CORP→(rare), TECH→technical.
+// These require a word-boundary check; longer / symbol-containing indicators do not.
+const WORD_BOUNDARY_SHORT = new Set(
+  COMPANY_INDICATORS.filter((ind) => ind.length <= 4 && /^\w+$/.test(ind)),
+);
+
 /** Returns true if the line looks like a company name */
 function mightBeCompany(line) {
   if (!line || line.length < 5) return false;
+  // Long sentences are never company names — cap at 90 characters.
+  if (line.length > 90) return false;
   const upper = line.toUpperCase();
-  return COMPANY_INDICATORS.some((ind) => upper.includes(ind));
+  return COMPANY_INDICATORS.some((ind) =>
+    WORD_BOUNDARY_SHORT.has(ind)
+      ? new RegExp(`\\b${ind}\\b`).test(upper)
+      : upper.includes(ind),
+  );
 }
 
 /** Returns true if the line should be excluded */
@@ -342,7 +373,7 @@ function extractMetaFromText(text, log) {
     /total\s+prepaid[^\n]{0,80}\n?[^\n]{0,40}?(\d[\d .]*\.\d{2})/i,
   );
   if (prepaidMatch) {
-    fretValue = prepaidMatch[1].replace(/\s/g, "");
+    fretValue = prepaidMatch[1].replace(/[\s,]/g, ""); // strip spaces and thousands commas
     log(`Total Prepaid trouvé dans texte: ${fretValue}`);
   }
 
@@ -410,9 +441,11 @@ Respond ONLY in this exact JSON (no markdown):
         responseText = s !== -1 ? responseText.slice(s, e) : responseText;
       }
       const parsed = JSON.parse(responseText);
+      // Strip thousands-separator commas so the UI receives a plain decimal.
+      const rawFret = parsed.total_prepaid || null;
       const result = {
         mawbCurrency: parsed.currency || null,
-        fretValue: parsed.total_prepaid || null,
+        fretValue: rawFret ? String(rawFret).replace(/,/g, "") : null,
       };
       log(
         `Complément Vision: devise=${result.mawbCurrency} fret=${result.fretValue}`,
@@ -506,15 +539,34 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
     const match = text.match(pattern);
     if (!match) continue;
 
+    // Use a large window (1500 chars) because two-column PDFs concatenate ALL
+    // column header labels before the actual cell content, so the company name
+    // may be several hundred chars after the "Shipper's Name and Address" label.
     const afterAnchor = text
-      .slice(match.index + match[0].length, match.index + match[0].length + 400)
+      .slice(
+        match.index + match[0].length,
+        match.index + match[0].length + 1500,
+      )
       .replace(/\r/g, "\n");
     const lines = afterAnchor
       .split("\n")
       .map((l) => l.trim())
       .filter((l) => l.length > 3 && !pattern.test(l));
 
-    const candidates = lines.filter((l) => !shouldExclude(l)).slice(0, 5);
+    // Only keep lines that look like company names AND are not excluded labels.
+    // If none pass, the anchor window didn't contain real content — fall through
+    // to the full-document scan rather than feeding garbage to Gemini.
+    const candidates = lines
+      .filter((l) => !shouldExclude(l) && mightBeCompany(l))
+      .slice(0, 5);
+
+    if (candidates.length === 0) {
+      log(
+        `Anchor trouvee mais aucun candidat societe dans la fenetre — passage au scan complet`,
+      );
+      continue;
+    }
+
     log(`Anchor trouvee -> candidats: ${JSON.stringify(candidates)}`);
 
     const shipperName = await resolveCandidate(candidates, knownCompanies, log);

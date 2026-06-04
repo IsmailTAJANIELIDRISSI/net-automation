@@ -31,6 +31,9 @@ The core automation flow is **fully implemented and working in production**:
 - **DUM Normale Partiel PDF copied to system Downloads ✅** (2026-05-22)
   - After saving PDF in LTA folder, also `copyFileSync` to `~/Downloads/` with same filename
   - Copy failure is non-fatal (warn log only)
+- **MAWB shipper extraction form-label bug ✅** (2026-06-04)
+  - Anchor window 400 → 1500 chars; candidates filtered by `mightBeCompany()`
+  - Added MAWB column-header exclusion patterns; falls back to full-document scan when no company candidate in window
 - **BADR session silent expiry fix ✅** (2026-06-01)
   - Refresh interval now forces `page.reload(domcontentloaded)` before `navigateToAccueil()` — real HTTP request every 45 s
   - Consultation poll reload: `networkidle` → `domcontentloaded` + non-fatal `networkidle` wait
