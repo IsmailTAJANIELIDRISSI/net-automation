@@ -403,12 +403,16 @@ async function supplementCurrencyFretViaVision(pdfPath, log) {
   const pdfBase64 = fs.readFileSync(pdfPath).toString("base64");
 
   const prompt = `This is an Air Waybill (MAWB). Extract exactly two values:
-1. CURRENCY — the 3-letter code in the "Currency" column (e.g. CNY, USD, HKD).
-2. TOTAL PREPAID — the number in the "Total Prepaid" box at the bottom (e.g. "10025.21").
-   If blank or zero, return null.
+1. CURRENCY — the 3-letter ISO code in the "Currency" column (e.g. CNY, USD, TWD, HKD).
+2. TOTAL PREPAID — the numeric amount in the "Total Prepaid" box at the bottom of the form.
+   STRICT RULES for the number:
+   - Strip any currency code prefix (e.g. "TWD575,770.00" → "575770.00").
+   - Remove ALL thousands-separator commas (e.g. "575,770.00" → "575770.00").
+   - KEEP the decimal point and exactly 2 decimal places (e.g. "575770.00", NOT "57577000").
+   - If the box is blank or shows zero, return null.
 
 Respond ONLY in this exact JSON (no markdown):
-{"currency": "USD", "total_prepaid": "10025.21"}`;
+{"currency": "TWD", "total_prepaid": "575770.00"}`;
 
   for (const modelName of GEMINI_MODEL_FALLBACKS) {
     try {
@@ -442,10 +446,19 @@ Respond ONLY in this exact JSON (no markdown):
       }
       const parsed = JSON.parse(responseText);
       // Strip thousands-separator commas so the UI receives a plain decimal.
+      // Also guard against Gemini returning an integer without decimal (e.g. "57577000"
+      // instead of "575770.00") by detecting values that look like they lost their
+      // decimal point: any integer with ≥ 5 digits where the last two should be cents.
       const rawFret = parsed.total_prepaid || null;
+      let fretValue = rawFret ? String(rawFret).replace(/,/g, "") : null;
+      if (fretValue && /^\d+$/.test(fretValue) && fretValue.length >= 5) {
+        // Gemini dropped the decimal point — reinsert before last 2 digits.
+        fretValue = `${fretValue.slice(0, -2)}.${fretValue.slice(-2)}`;
+        log(`Fret: décimale manquante détectée — corrigé en ${fretValue}`);
+      }
       const result = {
         mawbCurrency: parsed.currency || null,
-        fretValue: rawFret ? String(rawFret).replace(/,/g, "") : null,
+        fretValue,
       };
       log(
         `Complément Vision: devise=${result.mawbCurrency} fret=${result.fretValue}`,
