@@ -2,6 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { geminiCallWithRetry } = require("./geminiRetry");
 
 /** Same pdf.js build as pdf-parse (must match installed pdf-parse version). */
 function resolvePdfJsBuild() {
@@ -710,8 +711,130 @@ async function extractManifestMetricsFromPdfFile(pdfPath) {
     }
     return { ok: true, ...parsed };
   } catch (e) {
+    // pdf-parse / pdf.js failed (e.g. "Invalid PDF structure", newer PDF spec).
+    // Debug hint: log file size so the user knows which PDF is problematic.
+    try {
+      const sizeMB = (fs.statSync(resolved).size / 1024 / 1024).toFixed(2);
+      console.warn(
+        `[manifestPdfExtract] pdf-parse failed for ${path.basename(resolved)} ` +
+          `(${sizeMB} MB): ${e?.message || e} — trying Gemini Vision fallback`,
+      );
+    } catch {}
+
+    // Gemini Vision fallback: works for scanned or structurally incompatible PDFs.
+    const visionResult = await extractManifestViaVision(resolved);
+    if (visionResult?.ok) return visionResult;
+
     return { ok: false, error: String(e?.message || e) };
   }
+}
+
+/**
+ * Gemini Vision fallback for manifests whose PDF structure pdf-parse cannot read.
+ * Sends the first page as a PDF blob and asks Gemini to extract the header fields.
+ * Returns the same shape as extractManifestMetricsFromPdfFile, or { ok:false }.
+ */
+async function extractManifestViaVision(pdfPath) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return { ok: false, error: "GEMINI_API_KEY absent" };
+
+  let genai;
+  try {
+    genai = require("@google/genai");
+  } catch {
+    return { ok: false, error: "@google/genai not installed" };
+  }
+
+  const MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"];
+  const client = new genai.GoogleGenAI({ apiKey });
+  const pdfBase64 = fs.readFileSync(pdfPath).toString("base64");
+
+  const prompt = `This is a shipping manifest (bordereau de colisage / liste de colisage).
+Extract EXACTLY these fields from the document:
+1. refNumber  — MAWB reference, format digits-hyphen-digits (e.g. "072-74225546").
+2. nombreContenant — total number of pieces/packages (integer, e.g. "79").
+3. poidTotal  — total weight in kg (e.g. "1628" or "1628.5").
+4. currency   — 3-letter ISO currency code (e.g. "MAD", "USD").
+5. totalValue — the TOTAL VALUE (2nd of the three totals at the very bottom of the table,
+               French-decimal e.g. "215675.02"). Strip commas.
+6. qteFacturee — the QUANTITÉ FACTURÉE / POSITIONS (1st of the three bottom totals,
+                an integer, e.g. "1619"). Look for a label "Positions" near it.
+
+Return ONLY valid JSON (no markdown fences):
+{"refNumber":"072-74225546","nombreContenant":"79","poidTotal":"1628","currency":"MAD","totalValue":"215675.02","qteFacturee":"1619"}`;
+
+  for (const model of MODELS) {
+    try {
+      const response = await geminiCallWithRetry(
+        client,
+        model,
+        {
+          contents: [
+            {
+              parts: [
+                {
+                  inlineData: { mimeType: "application/pdf", data: pdfBase64 },
+                },
+                { text: prompt },
+              ],
+            },
+          ],
+        },
+        (msg) => console.info(`[manifestVision] ${msg}`),
+      );
+
+      let text = "";
+      if (response && typeof response.text === "string" && response.text) {
+        text = response.text;
+      } else if (response?.candidates?.[0]?.content?.parts) {
+        text = response.candidates[0].content.parts
+          .filter((p) => !p.thought)
+          .map((p) => p.text || "")
+          .join("");
+      }
+      text = text.trim();
+      if (text.startsWith("```")) {
+        const s = text.indexOf("{"),
+          e2 = text.lastIndexOf("}") + 1;
+        text = s !== -1 ? text.slice(s, e2) : text;
+      }
+
+      const parsed = JSON.parse(text);
+      // Normalise numbers — strip thousands commas
+      const clean = (v) =>
+        v != null ? String(v).replace(/,/g, "").trim() || null : null;
+
+      const result = {
+        ok: true,
+        refNumber: clean(parsed.refNumber),
+        nombreContenant: clean(parsed.nombreContenant),
+        poidTotal: clean(parsed.poidTotal),
+        currency: parsed.currency
+          ? String(parsed.currency).toUpperCase().trim()
+          : null,
+        totalValue: clean(parsed.totalValue),
+        qteFacturee: clean(parsed.qteFacturee),
+        _source: `gemini-vision:${model}`,
+      };
+
+      // Must have at least the ref or metrics to be useful
+      if (!result.refNumber && !result.nombreContenant) {
+        console.warn(`[manifestVision] ${model} returned empty result`);
+        continue;
+      }
+
+      console.info(
+        `[manifestVision] extracted via ${model}: ` +
+          `ref=${result.refNumber} ${result.nombreContenant}Pcs ` +
+          `${result.poidTotal}kg ${result.currency} ` +
+          `val=${result.totalValue} qte=${result.qteFacturee}`,
+      );
+      return result;
+    } catch (err) {
+      console.warn(`[manifestVision] ${model} failed: ${err?.message || err}`);
+    }
+  }
+  return { ok: false, error: "gemini_vision_all_models_failed" };
 }
 
 function isManifestFilename(name) {
@@ -760,6 +883,7 @@ module.exports = {
   extractFooterTotalValue,
   extractFooterTotalLineFallback,
   extractManifestMetricsFromPdfFile,
+  extractManifestViaVision,
   pickManifestPdf,
   pickMawbPdf,
 };

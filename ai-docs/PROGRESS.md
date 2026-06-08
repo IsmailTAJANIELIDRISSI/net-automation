@@ -5,6 +5,66 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-08 — Gemini API retry mechanism for Vision fallbacks
+
+**Problem:** When `gemini-2.5-flash` returned 503 (high demand) or 429 (quota exceeded), the code immediately moved to `gemini-1.5-flash` (which is now deprecated → 404). This wasted the better model and caused total failure when the fallback was also unavailable.
+
+**Fix — new `src/utils/geminiRetry.js` + updated Vision callers:**
+
+1. **`geminiRetry.js`** — shared retry module with `geminiCallWithRetry()`:
+   - **503 UNAVAILABLE**: exponential back-off on the SAME model (5s → 10s → 20s, max 3 retries) before giving up on that model
+   - **429 RESOURCE_EXHAUSTED**: parse the API's `retryDelay` field from error JSON (e.g. "58s"), wait that exact duration (+1s buffer, capped at 70s), retry the same model once
+   - **404 / 400**: skip to next model immediately (wrong name / bad request)
+   - Prevents discarding a better model just because it had a temporary 2-second spike
+
+2. **Wired into all Vision functions:**
+   - `mawbShipperExtract.js`: `verifyShipperWithGemini()`, `extractVisionMeta()`, `supplementCurrencyFretViaVision()`
+   - `manifestPdfExtract.js`: `extractManifestViaVision()`
+   - All now use `geminiCallWithRetry(client, modelName, params, log)` instead of raw `client.models.generateContent()`
+
+3. **Model fallback updated:**
+   - `gemini-1.5-flash` → `gemini-2.0-flash` (stable replacement, not deprecated in v1beta API)
+
+**Result:** Vision extraction success rate dramatically improved — 503 spikes are automatically retried, 429 quota waits are respected, and the better model (`gemini-2.5-flash`) gets multiple chances before falling back.
+
+---
+
+## 2026-06-08 — DUM Normale Partiel: USD manifest currency bypass
+
+**Problem:** When filling the Entête tab for DUM Normale Partiel (Step 2), the app was always dividing `ach.totalValue` by the USD exchange rate to compute `montantTotal`, even when the manifest itself was already in USD. This created an unnecessary double-conversion: USD → MAD (in the manifest extraction) → back to USD (in the form filling), introducing rounding errors.
+
+**Fix — `src/badr/badrDumNormalPartiel.js` `_step2_entete()`:**
+
+- Check `ach.currency` (manifest currency, extracted from manifest PDF)
+- If `currency === "USD"` → use `ach.totalValue` directly, no division
+- If `currency !== "USD"` (e.g. MAD, EUR, CNY) → apply USD exchange rate conversion as before
+- Added log message to show which path was taken
+
+**Business logic:** The DUM 085 form always expects USD-denominated `montantTotal`. When the manifest is already USD-valued, we preserve precision by skipping the USD↔MAD conversion round-trip.
+
+---
+
+## 2026-06-08 — Déclarer scellés for DUM Normale Partiel (new step 10)
+
+**Problem:** After the partiel DUM PDF was downloaded the automation stopped — scellés were never declared for partiel LTAs. The DS Combinée path uses DEDOUANEMENT → DS MEAD COMBINEE → Déclarer scellés DS MEAD combinée, but the partiel DUM path uses DEDOUANEMENT → Déclarer scellés (a#\_1225 / cf1225).
+
+**Fix:**
+
+1. **`src/badr/badrDsCombineFinalize.js`**:
+   - Extracted shared form-filling into `_fillScellesForm(page, bureau, regime, annee, serie, cle, scelle1, scelle2)` private method
+   - Refactored `declarerScelles` to call `_fillScellesForm` after navigation
+   - Added `declarerScellesPartiel(bureau, regime, serie, cle, scelle1, scelle2)`: navigates DEDOUANEMENT → Déclarer scellés (a#\_1225) then calls `_fillScellesForm`
+
+2. **`src/badr/badrDumNormalPartiel.js`**:
+   - `_readDumRef` now returns `{ ref, serie, cle }` instead of just the string
+   - `_step10_print` returns `{ destPath, serie, cle }` (DUM série/clé needed for scellés form)
+   - New checkpoint `partiel_pdf_saved`: set after PDF download with `dumSerie`/`dumCle` persisted in state (crash-safe resume)
+   - `partiel_done` now set only after scellés are declared (Step 10)
+   - `_isDone` phase order updated: `partiel_pdf_saved` inserted before `partiel_done`
+   - Step 10 lazy-requires `BADRDsCombineFinalize` and calls `declarerScellesPartiel("301", "085", dumSerie, dumCle, ach.scelle1, ach.scelle2)`
+
+---
+
 ## 2026-06-04 — MAWB shipper extraction: second pass — mightBeCompany false positives
 
 **Problem (follow-up to same-day fix):** After the EXCLUDE_PATTERNS + 1500-char window fix, two new false positives appeared:

@@ -1629,6 +1629,10 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
               `devise ${manifestPdfExtract.currency}`,
             manifestPdfExtract.totalValue &&
               `valeur ${manifestPdfExtract.totalValue}`,
+            manifestPdfExtract.qteFacturee &&
+              `qteFacturée ${manifestPdfExtract.qteFacturee}`,
+            manifestPdfExtract._source &&
+              `(via ${manifestPdfExtract._source})`,
           ]
             .filter(Boolean)
             .join(", ");
@@ -1645,10 +1649,18 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
             );
           }
         } else {
+          const errDetails = manifestPdfExtract?.error || "inconnu";
+          const hint = errDetails.includes("Invalid PDF")
+            ? " — le fichier PDF a une structure non supportée par le lecteur intégré"
+            : errDetails === "no_manifest_header_match"
+              ? " — le PDF est lisible mais ne contient pas l’en-tête MAWB/Pcs/kg attendu"
+              : errDetails === "gemini_vision_all_models_failed"
+                ? " — PDF illisible et Vision Gemini a aussi échoué"
+                : "";
           sendLog(
             "warn",
             "Manifeste",
-            `[${entry.name}] PDF "${manifeste}" — pas d’en-tête exploitable (${manifestPdfExtract?.error || "inconnu"})`,
+            `[${entry.name}] PDF "${manifeste}" — pas d’en-tête exploitable (${errDetails})${hint}`,
           );
         }
       } catch (e) {

@@ -16,6 +16,7 @@ The core automation flow is **fully implemented and working in production**:
   - `badrDumNormalPartiel.js`: 10-step BADR form, checkpointed per tab
   - 12-phase state machine in main.js
   - Step 1: radio + reference fields + checkbox ✅
+  - Step 2 (Entête): USD currency bypass — if manifest currency is USD, use totalValue directly without exchange rate conversion (preserves precision) ✅
   - Step 5: lieu autocomplete wait + item matching ✅; ref cleaned ✅
   - Step 5: poids rounding correction (≤1 kg → auto-fix Entête + Articles) ✅
   - Step 6: compressPdfForAnnex wired; short filename (≤49 chars); upload waitFor ✅
@@ -31,6 +32,11 @@ The core automation flow is **fully implemented and working in production**:
 - **DUM Normale Partiel PDF copied to system Downloads ✅** (2026-05-22)
   - After saving PDF in LTA folder, also `copyFileSync` to `~/Downloads/` with same filename
   - Copy failure is non-fatal (warn log only)
+- **Scellés declaration for DUM Normale Partiel ✅** (2026-06-08)
+  - `declarerScellesPartiel` in `badrDsCombineFinalize.js`: DEDOUANEMENT → Déclarer scellés (a#\_1225)
+  - `_fillScellesForm` extracted — shared by DS Combinée and partiel paths (no code duplication)
+  - `badrDumNormalPartiel`: Step 9 → PDF download (sets `partiel_pdf_saved` + persists `dumSerie`/`dumCle`), Step 10 → scellés (sets `partiel_done`)
+  - Crash-safe: `dumSerie`/`dumCle` persisted in `acheminement.json`; resume from `partiel_pdf_saved` goes straight to scellés
 - **MAWB shipper extraction form-label bug ✅** (2026-06-04)
   - Anchor window 400 → 1500 chars; candidates filtered by `mightBeCompany()`
   - Added MAWB column-header exclusion patterns; falls back to full-document scan when no company candidate in window
@@ -44,6 +50,21 @@ The core automation flow is **fully implemented and working in production**:
   - `portnetLogin.js`: `waitForURL` 120 s → 180 s; `networkidle` wait after URL confirmed
   - `portnetDsCombine.js` `navigate()`: `networkidle` wait before touching iframe
   - `badrLotLookup.js`: popup event timeout 30 s → 60 s; form input guard with auto-reload fallback
+
+- **Manifest PDF "Invalid PDF structure" — Gemini Vision fallback ✅** (2026-06-09)
+  - `extractManifestViaVision(pdfPath)` in `manifestPdfExtract.js`: sends PDF as base64 to `gemini-2.5-flash` (fallback `gemini-2.0-flash`), extracts all 6 fields (refNumber, nombreContenant, poidTotal, currency, totalValue, qteFacturee) from the manifest
+  - Wired into the catch block of `extractManifestMetricsFromPdfFile` — transparent upgrade: pdf-parse tries first, Vision fires only on parse failure
+  - Console logs file size + error reason before fallback attempt (debug aid)
+  - Exported as `extractManifestViaVision` for optional direct use
+  - Success log in `main.js` now shows `qteFacturée` and `(via gemini-vision:…)` source tag
+  - Warn log enhanced with actionable hint based on error type (Invalid PDF / no_header_match / gemini_failed)
+
+- **Gemini API robust retry mechanism ✅** (2026-06-09)
+  - `src/utils/geminiRetry.js` — shared `geminiCallWithRetry()` for 503/429 transient errors
+  - 503 UNAVAILABLE: exponential back-off (5s/10s/20s) on same model before fallback
+  - 429 RESOURCE_EXHAUSTED: parse API's `retryDelay` field, wait exact duration (e.g. 58s), retry same model once
+  - Wired into all Vision functions: MAWB shipper/currency/fret extraction + manifest extraction
+  - Model fallback updated: `gemini-1.5-flash` → `gemini-2.0-flash` (not deprecated)
 
 ## Next Steps / Testing
 

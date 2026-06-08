@@ -4,7 +4,10 @@ const fs = require("fs");
 const path = require("path");
 
 // ── Gemini model fallback order (mirrors Python GEMINI_MODEL_FALLBACKS) ──────
-const GEMINI_MODEL_FALLBACKS = ["gemini-2.5-flash", "gemini-1.5-flash"];
+const GEMINI_MODEL_FALLBACKS = ["gemini-2.5-flash", "gemini-2.0-flash"];
+
+// ── Retry helper (handles 503 back-off + 429 quota wait) ─────────────────────
+const { geminiCallWithRetry } = require("./geminiRetry");
 
 // ── Generic logistics words that must NOT be used as discriminating fragments ─
 // These words appear in many company names and cause false-positive matches.
@@ -195,10 +198,12 @@ OUTPUT FORMAT (exact JSON, no markdown fences):
   for (const modelName of GEMINI_MODEL_FALLBACKS) {
     try {
       log(`Appel Gemini (${modelName})...`);
-      const response = await client.models.generateContent({
-        model: modelName,
-        contents: prompt,
-      });
+      const response = await geminiCallWithRetry(
+        client,
+        modelName,
+        { contents: prompt },
+        log,
+      );
 
       let responseText = "";
       if (response && typeof response.text === "string" && response.text) {
@@ -286,17 +291,23 @@ Respond in this EXACT JSON (no markdown fences):
   for (const modelName of GEMINI_MODEL_FALLBACKS) {
     try {
       log(`PDF scanné — appel Gemini Vision (${modelName})...`);
-      const response = await client.models.generateContent({
-        model: modelName,
-        contents: [
-          {
-            parts: [
-              { inlineData: { mimeType: "application/pdf", data: pdfBase64 } },
-              { text: prompt },
-            ],
-          },
-        ],
-      });
+      const response = await geminiCallWithRetry(
+        client,
+        modelName,
+        {
+          contents: [
+            {
+              parts: [
+                {
+                  inlineData: { mimeType: "application/pdf", data: pdfBase64 },
+                },
+                { text: prompt },
+              ],
+            },
+          ],
+        },
+        log,
+      );
 
       let responseText = "";
       if (response && typeof response.text === "string" && response.text) {
@@ -417,17 +428,23 @@ Respond ONLY in this exact JSON (no markdown):
   for (const modelName of GEMINI_MODEL_FALLBACKS) {
     try {
       log(`Complément Vision devise+fret (${modelName})...`);
-      const response = await client.models.generateContent({
-        model: modelName,
-        contents: [
-          {
-            parts: [
-              { inlineData: { mimeType: "application/pdf", data: pdfBase64 } },
-              { text: prompt },
-            ],
-          },
-        ],
-      });
+      const response = await geminiCallWithRetry(
+        client,
+        modelName,
+        {
+          contents: [
+            {
+              parts: [
+                {
+                  inlineData: { mimeType: "application/pdf", data: pdfBase64 },
+                },
+                { text: prompt },
+              ],
+            },
+          ],
+        },
+        log,
+      );
 
       let responseText = "";
       if (response && typeof response.text === "string" && response.text) {

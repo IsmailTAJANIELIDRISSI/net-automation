@@ -211,14 +211,53 @@ class BADRDumNormalPartiel {
     }
 
     // ── STEP 9 — Print / Download ──────────────────────────────────────────
-    if (!this._isDone(ach, "partiel_done")) {
-      const pdfPath = await this._guardStep(
+    // ── STEP 9 — Print / Download ─────────────────────────────────────────
+    if (!this._isDone(ach, "partiel_pdf_saved")) {
+      const result = await this._guardStep(
         "step9_print",
         () => this._step10_print(iframe, ach, updateState),
         badrConn,
       );
-      updateState({ phase: "partiel_done", pdfPath });
-      log.info("DUM Normale Partiel complete", { pdfPath });
+      updateState({
+        phase: "partiel_pdf_saved",
+        pdfPath: result.destPath,
+        dumSerie: result.serie,
+        dumCle: result.cle,
+      });
+      log.info("DUM Normale Partiel — PDF saved", { pdfPath: result.destPath });
+    }
+
+    // ── STEP 10 — Déclarer Scèlles ──────────────────────────────────────────
+    if (!this._isDone(ach, "partiel_done")) {
+      const savedState = ach.automationState || {};
+      const dumSerie = savedState.dumSerie;
+      const dumCle = savedState.dumCle;
+      if (dumSerie && dumCle && ach.scelle1 && ach.scelle2) {
+        // Lazy-require to avoid circular dep at module load time
+        const BADRDsCombineFinalize = require("./badrDsCombineFinalize");
+        const finalizer = new BADRDsCombineFinalize(this.page, null, badrConn);
+        await this._guardStep(
+          "step10_scelles",
+          () =>
+            finalizer.declarerScellesPartiel(
+              "301",
+              "085",
+              dumSerie,
+              dumCle,
+              ach.scelle1,
+              ach.scelle2,
+            ),
+          badrConn,
+        );
+        log.info("Scèllés declared for DUM Normale Partiel.");
+      } else {
+        log.warn(
+          "Skipping scèllés declaration — missing DUM ref or scèllé values.",
+          { dumSerie, dumCle, scelle1: ach.scelle1, scelle2: ach.scelle2 },
+        );
+      }
+      updateState({ phase: "partiel_done" });
+      log.info("DUM Normale Partiel complete");
     }
   }
 
@@ -286,7 +325,8 @@ class BADRDumNormalPartiel {
       "partiel_documents_saved",
       "partiel_demandes_saved",
       "partiel_articles_saved",
-      "partiel_done",
+      "partiel_pdf_saved", // PDF downloaded; dumSerie/dumCle persisted in state
+      "partiel_done", // scelles declared
     ];
     const current = ach.automationState?.phase || "";
     const currentIdx = order.indexOf(current);
@@ -424,25 +464,39 @@ class BADRDumNormalPartiel {
       String(ach.poidTotal || ""),
     );
 
-    // Montant total = totalValue / tauxChange(USD)
-    let tauxChange = null;
-    const tauxSpan = iframe.locator("#mainTab\\:form0\\:id_tauxChange");
-    if (await tauxSpan.isVisible().catch(() => false)) {
-      const tauxText = await tauxSpan.textContent().catch(() => "");
-      const tauxNum = parseFloat(String(tauxText).replace(",", "."));
-      if (tauxNum > 0) tauxChange = tauxNum;
-    }
-    if (!tauxChange) {
-      try {
-        tauxChange = await fetchMADRate("USD");
-      } catch (e) {
-        log.warn("Could not fetch USD rate — using fallback 10", e.message);
-        tauxChange = 10;
+    // totalValue → montantTotal
+    // If manifest currency is already USD, use totalValue as-is (no conversion).
+    // Otherwise, convert via USD exchange rate.
+    const manifestCurrency = (ach.currency || "").toUpperCase().trim();
+    let montantTotal;
+    if (manifestCurrency === "USD") {
+      // Manifest is already in USD — use totalValue directly
+      montantTotal = roundBADR(parseFloat(ach.totalValue || "0"));
+      log.info(
+        `Manifest currency is USD — using totalValue as-is: ${montantTotal}`,
+      );
+    } else {
+      // Manifest is in another currency (e.g. MAD) — convert to USD via tauxChange
+      let tauxChange = null;
+      const tauxSpan = iframe.locator("#mainTab\\:form0\\:id_tauxChange");
+      if (await tauxSpan.isVisible().catch(() => false)) {
+        const tauxText = await tauxSpan.textContent().catch(() => "");
+        const tauxNum = parseFloat(String(tauxText).replace(",", "."));
+        if (tauxNum > 0) tauxChange = tauxNum;
       }
+      if (!tauxChange) {
+        try {
+          tauxChange = await fetchMADRate("USD");
+        } catch (e) {
+          log.warn("Could not fetch USD rate — using fallback 10", e.message);
+          tauxChange = 10;
+        }
+      }
+      montantTotal = roundBADR(parseFloat(ach.totalValue || "0") / tauxChange);
+      log.info(
+        `Manifest currency is ${manifestCurrency || "unknown"} — converted via USD rate ${tauxChange}: ${montantTotal}`,
+      );
     }
-    const montantTotal = roundBADR(
-      parseFloat(ach.totalValue || "0") / tauxChange,
-    );
     await this._fillClearType(
       iframe,
       "#mainTab\\:form0\\:montTotalNumber_input",
@@ -976,10 +1030,10 @@ class BADRDumNormalPartiel {
       .catch(() => {});
     await this.page.waitForTimeout(600);
 
-    const dumRef = await this._readDumRef(iframe);
-    if (dumRef) {
-      log.info(`Step 9 — DUM ref: ${dumRef}`);
-      updateState({ dumRef });
+    const dumRefParts = await this._readDumRef(iframe);
+    if (dumRefParts) {
+      log.info(`Step 9 — DUM ref: ${dumRefParts.ref}`);
+      updateState({ dumRef: dumRefParts.ref });
     }
 
     log.info("Step 9 — Printing declaration…");
@@ -993,7 +1047,7 @@ class BADRDumNormalPartiel {
       printBtn.click(),
     ]);
 
-    const refPart = dumRef ? `-${sanitizeFilename(dumRef)}` : "";
+    const refPart = dumRefParts ? `-${sanitizeFilename(dumRefParts.ref)}` : "";
     const safeName =
       sanitizeFilename(`${ach.name}-DUM-NORMAL-${ach.refNumber}`) + refPart;
     const destPath = path.join(ach.folderPath, `${safeName}.pdf`);
@@ -1012,12 +1066,17 @@ class BADRDumNormalPartiel {
       });
     }
 
-    return destPath;
+    return {
+      destPath,
+      serie: dumRefParts?.serie ?? null,
+      cle: dumRefParts?.cle ?? null,
+    };
   }
 
   /**
    * Read the assigned declaration reference from the Entête reference table.
-   * Returns a string like "2880 K", or null if not found.
+   * Returns { ref: "2880 K", serie: "2880", cle: "K" }, or null if not found.
+   * serie/cle are used by declarerScellesPartiel to fill the search form.
    */
   async _readDumRef(iframe) {
     try {
@@ -1043,7 +1102,11 @@ class BADRDumNormalPartiel {
       if (!serie) return null;
       // Strip leading zeros from serie: "0002880" → "2880"
       const serieNum = String(parseInt(serie, 10) || serie);
-      return cle ? `${serieNum} ${cle}` : serieNum;
+      return {
+        ref: cle ? `${serieNum} ${cle}` : serieNum,
+        serie: serieNum,
+        cle,
+      };
     } catch {
       log.warn("Could not read DUM reference table — skipping");
       return null;

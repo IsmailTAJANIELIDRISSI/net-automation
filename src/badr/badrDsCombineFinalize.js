@@ -377,6 +377,99 @@ class BADRDsCombineFinalize {
       }
     }
 
+    await this._fillScellesForm(
+      page,
+      bureau,
+      regime,
+      annee,
+      serie,
+      cle,
+      scelle1,
+      scelle2,
+    );
+  }
+
+  // 3. Declare Scellés for DUM Normale Partiel
+  //    Path: DEDOUANEMENT → Déclarer scellés  (a#_1225)
+  //    instead of: DEDOUANEMENT → DS MEAD COMBINEE → Déclarer scellés DS MEAD combinée
+  async declarerScellesPartiel(bureau, regime, serie, cle, scelle1, scelle2) {
+    const page = this.page;
+    const annee = new Date().getFullYear().toString();
+
+    if (!scelle1 || !scelle2) {
+      log.warn(
+        "Scellé 1 or Scellé 2 is missing. Skipping Scellés declaration (partiel).",
+      );
+      return;
+    }
+
+    log.info("Declaring Scellés for DUM Normale Partiel…");
+    await page.bringToFront();
+
+    const MAX_MENU_RETRIES = 3;
+    for (let menuAttempt = 1; menuAttempt <= MAX_MENU_RETRIES; menuAttempt++) {
+      try {
+        // Expand "DEDOUANEMENT"
+        const dedouanementPanel = page.locator(
+          'h3.ui-panelmenu-header:has-text("DEDOUANEMENT")',
+        );
+        const isExpanded =
+          (await dedouanementPanel.getAttribute("aria-expanded")) === "true";
+        if (!isExpanded) {
+          log.info("Clicking DEDOUANEMENT to expand…");
+          await dedouanementPanel.click();
+          await page.waitForTimeout(700);
+        }
+
+        // Click "Déclarer scellés" directly — id=_1225, cf1225
+        // (NOT the DS MEAD COMBINEE child which is _12251 / cf12251)
+        log.info("Clicking Déclarer scellés (partiel)…");
+        const declarerLink = page
+          .locator(
+            'a#_1225, a[title*="codeFonctionnalite=cf1225"]:not([title*="cf12251"])',
+          )
+          .first();
+        await declarerLink.waitFor({ state: "visible", timeout: 15000 });
+        await declarerLink.click();
+
+        break;
+      } catch (menuErr) {
+        if (menuAttempt >= MAX_MENU_RETRIES) throw menuErr;
+        log.warn(
+          `DEDOUANEMENT menu stuck (attempt ${menuAttempt}/${MAX_MENU_RETRIES}): ${menuErr.message}. Refreshing BADR Accueil and retrying…`,
+        );
+        if (this.badrConn) {
+          await this.badrConn.navigateToAccueil();
+        } else {
+          await page.reload({ waitUntil: "networkidle" });
+          await page.waitForTimeout(2000);
+        }
+      }
+    }
+
+    await this._fillScellesForm(
+      page,
+      bureau,
+      regime,
+      annee,
+      serie,
+      cle,
+      scelle1,
+      scelle2,
+    );
+  }
+
+  // ── Shared form-filling used by both declarerScelles and declarerScellesPartiel ──
+  async _fillScellesForm(
+    page,
+    bureau,
+    regime,
+    annee,
+    serie,
+    cle,
+    scelle1,
+    scelle2,
+  ) {
     const resolveVisibleLocator = async (
       contexts,
       selectors,
@@ -570,7 +663,7 @@ class BADRDsCombineFinalize {
     // Bring main page back to front and stabilize
     await page.bringToFront().catch(() => {});
     await page.waitForTimeout(500);
-  }
+  } // end _fillScellesForm
 }
 
 module.exports = BADRDsCombineFinalize;
