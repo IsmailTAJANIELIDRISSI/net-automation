@@ -424,7 +424,7 @@ class BADRLotLookup {
     return { dateDu: fmt(dateDu), dateAu: fmt(dateAu) };
   }
 
-  /** Send email notification when no result found ("Pas encours manifest"). */
+  /** Send email notification when no result found ("Pas encore manifest"). */
   async _sendNoResultEmail(lotReference) {
     const { email } = config;
     if (!email.enabled || !email.user || !email.to) {
@@ -443,7 +443,7 @@ class BADRLotLookup {
       await transporter.sendMail({
         from: email.from || email.user,
         to: email.to,
-        subject: `[BADR] Pas encours manifest – ${lotReference}`,
+        subject: `[BADR] Pas encore manifest – ${lotReference}`,
         text: [
           `Bonjour,`,
           ``,

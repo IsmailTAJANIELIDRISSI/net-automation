@@ -428,15 +428,15 @@ async function prepareLotAndWeightCheck(acheminement) {
       if (lotInfo.isEmpty) {
         updateAutomationState(folderPath, {
           phase: "error",
-          error: "Pas encours manifest",
+          error: "Pas encore manifest",
         });
         sendLog(
           "warn",
           "BADR",
-          `Pas encours manifest pour ${resolvedRef} – email envoyé`,
+          `Pas encore manifest pour ${resolvedRef} – email envoyé`,
         );
-        sendProgress(id, "error", { error: "Pas encours manifest" });
-        return { success: false, error: "Pas encours manifest" };
+        sendProgress(id, "error", { error: "Pas encore manifest" });
+        return { success: false, error: "Pas encore manifest" };
       }
 
       if (lotInfo.isPartiel) {
@@ -1260,10 +1260,10 @@ async function runPartielDumFlow(acheminement) {
     if (lotResult.isEmpty) {
       updateAutomationState(folderPath, {
         phase: "error",
-        error: "Pas encours manifest",
+        error: "Pas encore manifest",
       });
-      sendProgress(id, "error", { error: "Pas encours manifest" });
-      return { success: false, error: "Pas encours manifest" };
+      sendProgress(id, "error", { error: "Pas encore manifest" });
+      return { success: false, error: "Pas encore manifest" };
     }
 
     if (lotResult.isPartiel && !lotResult.partiels) {
@@ -1631,8 +1631,7 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
               `valeur ${manifestPdfExtract.totalValue}`,
             manifestPdfExtract.qteFacturee &&
               `qteFacturée ${manifestPdfExtract.qteFacturee}`,
-            manifestPdfExtract._source &&
-              `(via ${manifestPdfExtract._source})`,
+            manifestPdfExtract._source && `(via ${manifestPdfExtract._source})`,
           ]
             .filter(Boolean)
             .join(", ");

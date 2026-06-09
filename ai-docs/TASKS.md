@@ -5,6 +5,7 @@
 The core automation flow is **fully implemented and working in production**:
 
 - BADR lot lookup ✅
+  - Error messaging: "Pas encore manifest" when lot not found (clear user-facing message) ✅
 - BADR pré-apurement weight check ✅
 - Portnet DS Combinée form (all 9 steps) ✅
 - PDF compression chain (iLovePDF → Adobe → fallback) ✅

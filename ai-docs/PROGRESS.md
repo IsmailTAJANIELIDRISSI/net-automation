@@ -5,6 +5,23 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-09 — Clearer "no manifest" error message in BADR lot lookup
+
+**Problem:** When `badrLotLookup` failed to find a manifest row (lot not yet processed in BADR), the error message shown on the card badge and in logs was "Pas encours manifest" — unclear wording that confused users.
+
+**Fix:**
+
+Changed error message from "Pas encours manifest" to "Pas encore manifest" (not yet manifest) for clarity.
+
+**Files changed:**
+
+- `src/badr/badrLotLookup.js` — updated comment and email subject
+- `electron/main.js` — updated error messages in both DS Combinée and DUM Normale Partiel flows (2 locations)
+
+**Result:** Users now see "Pas encore manifest" on error badges and in email notifications, making it immediately clear that the manifest hasn't been processed in BADR yet (rather than a generic error).
+
+---
+
 ## 2026-06-08 — Gemini API retry mechanism for Vision fallbacks
 
 **Problem:** When `gemini-2.5-flash` returned 503 (high demand) or 429 (quota exceeded), the code immediately moved to `gemini-1.5-flash` (which is now deprecated → 404). This wasted the better model and caused total failure when the fallback was also unavailable.
