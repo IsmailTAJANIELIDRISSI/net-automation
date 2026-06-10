@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState } from "react";
 import StatusBadge from "./StatusBadge.jsx";
 
 /**
@@ -13,6 +13,7 @@ export default function AcheminementCard({
   onChange,
   onRun,
   onDelete,
+  onDeclareScelles,
 }) {
   const { id, name, folderPath, manifeste, mawb, refNumber } = ach;
 
@@ -50,6 +51,12 @@ export default function AcheminementCard({
     "badr-downloading",
   ].includes(status);
   const isError = status === "error" || status === "weight-mismatch";
+  const isWaitingSignature = status === "partiel-waiting-signature";
+
+  // Local state for the signed-serie input (prefilled with the validated serie)
+  const [signedSerie, setSignedSerie] = useState(
+    ach.automationState?.dumSerie ?? "",
+  );
 
   const cardBorder = isDone
     ? "border-emerald-700/50"
@@ -262,7 +269,7 @@ export default function AcheminementCard({
         </div>
       )}
 
-      {/* ── Run button (or Terminé + delete row) ──────────────────────────── */}
+      {/* ── Run button / Terminé / Waiting signature ────────────────────── */}
       {isDone ? (
         <div className="mt-1 flex gap-1.5">
           {/* 80% — Terminé indicator */}
@@ -285,6 +292,50 @@ export default function AcheminementCard({
                        flex items-center justify-center"
           >
             🗑
+          </button>
+        </div>
+      ) : isWaitingSignature ? (
+        /* ── Manual-signature waiting panel ──────────────────────────────── */
+        <div className="mt-1 flex flex-col gap-2 bg-amber-900/20 border border-amber-700/40 rounded-lg p-3">
+          <p className="text-xs text-amber-400 font-semibold">
+            ✍ Signature manuelle requise dans BADR
+          </p>
+          {/* Show validated serie/cle so the user knows what to sign */}
+          <div className="flex flex-col gap-0.5">
+            <span className="text-xs text-slate-400">
+              Référence DUM à signer :
+            </span>
+            <span className="text-sm font-mono text-amber-300 px-2 py-1 bg-slate-900/50 rounded select-all">
+              301 — 000 — {new Date().getFullYear()} —{" "}
+              {ach.automationState?.dumSerie ?? "—"} —{" "}
+              {ach.automationState?.dumCle ?? "—"}
+            </span>
+          </div>
+          {/* Input for signed serie (user fills in after signing) */}
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-slate-400 font-medium">
+              Série signée (après validation BADR)
+            </label>
+            <input
+              type="text"
+              value={signedSerie}
+              onChange={(e) => setSignedSerie(e.target.value)}
+              placeholder={ach.automationState?.dumSerie ?? "ex: 3064"}
+              disabled={isGlobalRunning}
+              className="bg-slate-900 border border-amber-700/50 rounded px-2.5 py-1.5 text-sm
+                         text-slate-100 placeholder-slate-600 font-mono
+                         focus:border-amber-400 focus:ring-1 focus:ring-amber-400/50
+                         disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            />
+          </div>
+          <button
+            onClick={() => onDeclareScelles?.(ach, signedSerie)}
+            disabled={!signedSerie.trim() || isGlobalRunning}
+            className="w-full py-2 rounded-lg text-sm font-semibold transition-all duration-200
+                       bg-amber-700 hover:bg-amber-600 text-white border border-amber-600
+                       disabled:opacity-50 disabled:cursor-not-allowed shadow-md"
+          >
+            ✍ Déclarer scellés
           </button>
         </div>
       ) : (

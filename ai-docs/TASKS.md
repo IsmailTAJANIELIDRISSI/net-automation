@@ -33,11 +33,11 @@ The core automation flow is **fully implemented and working in production**:
 - **DUM Normale Partiel PDF copied to system Downloads ✅** (2026-05-22)
   - After saving PDF in LTA folder, also `copyFileSync` to `~/Downloads/` with same filename
   - Copy failure is non-fatal (warn log only)
-- **Scellés declaration for DUM Normale Partiel ✅** (2026-06-08)
-  - `declarerScellesPartiel` in `badrDsCombineFinalize.js`: DEDOUANEMENT → Déclarer scellés (a#\_1225)
-  - `_fillScellesForm` extracted — shared by DS Combinée and partiel paths (no code duplication)
-  - `badrDumNormalPartiel`: Step 9 → PDF download (sets `partiel_pdf_saved` + persists `dumSerie`/`dumCle`), Step 10 → scellés (sets `partiel_done`)
-  - Crash-safe: `dumSerie`/`dumCle` persisted in `acheminement.json`; resume from `partiel_pdf_saved` goes straight to scellés
+- **Scellés declaration for DUM Normale Partiel — human-gated ✅** (2026-06-09)
+  - `run()` in `badrDumNormalPartiel.js` now stops at `partiel_pdf_saved` (no auto-scellés)
+  - New checkpoint `partiel_waiting_signature`: card shows amber badge + validated DUM reference + signed-serie input + "Déclarer scellés" button
+  - `automation:declare-scelles-partiel` IPC: user-triggered after manual signing in BADR
+  - Batch runner skips `partiel_waiting_signature` LTAs (no automation possible without human action)
 - **MAWB shipper extraction form-label bug ✅** (2026-06-04)
   - Anchor window 400 → 1500 chars; candidates filtered by `mightBeCompany()`
   - Added MAWB column-header exclusion patterns; falls back to full-document scan when no company candidate in window

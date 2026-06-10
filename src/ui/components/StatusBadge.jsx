@@ -19,6 +19,7 @@ export default function StatusBadge({ status }) {
     error: "bg-red-900/60 text-red-300",
     "weight-mismatch": "bg-orange-900/60 text-orange-300",
     "partiel-skip": "bg-yellow-900/60 text-yellow-300",
+    "partiel-waiting-signature": "bg-amber-900/60 text-amber-300 animate-pulse",
   };
 
   const labels = {
@@ -35,6 +36,7 @@ export default function StatusBadge({ status }) {
     error: "Erreur",
     "weight-mismatch": "Écart poids",
     "partiel-skip": "LTA Partielle",
+    "partiel-waiting-signature": "En attente signature",
   };
 
   const cls = variants[status] ?? variants.idle;

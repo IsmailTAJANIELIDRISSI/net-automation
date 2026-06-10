@@ -227,38 +227,16 @@ class BADRDumNormalPartiel {
       log.info("DUM Normale Partiel — PDF saved", { pdfPath: result.destPath });
     }
 
-    // ── STEP 10 — Déclarer Scèlles ──────────────────────────────────────────
-    if (!this._isDone(ach, "partiel_done")) {
-      const savedState = ach.automationState || {};
-      const dumSerie = savedState.dumSerie;
-      const dumCle = savedState.dumCle;
-      if (dumSerie && dumCle && ach.scelle1 && ach.scelle2) {
-        // Lazy-require to avoid circular dep at module load time
-        const BADRDsCombineFinalize = require("./badrDsCombineFinalize");
-        const finalizer = new BADRDsCombineFinalize(this.page, null, badrConn);
-        await this._guardStep(
-          "step10_scelles",
-          () =>
-            finalizer.declarerScellesPartiel(
-              "301",
-              "085",
-              dumSerie,
-              dumCle,
-              ach.scelle1,
-              ach.scelle2,
-            ),
-          badrConn,
-        );
-        log.info("Scèllés declared for DUM Normale Partiel.");
-      } else {
-        log.warn(
-          "Skipping scèllés declaration — missing DUM ref or scèllé values.",
-          { dumSerie, dumCle, scelle1: ach.scelle1, scelle2: ach.scelle2 },
-        );
-      }
-      updateState({ phase: "partiel_done" });
-      log.info("DUM Normale Partiel complete");
-    }
+    // ── Scellés are NOT declared here automatically ────────────────────────
+    // After printing the DUM, the user must manually sign the declaration in
+    // BADR (this is a critical human-verification step).  The automation
+    // stops at "partiel_pdf_saved" and waits for the user to:
+    //   1. Go to BADR, sign the printed serie manually.
+    //   2. Come back to the app, confirm/enter the signed serie.
+    //   3. Click "Déclarer scellés" — which triggers automation:declare-scelles-partiel IPC.
+    log.info(
+      "DUM Normale Partiel — PDF printed. Waiting for manual signature before declaring scellés.",
+    );
   }
 
   // ── BADR error detection & recovery ──────────────────────────────────────

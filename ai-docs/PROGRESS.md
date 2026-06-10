@@ -5,6 +5,37 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-09 — DUM Normale Partiel: human-gated scellés declaration
+
+**Problem:** The automation was auto-declaring scellés immediately after printing the DUM PDF. But declaring scellés requires a **signed** DUM serie — which requires the user to manually sign the declaration in BADR first (critical human-verification step). The app had no way to know the signed serie, and no mechanism to wait for it.
+
+**Solution:** Split the flow into two phases separated by a human action:
+
+1. **Automation phase** (`badrDumNormalPartiel.run()`): fills all steps (1-9) + prints PDF → stops at `partiel_pdf_saved` → transitions to `partiel_waiting_signature`
+2. **Manual phase**: user goes to BADR, signs the DUM serie manually
+3. **User-triggered phase**: user comes back to the app, confirms/enters the signed serie, clicks "Déclarer scellés" → triggers `automation:declare-scelles-partiel` IPC → declares scellés → `partiel_done`
+
+**Files changed:**
+
+- **`src/badr/badrDumNormalPartiel.js`**: Removed Step 10 (auto-scellés) from `run()`. Added explanatory comment. `run()` now stops at `partiel_pdf_saved`.
+- **`electron/main.js`**:
+  - `runPartielDumFlow()`: Added `partiel_waiting_signature` checkpoint guard at top; after `dum.run()` completes, transitions `partiel_pdf_saved` → `partiel_waiting_signature` and returns early
+  - New `automation:declare-scelles-partiel` IPC handler: reads saved `dumCle`/scellés from state, runs `declarerScellesPartiel()` with the user-supplied signed serie, sets `partiel_done`
+  - `runAllAutomationTasks()`: Added `partiel_waiting_signature` to needsPortnet exclusion list + continue in loop (skips these in batch runs)
+- **`electron/preload.js`**: Exposed `window.api.declareScelles(folderPath, signedSerie)`
+- **`src/ui/components/StatusBadge.jsx`**: Added `"partiel-waiting-signature"` → amber pulsing badge "En attente signature"
+- **`src/ui/App.jsx`**: Mapped `partiel_waiting_signature` → `"partiel-waiting-signature"` in `checkpointToStatus`; added `handleDeclareScelles` callback; passes `onDeclareScelles={handleDeclareScelles}` to cards
+- **`src/ui/components/AcheminementCard.jsx`**: Added `useState` for `signedSerie` (prefilled with `dumSerie`); when status = `partiel-waiting-signature`, shows: validated DUM reference (read-only), signed-serie input, amber "✍ Déclarer scellés" button
+
+**UX flow on card:**
+
+- After automation prints PDF: badge turns amber "En attente signature" + panel shows "301 — 000 — YYYY — SERIE — CLE" (read-only)
+- User signs the DUM in BADR, comes back
+- User verifies/updates the serie input (pre-filled, editable if BADR changed it)
+- User clicks "✍ Déclarer scellés" → app connects to BADR and declares scellés → badge turns "Terminé"
+
+---
+
 ## 2026-06-09 — Clearer "no manifest" error message in BADR lot lookup
 
 **Problem:** When `badrLotLookup` failed to find a manifest row (lot not yet processed in BADR), the error message shown on the card badge and in logs was "Pas encours manifest" — unclear wording that confused users.

@@ -22,6 +22,12 @@ contextBridge.exposeInMainWorld("api", {
   runAllAutomation: (acheminements) =>
     ipcRenderer.invoke("automation:run-all", acheminements),
 
+  declareScelles: (folderPath, signedSerie) =>
+    ipcRenderer.invoke("automation:declare-scelles-partiel", {
+      folderPath,
+      signedSerie,
+    }),
+
   deleteDoneFolders: (folders) =>
     ipcRenderer.invoke("folder:delete-done", { folders }),
 

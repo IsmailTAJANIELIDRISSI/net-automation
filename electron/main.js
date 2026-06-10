@@ -1233,6 +1233,17 @@ async function runPartielDumFlow(acheminement) {
     sendProgress(id, "done");
     return { success: true, skipped: true };
   }
+  if (checkpoint?.phase === "partiel_waiting_signature") {
+    const dumSerie = checkpoint.dumSerie;
+    const dumCle = checkpoint.dumCle;
+    sendLog(
+      "info",
+      "BADR",
+      `"${id}" en attente de signature manuelle — série: ${dumSerie} clé: ${dumCle}`,
+    );
+    sendProgress(id, "partiel-waiting-signature", { dumSerie, dumCle });
+    return { success: false, waitingSignature: true };
+  }
   if (checkpoint?.phase === "partiel_poids_mismatch") {
     sendProgress(id, "weight-mismatch");
     return { success: false, error: checkpoint.errorMessage };
@@ -1332,6 +1343,34 @@ async function runPartielDumFlow(acheminement) {
         }
         throw err; // non-BADR error or exhausted retries
       }
+    }
+
+    // ── After run(): DUM PDF is printed — waiting for manual signature ───────
+    // run() now stops at partiel_pdf_saved; scellés are declared separately
+    // by the user via the "Déclarer scellés" button in the UI.
+    const postRunState = getAutomationState(folderPath);
+    if (
+      postRunState?.phase === "partiel_pdf_saved" ||
+      postRunState?.phase === "partiel_done" // already fully done (re-entry)
+    ) {
+      if (postRunState.phase === "partiel_pdf_saved") {
+        updateAutomationState(folderPath, {
+          phase: "partiel_waiting_signature",
+        });
+        sendLog(
+          "info",
+          "BADR",
+          `"${id}" — DUM imprimée ✓. Série: ${postRunState.dumSerie} / Clé: ${postRunState.dumCle}. Signature manuelle requise.`,
+        );
+        sendProgress(id, "partiel-waiting-signature", {
+          dumSerie: postRunState.dumSerie,
+          dumCle: postRunState.dumCle,
+        });
+        return { success: false, waitingSignature: true };
+      }
+      // partiel_done: already finished (scellés were declared in a previous run)
+      sendProgress(id, "done");
+      return { success: true };
     }
 
     sendProgress(id, "done");
@@ -1460,6 +1499,7 @@ async function runAllAutomationTasks(acheminements) {
         "partiel_done",
         "partiel_skip",
         "partiel_waiting_lots",
+        "partiel_waiting_signature",
         "weight_mismatch",
       ].includes(phase);
     });
@@ -1479,6 +1519,14 @@ async function runAllAutomationTasks(acheminements) {
       }
       if (checkpoint?.phase === "partiel_done") {
         sendProgress(ach.id, "done");
+        continue;
+      }
+      if (checkpoint?.phase === "partiel_waiting_signature") {
+        // Waiting for user to sign the DUM manually — skip in batch
+        sendProgress(ach.id, "partiel-waiting-signature", {
+          dumSerie: checkpoint.dumSerie,
+          dumCle: checkpoint.dumCle,
+        });
         continue;
       }
       if (ach.partiel === true) {
@@ -1974,6 +2022,81 @@ ipcMain.handle("automation:close-sessions", async () => {
   await closeSharedSessions();
   return { success: true };
 });
+
+// ── IPC: Declare scellés for a partiel DUM (after manual signature) ──────────
+// Called by the UI when the user has signed the DUM in BADR manually and
+// comes back to confirm the signed serie.  signedSerie may differ from the
+// originally validated dumSerie if BADR regenerated it during signing.
+ipcMain.handle(
+  "automation:declare-scelles-partiel",
+  async (_event, { folderPath, signedSerie }) => {
+    const id = path.basename(folderPath);
+    const state = getAutomationState(folderPath);
+    const saved = readAcheminementFile(folderPath);
+
+    const dumCle = state?.dumCle;
+    const scelle1 = saved.scelle1;
+    const scelle2 = saved.scelle2;
+
+    if (!signedSerie || !signedSerie.trim()) {
+      return { ok: false, error: "Série signée manquante" };
+    }
+    if (!dumCle) {
+      return { ok: false, error: "Clé DUM introuvable dans l'état sauvegardé" };
+    }
+    if (!scelle1 || !scelle2) {
+      return { ok: false, error: "Numéros de scellés manquants" };
+    }
+
+    sendLog(
+      "info",
+      "BADR",
+      `[${id}] Déclaration scellés — série signée: ${signedSerie} clé: ${dumCle}`,
+    );
+    sendProgress(id, "running");
+
+    try {
+      const BADRDsCombineFinalize = require("../src/badr/badrDsCombineFinalize");
+      const badrConn = await ensureBadrSession();
+      await badrConn.navigateToAccueil();
+
+      const finalizer = new BADRDsCombineFinalize(
+        badrConn.page,
+        null,
+        badrConn,
+      );
+      await finalizer.declarerScellesPartiel(
+        "301",
+        "085",
+        signedSerie.trim(),
+        dumCle,
+        scelle1,
+        scelle2,
+      );
+
+      updateAutomationState(folderPath, { phase: "partiel_done" });
+      sendLog(
+        "info",
+        "BADR",
+        `[${id}] ✓ Scellés déclarés — DUM Normale Partiel terminée`,
+      );
+      sendProgress(id, "done");
+      return { ok: true };
+    } catch (err) {
+      updateAutomationState(folderPath, {
+        phase: "error",
+        error: err.message,
+      });
+      sendLog(
+        "error",
+        "BADR",
+        `[${id}] Erreur déclaration scellés: ${err.message}`,
+      );
+      sendProgress(id, "error", { error: err.message });
+      return { ok: false, error: err.message };
+    }
+  },
+);
 
 app.on("before-quit", async () => {
   await closeSharedSessions();

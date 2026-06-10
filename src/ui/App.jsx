@@ -26,6 +26,8 @@ export default function App() {
         return "portnet-submitted";
       case "portnet_accepted":
         return "portnet-accepted";
+      case "partiel_waiting_signature":
+        return "partiel-waiting-signature";
       case "badr_done":
       case "partiel_done":
         return "done";
@@ -228,6 +230,41 @@ export default function App() {
     [folderPath],
   );
 
+  // ── Declare scellés for partiel DUM (after manual signature) ─────────────
+  const handleDeclareScelles = useCallback(async (ach, signedSerie) => {
+    setIsRunning(true);
+    setStatuses((prev) => ({
+      ...prev,
+      [ach.id]: { acheminementId: ach.id, status: "running" },
+    }));
+    addLog(
+      "info",
+      "Scellés",
+      `Déclaration scellés pour ${ach.name} — série: ${signedSerie}`,
+    );
+    try {
+      const result = await window.api.declareScelles(
+        ach.folderPath,
+        signedSerie,
+      );
+      if (!result.ok) {
+        addLog("error", "Scellés", `Échec: ${result.error}`);
+      }
+    } catch (err) {
+      setStatuses((prev) => ({
+        ...prev,
+        [ach.id]: {
+          acheminementId: ach.id,
+          status: "error",
+          error: err.message,
+        },
+      }));
+      addLog("error", "Scellés", `Exception: ${err.message}`);
+    } finally {
+      setIsRunning(false);
+    }
+  }, []);
+
   // ── Run one acheminement ───────────────────────────────────────────────────
   const handleRun = useCallback(async (ach) => {
     setIsRunning(true);
@@ -428,6 +465,7 @@ export default function App() {
                   onChange={handleChange}
                   onRun={handleRun}
                   onDelete={handleDelete}
+                  onDeclareScelles={handleDeclareScelles}
                 />
               ))}
             </div>
