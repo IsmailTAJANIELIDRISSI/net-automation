@@ -5,6 +5,24 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-12 — Fix signed-serie/clé parsing for scellés (partiel) + per-step retry
+
+**Problem:**
+
+1. After signing the DUM in BADR, the user enters a combined "signed serie" value in the card, e.g. `12345S` or `12345 S` (digits + the BADR-assigned letter/"clé"). The `automation:declare-scelles-partiel` handler passed this whole string straight through as the BADR form's numeric "série" field, and always reused the OLD `dumCle` captured before signing — ignoring the new letter the user just entered. Validation in BADR failed as a result.
+2. On failure, the handler set `phase: "error"` and `sendProgress(id, "error", ...)`. This hid the signed-serie input + "Déclarer scellés" button (card fell out of the `isWaitingSignature` branch) and left only "↺ Réessayer", which restarts the **entire** partiel DUM flow (lot lookup → DUM creation → PDF) instead of just retrying the scellés declaration.
+
+**Solution:**
+
+- `electron/main.js` (`automation:declare-scelles-partiel`): parse `signedSerie` with `^(\d+)\s*([A-Za-z])$` to split into numeric `serie` (leading zeros stripped) + uppercased `cle`. Falls back to digits-only input + the old `dumCle` for backward compatibility; rejects anything else with a clear format error. The parsed `serie`/`cle` are passed to `declarerScellesPartiel()`.
+- On any failure (validation or BADR error), a new `failWaiting()` helper calls `sendProgress(id, "partiel-waiting-signature", { dumSerie, dumCle, error })` instead of `"error"`, and `updateAutomationState()` no longer overwrites `phase` (stays `partiel_waiting_signature`). This keeps the card on the waiting-signature panel so the user can correct the input and retry just this step.
+- `src/ui/App.jsx`: passes `error={statuses[ach.id]?.error}` to `AcheminementCard`.
+- `src/ui/components/AcheminementCard.jsx`: accepts `error` prop and renders a red error banner inside the waiting-signature panel when present.
+
+**Files changed:** `electron/main.js`, `src/ui/App.jsx`, `src/ui/components/AcheminementCard.jsx`
+
+---
+
 ## 2026-06-09 — DUM Normale Partiel: human-gated scellés declaration
 
 **Problem:** The automation was auto-declaring scellés immediately after printing the DUM PDF. But declaring scellés requires a **signed** DUM serie — which requires the user to manually sign the declaration in BADR first (critical human-verification step). The app had no way to know the signed serie, and no mechanism to wait for it.

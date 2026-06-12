@@ -8,6 +8,7 @@ import StatusBadge from "./StatusBadge.jsx";
 export default function AcheminementCard({
   ach,
   status = "idle",
+  error,
   isGlobalRunning,
   shipperLoading = false,
   onChange,
@@ -300,6 +301,11 @@ export default function AcheminementCard({
           <p className="text-xs text-amber-400 font-semibold">
             ✍ Signature manuelle requise dans BADR
           </p>
+          {error && (
+            <p className="text-xs text-red-400 bg-red-900/20 border border-red-700/40 rounded px-2 py-1">
+              ⚠ {error}
+            </p>
+          )}
           {/* Show validated serie/cle so the user knows what to sign */}
           <div className="flex flex-col gap-0.5">
             <span className="text-xs text-slate-400">

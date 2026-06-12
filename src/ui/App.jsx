@@ -460,6 +460,7 @@ export default function App() {
                   key={ach.id}
                   ach={ach}
                   status={statuses[ach.id]?.status ?? "idle"}
+                  error={statuses[ach.id]?.error}
                   isGlobalRunning={isRunning}
                   shipperLoading={shipperLoadingIds.has(ach.id)}
                   onChange={handleChange}

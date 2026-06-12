@@ -2035,23 +2035,56 @@ ipcMain.handle(
     const saved = readAcheminementFile(folderPath);
 
     const dumCle = state?.dumCle;
+    const dumSerie = state?.dumSerie;
     const scelle1 = saved.scelle1;
     const scelle2 = saved.scelle2;
 
+    // On failure, restore the waiting-signature panel (with the error attached)
+    // instead of bouncing the card to "error", so the user can retry just this
+    // step without re-running the whole partiel DUM flow.
+    const failWaiting = (errorMsg) => {
+      sendProgress(id, "partiel-waiting-signature", {
+        dumSerie,
+        dumCle,
+        error: errorMsg,
+      });
+      return { ok: false, error: errorMsg };
+    };
+
     if (!signedSerie || !signedSerie.trim()) {
-      return { ok: false, error: "Série signée manquante" };
+      return failWaiting("Série signée manquante");
     }
     if (!dumCle) {
-      return { ok: false, error: "Clé DUM introuvable dans l'état sauvegardé" };
+      return failWaiting("Clé DUM introuvable dans l'état sauvegardé");
     }
     if (!scelle1 || !scelle2) {
-      return { ok: false, error: "Numéros de scellés manquants" };
+      return failWaiting("Numéros de scellés manquants");
+    }
+
+    // Parse the user-entered combined serie, e.g. "12345S" or "12345 S"
+    // (digits + optional space + the BADR-assigned letter "clé").
+    const trimmed = signedSerie.trim();
+    const withLetter = trimmed.match(/^(\d+)\s*([A-Za-z])$/);
+    const digitsOnly = trimmed.match(/^(\d+)$/);
+
+    let serie;
+    let cle;
+    if (withLetter) {
+      serie = String(parseInt(withLetter[1], 10) || withLetter[1]);
+      cle = withLetter[2].toUpperCase();
+    } else if (digitsOnly) {
+      serie = String(parseInt(digitsOnly[1], 10) || digitsOnly[1]);
+      cle = dumCle;
+    } else {
+      return failWaiting(
+        `Format de série invalide: "${signedSerie}". Format attendu: chiffres suivis d'une lettre (ex: "12345S" ou "12345 S").`,
+      );
     }
 
     sendLog(
       "info",
       "BADR",
-      `[${id}] Déclaration scellés — série signée: ${signedSerie} clé: ${dumCle}`,
+      `[${id}] Déclaration scellés — série signée: ${serie} clé: ${cle}`,
     );
     sendProgress(id, "running");
 
@@ -2068,8 +2101,8 @@ ipcMain.handle(
       await finalizer.declarerScellesPartiel(
         "301",
         "085",
-        signedSerie.trim(),
-        dumCle,
+        serie,
+        cle,
         scelle1,
         scelle2,
       );
@@ -2083,17 +2116,13 @@ ipcMain.handle(
       sendProgress(id, "done");
       return { ok: true };
     } catch (err) {
-      updateAutomationState(folderPath, {
-        phase: "error",
-        error: err.message,
-      });
+      updateAutomationState(folderPath, { error: err.message });
       sendLog(
         "error",
         "BADR",
         `[${id}] Erreur déclaration scellés: ${err.message}`,
       );
-      sendProgress(id, "error", { error: err.message });
-      return { ok: false, error: err.message };
+      return failWaiting(err.message);
     }
   },
 );
