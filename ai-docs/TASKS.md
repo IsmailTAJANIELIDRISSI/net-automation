@@ -9,6 +9,7 @@ The core automation flow is **fully implemented and working in production**:
   - Field selectors updated: `#auth-username` / `#auth-password` (were `#j_username` / `#j_password`)
   - Removed obsolete `.closeP` promo-popup close step (not present on the new page)
   - reCAPTCHA + manual "Se connecter" click still required from the user before automation continues
+  - Page zoomed to 85% (`document.body.style.zoom`) on load so the full form fits on screen
 - BADR lot lookup ✅
   - Error messaging: "Pas encore manifest" when lot not found (clear user-facing message) ✅
 - BADR pré-apurement weight check ✅

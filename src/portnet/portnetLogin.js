@@ -44,6 +44,11 @@ class PortnetLogin {
       waitUntil: "domcontentloaded",
     });
 
+    // Zoom out the login page so the full form (incl. reCAPTCHA) fits on screen
+    await this.page.evaluate(() => {
+      document.body.style.zoom = "85%";
+    });
+
     // Fill credentials
     const { username, password } = config.portnet;
     await this.page.locator("#auth-username").fill(username);

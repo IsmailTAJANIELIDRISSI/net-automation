@@ -11,7 +11,7 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 **Solution:**
 
-- `src/portnet/portnetLogin.js`: navigate directly to `https://cargo.portnet.ma/`, fill `#auth-username`/`#auth-password`, removed the obsolete `.closeP` popup-close step, updated the manual-step prompt to reference "Se connecter". `waitForURL(...cargo.portnet.ma/home...)` after manual CAPTCHA + login unchanged.
+- `src/portnet/portnetLogin.js`: navigate directly to `https://cargo.portnet.ma/`, fill `#auth-username`/`#auth-password`, removed the obsolete `.closeP` popup-close step, updated the manual-step prompt to reference "Se connecter". `waitForURL(...cargo.portnet.ma/home...)` after manual CAPTCHA + login unchanged. Page is zoomed to 85% (`document.body.style.zoom`) right after navigation so the full login form + reCAPTCHA fits on screen.
 - `src/config/config.js`: `portnet.baseUrl` updated to `https://cargo.portnet.ma/` to match.
 
 **Note:** the standalone dev script `login-portnet.js` (root) still uses the old selectors/URL and was not updated — it's not part of the production automation path (`src/portnet/portnetLogin.js` is).
