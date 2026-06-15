@@ -4,6 +4,11 @@
 
 The core automation flow is **fully implemented and working in production**:
 
+- **Portnet login updated for new cargo.portnet.ma interface ✅** (2026-06-15)
+  - Login now navigates directly to `https://cargo.portnet.ma/` (new React-based auth page) instead of `https://www.portnet.ma/`
+  - Field selectors updated: `#auth-username` / `#auth-password` (were `#j_username` / `#j_password`)
+  - Removed obsolete `.closeP` promo-popup close step (not present on the new page)
+  - reCAPTCHA + manual "Se connecter" click still required from the user before automation continues
 - BADR lot lookup ✅
   - Error messaging: "Pas encore manifest" when lot not found (clear user-facing message) ✅
 - BADR pré-apurement weight check ✅

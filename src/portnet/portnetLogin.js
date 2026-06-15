@@ -40,27 +40,19 @@ class PortnetLogin {
     this.page.setDefaultTimeout(config.timeout);
 
     log.info("Navigating to Portnet…");
-    await this.page.goto("https://www.portnet.ma/", {
+    await this.page.goto("https://cargo.portnet.ma/", {
       waitUntil: "domcontentloaded",
     });
 
-    // Try closing the promotional popup
-    try {
-      await this.page.locator(".closeP").click({ timeout: 5000 });
-      log.info("Popup closed");
-    } catch (_) {
-      log.info("No popup found – continuing");
-    }
-
     // Fill credentials
     const { username, password } = config.portnet;
-    await this.page.locator("#j_username").fill(username);
-    await this.page.locator("#j_password").fill(password);
+    await this.page.locator("#auth-username").fill(username);
+    await this.page.locator("#auth-password").fill(password);
     log.info("Credentials filled");
 
     // ── Manual CAPTCHA ───────────────────────────────────────────────────────
     console.log("\n========================================");
-    console.log("  Solve the CAPTCHA and click LOGIN.");
+    console.log("  Solve the CAPTCHA and click 'Se connecter'.");
     console.log("  Automation will continue automatically.");
     console.log("========================================\n");
 

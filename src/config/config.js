@@ -24,7 +24,7 @@ const config = {
 
   // ── PORTNET ───────────────────────────────────────────────────────────────
   portnet: {
-    baseUrl: "https://www.portnet.ma/",
+    baseUrl: "https://cargo.portnet.ma/",
     cargoUrl: "https://cargo.portnet.ma",
     username: process.env.PORTNET_USERNAME || "",
     password: process.env.PORTNET_PASSWORD || "",

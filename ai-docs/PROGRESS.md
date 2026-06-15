@@ -5,6 +5,21 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-15 — Portnet login: adapt to new cargo.portnet.ma auth page
+
+**Problem:** Portnet changed their login interface. The old flow navigated to `https://www.portnet.ma/`, closed a promo popup (`.closeP`), and filled `#j_username`/`#j_password`. The new site serves a React/MUI auth form directly at `https://cargo.portnet.ma/` with fields `#auth-username`/`#auth-password` and a "Se connecter" button (reCAPTCHA still present); the old selectors no longer exist, so login automation failed.
+
+**Solution:**
+
+- `src/portnet/portnetLogin.js`: navigate directly to `https://cargo.portnet.ma/`, fill `#auth-username`/`#auth-password`, removed the obsolete `.closeP` popup-close step, updated the manual-step prompt to reference "Se connecter". `waitForURL(...cargo.portnet.ma/home...)` after manual CAPTCHA + login unchanged.
+- `src/config/config.js`: `portnet.baseUrl` updated to `https://cargo.portnet.ma/` to match.
+
+**Note:** the standalone dev script `login-portnet.js` (root) still uses the old selectors/URL and was not updated — it's not part of the production automation path (`src/portnet/portnetLogin.js` is).
+
+**Files changed:** `src/portnet/portnetLogin.js`, `src/config/config.js`
+
+---
+
 ## 2026-06-12 — Fix signed-serie/clé parsing for scellés (partiel) + per-step retry
 
 **Problem:**
