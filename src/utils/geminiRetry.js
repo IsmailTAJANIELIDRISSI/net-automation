@@ -16,6 +16,7 @@
  */
 
 const MAX_503_RETRIES = 3; // per model: 5 s, 10 s, 20 s
+const MAX_429_RETRIES = 5; // per model: wait API-provided delay (min 15 s), up to 5 retries
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -85,12 +86,15 @@ async function geminiCallWithRetry(client, modelName, params, log) {
       }
 
       // ── 429: quota / rate limit ───────────────────────────────────────────
-      if (code === 429 && retries429 < 1) {
-        // Respect the API's own retry hint; add 1 s buffer; cap at 70 s.
-        const wait = Math.min((retryDelayMs ?? 60_000) + 1_000, 70_000);
+      if (code === 429 && retries429 < MAX_429_RETRIES) {
+        // Respect the API's own retry hint (min 15 s), add 1 s buffer, cap at 70 s.
+        const wait = Math.min(
+          Math.max((retryDelayMs ?? 15_000), 15_000) + 1_000,
+          70_000,
+        );
         log(
           `${modelName} quota dépassé (429) — attente ${Math.round(wait / 1000)} s ` +
-            `(délai API: ${retryDelayMs != null ? Math.round(retryDelayMs / 1000) + " s" : "inconnu"})...`,
+            `(tentative ${retries429 + 1}/${MAX_429_RETRIES}, délai API: ${retryDelayMs != null ? Math.round(retryDelayMs / 1000) + " s" : "inconnu"})...`,
         );
         await sleep(wait);
         retries429++;

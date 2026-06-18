@@ -5,6 +5,23 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-15 — MAWB: fix Total Prepaid regex for "CurrencyNumber" format + more 429 retries
+
+**Problems:**
+
+1. When a text-based MAWB PDF contains "TWD577,610.00" in the Total Prepaid cell (currency code glued to the number), the regex in `extractMetaFromText` captured only the trailing "0.00" instead of the full amount. Root cause: `[\d .]` in the capture group excluded commas, so the thousands-separator broke the match, causing backtracking that settled on the last 4 chars.
+
+2. Gemini's 429 rate-limit handling in `geminiCallWithRetry` only allowed 1 retry before throwing, meaning a second quota hit immediately escalated to "all models failed."
+
+**Fixes:**
+
+- `src/utils/mawbShipperExtract.js`: Total Prepaid regex capture changed from `(\d[\d .]*\.\d{2})` to `(\d[\d, .]*\.\d{2})` — comma added to character class. The existing post-match strip (`replace(/[\s,]/g, "")`) already removes it, so no other change needed.
+- `src/utils/geminiRetry.js`: Added `MAX_429_RETRIES = 5`. Retry condition changed from `retries429 < 1` to `retries429 < MAX_429_RETRIES`. Wait per retry = `max(API hint, 15 s) + 1 s`, capped at 70 s. This allows up to 5 per-model retries (~5 min max) before escalating to the next model.
+
+**Files changed:** `src/utils/mawbShipperExtract.js`, `src/utils/geminiRetry.js`
+
+---
+
 ## 2026-06-15 — Portnet login: adapt to new cargo.portnet.ma auth page
 
 **Problem:** Portnet changed their login interface. The old flow navigated to `https://www.portnet.ma/`, closed a promo popup (`.closeP`), and filled `#j_username`/`#j_password`. The new site serves a React/MUI auth form directly at `https://cargo.portnet.ma/` with fields `#auth-username`/`#auth-password` and a "Se connecter" button (reCAPTCHA still present); the old selectors no longer exist, so login automation failed.

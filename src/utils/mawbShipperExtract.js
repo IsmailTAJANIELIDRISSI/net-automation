@@ -380,8 +380,10 @@ function extractMetaFromText(text, log) {
 
   // Total Prepaid: label followed (same line or next line) by a decimal number.
   // pdf-parse sometimes flattens the layout so the label may not appear — handled below.
+  // Allow comma in the numeric part so "TWD577,610.00" → match "577,610.00"
+  // (currency prefix is consumed by the preceding [^\n] groups; comma stripped after).
   const prepaidMatch = text.match(
-    /total\s+prepaid[^\n]{0,80}\n?[^\n]{0,40}?(\d[\d .]*\.\d{2})/i,
+    /total\s+prepaid[^\n]{0,80}\n?[^\n]{0,40}?(\d[\d, .]*\.\d{2})/i,
   );
   if (prepaidMatch) {
     fretValue = prepaidMatch[1].replace(/[\s,]/g, ""); // strip spaces and thousands commas
