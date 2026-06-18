@@ -31,6 +31,8 @@ class PortnetLogin {
     log.info("Launching Chromium for Portnet…");
 
     this.browser = await chromium.launch({
+      // Use the installed Microsoft Edge (BADR runs in Chrome — see badrConnection.js).
+      channel: "msedge",
       headless: config.headless,
       slowMo: config.slowMo,
       // Open the window maximized so the page can use the full screen.

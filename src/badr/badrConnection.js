@@ -29,18 +29,18 @@ class BADRConnection {
    * Mirrors Python's start_fresh_edge().
    */
   async startFreshEdge() {
-    const { edgePath, debuggingPort, userDataDir } = config.badr;
+    const { browserPath, debuggingPort, userDataDir } = config.badr;
 
     // Ensure profile dir exists
     if (!fs.existsSync(userDataDir)) {
       fs.mkdirSync(userDataDir, { recursive: true });
-      log.info(`Created Edge profile dir: ${userDataDir}`);
+      log.info(`Created browser profile dir: ${userDataDir}`);
     }
 
-    log.info(`Launching Edge on port ${debuggingPort}...`);
+    log.info(`Launching BADR browser (${browserPath}) on port ${debuggingPort}...`);
 
     this.edgeProcess = spawn(
-      edgePath,
+      browserPath,
       [
         `--remote-debugging-port=${debuggingPort}`,
         `--user-data-dir=${userDataDir}`,

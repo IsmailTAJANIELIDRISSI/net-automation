@@ -5,6 +5,21 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-15 — Browser split: Portnet → Edge, BADR → Chrome
+
+**Change:** Run each portal in its own browser. Portnet now runs in Microsoft Edge; BADR now runs in Google Chrome (confirmed the USB/client certificate works in Chrome via the shared Windows OS cert store).
+
+**Files changed:**
+
+- `src/portnet/portnetLogin.js`: added `channel: "msedge"` to `chromium.launch()` so Playwright drives installed Edge instead of bundled Chromium.
+- `src/config/config.js`: BADR `edgePath` → renamed `browserPath`, default now Chrome (`...\\Google\\Chrome\\Application\\chrome.exe`), env override `BADR_BROWSER_PATH` (was `EDGE_PATH`). `userDataDir` default → `C:\\Temp\\badr-chrome-profile`.
+- `src/badr/badrConnection.js`: `startFreshEdge()` now destructures/spawns `browserPath` (was `edgePath`); launch log line updated. Internal var/method names (`edgeProcess`, `startFreshEdge`, `connectToEdge`) and some log strings still say "Edge" but are browser-agnostic — they spawn/kill whatever `browserPath` points to.
+- `.env`: replaced `EDGE_PATH` with `BADR_BROWSER_PATH` (Chrome path); `BADR_PROFILE_DIR` → `C:\\Temp\\badr-chrome-profile` (Edge profiles aren't Chrome-compatible, so a fresh Chrome profile dir is required).
+
+**Note:** first BADR run with the new Chrome profile will prompt to select the USB certificate once; Chrome remembers the choice for that profile afterward.
+
+---
+
 ## 2026-06-15 — Portnet browser: full-window viewport + global 90% zoom
 
 **Problem:** The Playwright-launched Portnet browser rendered the page inside a small box (Playwright's default 1280×720 emulated viewport) with empty white space at the right/bottom, clipping useful content — unlike a normal maximized browser. Also, the previously-added zoom only applied to the login page and reset on every navigation.
