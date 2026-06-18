@@ -33,20 +33,37 @@ class PortnetLogin {
     this.browser = await chromium.launch({
       headless: config.headless,
       slowMo: config.slowMo,
+      // Open the window maximized so the page can use the full screen.
+      args: ["--start-maximized"],
     });
 
-    this.context = await this.browser.newContext();
+    // viewport: null → the page fills the actual (maximized) window instead of
+    // Playwright's default 1280×720 emulated viewport, which otherwise leaves
+    // empty white space at the right/bottom and clips Portnet's content.
+    this.context = await this.browser.newContext({ viewport: null });
+
+    // Apply a 90% zoom on every page Portnet loads (re-runs on each navigation,
+    // top frame only to avoid double-zooming the cross-origin DS form iframe).
+    await this.context.addInitScript(() => {
+      if (window.top !== window.self) return;
+      const applyZoom = () => {
+        if (document.documentElement) {
+          document.documentElement.style.zoom = "90%";
+        }
+      };
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", applyZoom);
+      } else {
+        applyZoom();
+      }
+    });
+
     this.page = await this.context.newPage();
     this.page.setDefaultTimeout(config.timeout);
 
     log.info("Navigating to Portnet…");
     await this.page.goto("https://cargo.portnet.ma/", {
       waitUntil: "domcontentloaded",
-    });
-
-    // Zoom out the login page so the full form (incl. reCAPTCHA) fits on screen
-    await this.page.evaluate(() => {
-      document.body.style.zoom = "85%";
     });
 
     // Fill credentials

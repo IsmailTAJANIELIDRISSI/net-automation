@@ -5,6 +5,19 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-15 — Portnet browser: full-window viewport + global 90% zoom
+
+**Problem:** The Playwright-launched Portnet browser rendered the page inside a small box (Playwright's default 1280×720 emulated viewport) with empty white space at the right/bottom, clipping useful content — unlike a normal maximized browser. Also, the previously-added zoom only applied to the login page and reset on every navigation.
+
+**Fix (`src/portnet/portnetLogin.js`):**
+
+- Launch with `args: ["--start-maximized"]` and create the context with `viewport: null`, so the page fills the actual window instead of the 1280×720 emulated viewport.
+- Replaced the one-off login-page `document.body.style.zoom = "85%"` with a `context.addInitScript` that sets `document.documentElement.style.zoom = "90%"` on **every** page load (re-runs per navigation, top frame only so the cross-origin DS form iframe isn't double-zoomed). This keeps 90% zoom across the whole Portnet process, not just login.
+
+**Files changed:** `src/portnet/portnetLogin.js`
+
+---
+
 ## 2026-06-15 — Scellés: fix intermittent "nombre de scellés ne correspond pas" (race on 2nd add)
 
 **Problem:** In `_fillScellesForm` (shared by `declarerScelles` + `declarerScellesPartiel`), scellés were added with fixed `waitForTimeout(1000)` between the two "+" clicks. BADR re-renders the whole scellés panel via partial AJAX after each add, so the 2nd clear+fill+click could race the refresh and land on a stale/empty field — the 2nd scellé silently failed to register. The list ended with 1 item while "Nombre de Scellés" was hardcoded to "2", so BADR rejected at confirm: *"Le nombre de scellés saisis ne correspond pas à la valeur du champ 'nombre de scéllés'."* Intermittent (timing-dependent), not a data problem — both numbers were read correctly.
