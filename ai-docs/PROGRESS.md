@@ -12,7 +12,7 @@ _Format: `## YYYY-MM-DD — <title>`_
 **Files changed:**
 
 - `src/portnet/portnetLogin.js`: added `channel: "msedge"` to `chromium.launch()` so Playwright drives installed Edge instead of bundled Chromium.
-- `src/config/config.js`: BADR `edgePath` → renamed `browserPath`, default now Chrome (`...\\Google\\Chrome\\Application\\chrome.exe`), env override `BADR_BROWSER_PATH` (was `EDGE_PATH`). `userDataDir` default → `C:\\Temp\\badr-chrome-profile`.
+- `src/config/config.js`: BADR `edgePath` → renamed `browserPath`. **Default is Edge** (`...\\Microsoft\\Edge\\Application\\msedge.exe`) since Edge ships on every Windows PC — this works out of the box even when `BADR_BROWSER_PATH` isn't set. To run BADR in Chrome, set `BADR_BROWSER_PATH=...chrome.exe` + a Chrome `BADR_PROFILE_DIR`. `userDataDir` default → `C:\\Temp\\badr-edge-profile`. (env override `BADR_BROWSER_PATH` replaces old `EDGE_PATH`.)
 - `src/badr/badrConnection.js`: `startFreshEdge()` now destructures/spawns `browserPath` (was `edgePath`); launch log line updated. Internal var/method names (`edgeProcess`, `startFreshEdge`, `connectToEdge`) and some log strings still say "Edge" but are browser-agnostic — they spawn/kill whatever `browserPath` points to.
 - `.env`: replaced `EDGE_PATH` with `BADR_BROWSER_PATH` (Chrome path); `BADR_PROFILE_DIR` → `C:\\Temp\\badr-chrome-profile` (Edge profiles aren't Chrome-compatible, so a fresh Chrome profile dir is required).
 

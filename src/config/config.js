@@ -7,14 +7,16 @@ const config = {
     url: process.env.BADR_URL || "https://badr.douane.gov.ma:40444/badr/Login",
     username: process.env.BADR_USERNAME || "",
     password: process.env.BADR_PASSWORD || "",
-    // BADR runs in Google Chrome (the USB/client certificate is in the Windows
-    // OS store, which Chrome reads). Portnet runs in Edge — see portnetLogin.js.
+    // BADR browser. Default is Edge (ships with every Windows PC) so the app
+    // works out of the box. The USB/client certificate lives in the Windows OS
+    // store, which both Edge and Chrome read — so to run BADR in Chrome instead,
+    // set BADR_BROWSER_PATH to chrome.exe (+ a Chrome BADR_PROFILE_DIR).
+    // Portnet always runs in Edge separately — see portnetLogin.js.
     browserPath:
       process.env.BADR_BROWSER_PATH ||
-      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
     debuggingPort: parseInt(process.env.BADR_CDP_PORT || "9222", 10),
-    userDataDir:
-      process.env.BADR_PROFILE_DIR || "C:\\Temp\\badr-chrome-profile",
+    userDataDir: process.env.BADR_PROFILE_DIR || "C:\\Temp\\badr-edge-profile",
     // Fixed values for lot lookup
     bureauCode: process.env.BADR_BUREAU_CODE || "301",
     bureauLabel:
