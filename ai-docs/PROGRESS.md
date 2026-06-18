@@ -5,6 +5,28 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-15 — DS Combinée: fix iframe form hang (stacked zoom destabilized clicks)
+
+**Problem:** After adding the global 90% page zoom (in `portnetLogin`), the DS Combinée creation flow hung at "Selecting Numéro d'agrément…", with the form visibly auto-scrolling up/down. The form lives in a cross-origin iframe that already applies its own 65% zoom; the outer page's 90% zoom stacked on top of it, making element geometry unstable so Playwright's click actionability check scroll-looped forever and timed out.
+
+**Fix (`src/portnet/portnetDsCombine.js`):** In `openCreationPage`, after locating the iframe, reset the OUTER page zoom to 100% (`document.documentElement.style.zoom = ""` / `body.style.zoom = ""`) before applying the iframe's own zoom. Restores the pre-global-zoom behavior for the form while keeping the iframe readable. (Outer shell zoom is invisible anyway — the real form is inside the iframe.)
+
+**Follow-up (same day):** Changed the iframe zoom 65% → **90%** so the form matches the rest of the Portnet session (login/consultation are 90%). Zoom is applied INSIDE the cross-origin iframe (not via the parent) because parent-side CSS zoom on a cross-origin frame throws off Playwright's click coordinates — so the proven in-iframe mechanism is kept, just at 90%. Note: the long pause before the form fills is the `networkidle` 60 s timeout on the DS page (the form keeps background connections open), unrelated to zoom.
+
+**Files changed:** `src/portnet/portnetDsCombine.js`
+
+---
+
+## 2026-06-15 — UI: fix misleading "Échec: undefined" on DS Partiel skip
+
+**Problem:** Running a (non-partiel-checked) LTA whose BADR lot lookup returns 2 rows is correctly detected as a DS Partiel and **skipped** — `prepareLotAndWeightCheck` returns `{ success: false, skipped: true, reason: "partiel" }` (no `error` field). But `handleRun` logged `Échec: ${result.error}` for any non-success, so the user saw the confusing `Échec: undefined` for what is an intentional skip, not a failure.
+
+**Fix (`src/ui/App.jsx`):** `handleRun` now branches on `result.skipped`. For a skip it logs a `warn` with a helpful message (for `reason === "partiel"`, it tells the user to tick the « Partiel » checkbox so the LTA runs through the DUM Normale Partiel flow). Genuine failures still log `error`, now with a `"raison inconnue"` fallback when `result.error` is missing.
+
+**Files changed:** `src/ui/App.jsx`
+
+---
+
 ## 2026-06-15 — Browser split: Portnet → Edge, BADR → Chrome
 
 **Change:** Run each portal in its own browser. Portnet now runs in Microsoft Edge; BADR now runs in Google Chrome (confirmed the USB/client certificate works in Chrome via the shared Windows OS cert store).

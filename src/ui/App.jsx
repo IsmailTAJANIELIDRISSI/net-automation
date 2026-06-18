@@ -278,8 +278,17 @@ export default function App() {
     try {
       const result = await window.api.runAutomation(ach);
       if (!result.success) {
-        // status is updated via IPC progress event
-        addLog("error", "UI", `Échec: ${result.error}`);
+        if (result.skipped) {
+          // Not a real failure — e.g. BADR shows 2 lots so it's a DS Partiel.
+          const msg =
+            result.reason === "partiel"
+              ? `${ach.name}: DS Partiel détecté — cochez « Partiel » pour traiter ce LTA via le flux DUM Normale Partiel.`
+              : `${ach.name}: ignoré${result.reason ? ` (${result.reason})` : ""}`;
+          addLog("warn", "UI", msg);
+        } else {
+          // status is updated via IPC progress event
+          addLog("error", "UI", `Échec: ${result.error || "raison inconnue"}`);
+        }
       }
     } catch (err) {
       setStatuses((prev) => ({

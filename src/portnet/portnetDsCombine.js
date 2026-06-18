@@ -205,14 +205,28 @@ class PortnetDsCombine {
     await iframeLoc.waitFor({ timeout: TIMEOUT });
     this.frame = this.page.frameLocator("main iframe");
 
-    // Zoom out to 65% for better visibility
+    // Reset the OUTER page zoom to 100%. The global 90% zoom (set in
+    // portnetLogin) would stack on top of the iframe's own zoom below and make
+    // the form's element geometry unstable — Playwright then auto-scrolls
+    // forever trying to stabilize a click. We zoom the iframe itself instead.
+    await this.page
+      .evaluate(() => {
+        document.documentElement.style.zoom = "";
+        document.body.style.zoom = "";
+      })
+      .catch(() => {});
+
+    // Zoom the form iframe to 90% — consistent with the rest of the Portnet
+    // session (login/consultation are 90% via portnetLogin). We zoom INSIDE the
+    // cross-origin iframe (not via the parent) because parent-side zoom throws
+    // off Playwright's click coordinates in cross-origin frames.
     try {
       await this.frame.locator("body").evaluate(() => {
-        document.body.style.zoom = "0.67";
+        document.body.style.zoom = "0.9";
       });
-      log.info("Zoomed out Portnet iframe to 65%.");
+      log.info("Zoomed Portnet iframe to 90%.");
     } catch (e) {
-      log.warn("Failed to zoom out Portnet iframe", { message: e.message });
+      log.warn("Failed to zoom Portnet iframe", { message: e.message });
     }
 
     // Wait for the React MUI form to mount inside the iframe
