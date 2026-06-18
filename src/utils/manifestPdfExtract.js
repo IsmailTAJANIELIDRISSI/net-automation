@@ -745,7 +745,11 @@ async function extractManifestViaVision(pdfPath) {
     return { ok: false, error: "@google/genai not installed" };
   }
 
-  const MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"];
+  const MODELS = [
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+  ];
   const client = new genai.GoogleGenAI({ apiKey });
   const pdfBase64 = fs.readFileSync(pdfPath).toString("base64");
 

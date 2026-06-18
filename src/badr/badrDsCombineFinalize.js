@@ -569,54 +569,64 @@ class BADRDsCombineFinalize {
     await nombreInputLocator.waitFor({ state: "visible", timeout: 15000 });
     await nombreInputLocator.fill("2");
 
+    // Count the scellés currently in the result list.
+    const listOptionCount = () =>
+      formCtx
+        .locator(
+          "#eciMain\\:listPinces1_input option, select[id$=':listPinces1_input'] option",
+        )
+        .count();
+
+    // Add one scellé and WAIT for the list to actually grow before continuing.
+    // PrimeFaces re-renders the whole panel after every "+" click, so fixed
+    // timeouts race the AJAX refresh and can silently drop the 2nd entry. We
+    // poll the list count and retry the add if it didn't register.
+    const addScelle = async (value, expectedCount) => {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const field = formCtx
+          .locator("input#eciMain\\:scelle1, input[id$=':scelle1']")
+          .first();
+        await field.waitFor({ state: "visible", timeout: 15000 });
+        await field.fill("");
+        await field.fill(value);
+        await formCtx
+          .locator(
+            "button#eciMain\\:btn_add_pince1, button[id$=':btn_add_pince1']",
+          )
+          .first()
+          .click();
+
+        // Wait up to 8 s for the list to reach the expected size.
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+          if ((await listOptionCount()) >= expectedCount) return;
+          await page.waitForTimeout(250);
+        }
+        log.warn(
+          `Scellé "${value}" non ajouté à la liste (tentative ${attempt}/3) — réessai...`,
+        );
+      }
+      throw new Error(
+        `Impossible d'ajouter le scellé "${value}" à la liste après 3 tentatives.`,
+      );
+    };
+
     log.info(`Adding Scellé 1: ${scelle1}`);
-    await formCtx
-      .locator("input#eciMain\\:scelle1, input[id$=':scelle1']")
-      .first()
-      .fill(scelle1);
-    await formCtx
-      .locator("button#eciMain\\:btn_add_pince1, button[id$=':btn_add_pince1']")
-      .first()
-      .click();
-    await page.waitForTimeout(1000);
-
-    // PrimeFaces updates the whole panel after each "+" click; re-apply the value.
-    await formCtx
-      .locator(
-        'xpath=//tr[td[contains(normalize-space(.),"Nombre de Scellés")]]/td[contains(normalize-space(.),"Nombre de Scellés")]/following-sibling::td[1]//input[@type="text"]',
-      )
-      .first()
-      .fill("2");
-
+    await addScelle(scelle1, 1);
     log.info(`Adding Scellé 2: ${scelle2}`);
-    await formCtx
-      .locator("input#eciMain\\:scelle1, input[id$=':scelle1']")
-      .first()
-      .fill(""); // Clear first
-    await formCtx
-      .locator("input#eciMain\\:scelle1, input[id$=':scelle1']")
-      .first()
-      .fill(scelle2);
-    await formCtx
-      .locator("button#eciMain\\:btn_add_pince1, button[id$=':btn_add_pince1']")
-      .first()
-      .click();
-    await page.waitForTimeout(1000);
+    await addScelle(scelle2, 2);
 
-    // Re-apply once more after second panel refresh to ensure final validation passes.
+    // Set "Nombre de Scellés" to the ACTUAL list size after both adds, so the
+    // value the form validates against always matches the list (avoids the
+    // "nombre de scellés saisis ne correspond pas" error).
+    const listCount = await listOptionCount();
     await formCtx
       .locator(
         'xpath=//tr[td[contains(normalize-space(.),"Nombre de Scellés")]]/td[contains(normalize-space(.),"Nombre de Scellés")]/following-sibling::td[1]//input[@type="text"]',
       )
       .first()
-      .fill("2");
+      .fill(String(listCount));
 
-    // Verify list contains 2 items
-    const listCount = await formCtx
-      .locator(
-        "#eciMain\\:listPinces1_input option, select[id$=':listPinces1_input'] option",
-      )
-      .count();
     if (listCount !== 2) {
       log.warn(
         `Expected 2 scelles in list, found ${listCount}. Ensure they were not duplicates or rejected.`,

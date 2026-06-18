@@ -4,7 +4,11 @@ const fs = require("fs");
 const path = require("path");
 
 // ── Gemini model fallback order (mirrors Python GEMINI_MODEL_FALLBACKS) ──────
-const GEMINI_MODEL_FALLBACKS = ["gemini-2.5-flash", "gemini-2.0-flash"];
+const GEMINI_MODEL_FALLBACKS = [
+  "gemini-3.1-flash-lite-preview",
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+];
 
 // ── Retry helper (handles 503 back-off + 429 quota wait) ─────────────────────
 const { geminiCallWithRetry } = require("./geminiRetry");

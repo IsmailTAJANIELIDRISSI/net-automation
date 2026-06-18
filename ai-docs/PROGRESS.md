@@ -5,6 +5,30 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-15 — Scellés: fix intermittent "nombre de scellés ne correspond pas" (race on 2nd add)
+
+**Problem:** In `_fillScellesForm` (shared by `declarerScelles` + `declarerScellesPartiel`), scellés were added with fixed `waitForTimeout(1000)` between the two "+" clicks. BADR re-renders the whole scellés panel via partial AJAX after each add, so the 2nd clear+fill+click could race the refresh and land on a stale/empty field — the 2nd scellé silently failed to register. The list ended with 1 item while "Nombre de Scellés" was hardcoded to "2", so BADR rejected at confirm: *"Le nombre de scellés saisis ne correspond pas à la valeur du champ 'nombre de scéllés'."* Intermittent (timing-dependent), not a data problem — both numbers were read correctly.
+
+**Fix (`src/badr/badrDsCombineFinalize.js`):**
+
+- Added an `addScelle(value, expectedCount)` helper that fills the field, clicks "+", then **polls the list option count** (up to 8 s) until it reaches the expected size; retries the add up to 3× and throws if it never registers. Replaces the blind timeouts.
+- "Nombre de Scellés" is now set to the **actual** list size *after* both adds (instead of hardcoded "2" re-applied mid-flow), so the validated count always matches the list.
+
+**Files changed:** `src/badr/badrDsCombineFinalize.js`
+
+---
+
+## 2026-06-15 — Gemini: add gemini-3.1-flash-lite-preview as primary model
+
+**Change:** Added `gemini-3.1-flash-lite-preview` to the front of both Gemini model fallback lists, so it is tried first before `gemini-2.5-flash` → `gemini-2.0-flash`.
+
+**Files changed:**
+
+- `src/utils/mawbShipperExtract.js`: `GEMINI_MODEL_FALLBACKS` (used by shipper verification, Vision meta extraction, and currency/fret supplement).
+- `src/utils/manifestPdfExtract.js`: `MODELS` (used by manifest Vision extraction).
+
+---
+
 ## 2026-06-15 — MAWB: fix Total Prepaid regex for "CurrencyNumber" format + more 429 retries
 
 **Problems:**
