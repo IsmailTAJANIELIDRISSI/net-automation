@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import Header from "./components/Header.jsx";
 import AcheminementCard from "./components/AcheminementCard.jsx";
 import LogPanel from "./components/LogPanel.jsx";
+import { getMissingRequiredFields } from "./requiredFields.js";
 
 /** Keep user input unless blank — otherwise new scan values apply (acheminement.json can store ""). */
 function preferNonEmptyPrev(prev, fromScan) {
@@ -310,7 +311,31 @@ export default function App() {
     setIsRunning(true);
     addLog("info", "UI", "Lancement batch: soumission + suivi Portnet…");
     try {
-      const pending = acheminements.filter((a) => !a.refMismatch);
+      // Skip LTAs missing obligatory info (scellés, nb contenant, poids/valeur).
+      const pending = [];
+      for (const a of acheminements) {
+        if (a.refMismatch) continue;
+        const missing = getMissingRequiredFields(a);
+        if (missing.length > 0) {
+          addLog(
+            "warn",
+            "UI",
+            `${a.name}: ignoré — champs obligatoires manquants : ${missing.join(", ")}`,
+          );
+          continue;
+        }
+        pending.push(a);
+      }
+
+      if (pending.length === 0) {
+        addLog(
+          "warn",
+          "UI",
+          "Aucun LTA complet à traiter (tous ignorés pour champs manquants).",
+        );
+        return;
+      }
+
       const result = await window.api.runAllAutomation(pending);
       if (!result.success) {
         addLog("error", "UI", `Échec batch: ${result.error || "inconnu"}`);

@@ -1492,21 +1492,47 @@ async function runAllAutomationTasks(acheminements) {
         (a, b) => (a.partiel === true ? 1 : 0) - (b.partiel === true ? 1 : 0),
       );
 
-    const needsPortnet = toProcess.some((ach) => {
-      const phase = getAutomationState(ach.folderPath)?.phase;
-      return ![
-        "badr_done",
-        "partiel_done",
-        "partiel_skip",
-        "partiel_waiting_lots",
-        "partiel_waiting_signature",
-        "weight_mismatch",
-      ].includes(phase);
-    });
+    // Phases that are terminal / can't progress in a batch → need no browser.
+    const noSessionPhases = [
+      "badr_done",
+      "partiel_done",
+      "partiel_skip",
+      "partiel_waiting_lots",
+      "partiel_waiting_signature",
+      "weight_mismatch",
+    ];
+    const hasActiveWork = toProcess.some(
+      (ach) =>
+        !noSessionPhases.includes(getAutomationState(ach.folderPath)?.phase),
+    );
+    const needsPortnet = hasActiveWork;
+    const needsBadr = hasActiveWork;
 
+    // Open Portnet + BADR sessions UP-FRONT and IN PARALLEL, so the user solves
+    // the Portnet CAPTCHA and inserts the BADR USB certificate once at the start,
+    // then the batch (submission + Portnet polling + BADR finalisation) runs
+    // unattended. Previously BADR only opened later — when the first LTA was
+    // accepted — forcing the user to stay at the PC to enter the certificate then.
+    const sessionTasks = [];
     if (needsPortnet) {
-      portnetPage = await ensurePortnetSession();
+      sessionTasks.push(
+        ensurePortnetSession().then((p) => {
+          portnetPage = p;
+        }),
+      );
     }
+    if (needsBadr) {
+      sessionTasks.push(
+        ensureBadrSession().catch((err) =>
+          sendLog(
+            "warn",
+            "BADR",
+            `Ouverture anticipée de la session BADR échouée: ${err.message} — réessai à la demande.`,
+          ),
+        ),
+      );
+    }
+    await Promise.all(sessionTasks);
 
     for (const ach of toProcess) {
       const checkpoint = getAutomationState(ach.folderPath);

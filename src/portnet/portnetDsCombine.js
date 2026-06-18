@@ -1134,21 +1134,29 @@ class PortnetDsCombine {
       waitUntil: "domcontentloaded",
       timeout: TIMEOUT,
     });
-    // Best-effort: let the network settle; failures are non-fatal because the
-    // DataGrid poller below already handles a not-yet-visible header gracefully.
-    await this.page
-      .waitForLoadState("networkidle", { timeout: 30_000 })
-      .catch(() =>
-        log.warn(
-          "Consultation networkidle timed-out – page may still be loading, proceeding anyway",
-        ),
-      );
+    // Do NOT wait for networkidle: the consultation page keeps background XHR
+    // connections open, so it never goes idle — that was a dead ~30 s wait even
+    // though the grid is already visible. _ensureConsultationSortedByCreatedAtDesc()
+    // below waits for the actual grid header, which is the real readiness signal.
 
     // Ensure newest rows are shown first to reduce ambiguity on shared dsReference.
     await this._ensureConsultationSortedByCreatedAtDesc();
   }
 
   async _ensureConsultationSortedByCreatedAtDesc() {
+    // The consultation grid lives in an iframe. The global 90% zoom on the outer
+    // page (set in portnetLogin, re-applied on every reload of this poll loop)
+    // destabilizes clicks inside that iframe — Playwright then scroll-loops on
+    // the sort header. Reset the OUTER page to 100% so the iframe clicks are
+    // stable (same fix as the DS creation form). Runs on every call, including
+    // after each poll-loop reload.
+    await this.page
+      .evaluate(() => {
+        document.documentElement.style.zoom = "";
+        document.body.style.zoom = "";
+      })
+      .catch(() => {});
+
     const pollFrame = this.page.frameLocator('iframe[title="iframe"]');
     const createdAtHeader = pollFrame.locator(
       '[role="columnheader"][data-field="createdAtFormatted"]',
@@ -1367,7 +1375,9 @@ class PortnetDsCombine {
       }
 
       await this.page.waitForTimeout(pollEveryMs);
-      await this.page.reload({ waitUntil: "networkidle" }).catch(() => {});
+      // domcontentloaded, not networkidle: the page never goes idle (background
+      // XHR), so networkidle would add a ~30 s dead wait to every poll cycle.
+      await this.page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
       await this._ensureConsultationSortedByCreatedAtDesc().catch(() => {});
     }
 

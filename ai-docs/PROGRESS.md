@@ -5,6 +5,41 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-15 — Consultation polling: drop dead ~30 s networkidle waits
+
+**Problem:** Navigating to the Consultation page (status polling) paused ~30 s at "Navigating to Consultation page…" even though the grid was already visible. Cause: a `waitForLoadState("networkidle", 30 s)` after the goto — but the page keeps background XHR open so it never goes idle, burning the full timeout every time. The poll loop's `reload({ waitUntil: "networkidle" })` had the same dead wait on every cycle.
+
+**Fix (`src/portnet/portnetDsCombine.js`):** Removed the post-goto networkidle wait in `openConsultationPage` (the following `_ensureConsultationSortedByCreatedAtDesc()` already waits for the actual grid header — the real readiness signal). Changed the poll-loop `reload` from `waitUntil: "networkidle"` → `"domcontentloaded"`.
+
+**Files changed:** `src/portnet/portnetDsCombine.js`
+
+---
+
+## 2026-06-15 — "Lancer tous": open BADR + Portnet sessions up-front in parallel
+
+**Problem:** On "Lancer tous", the batch opened only the Portnet session, polled until an LTA was accepted, and *then* opened BADR (USB-certificate prompt) for the final step. The user had to stay at the PC waiting for the first acceptance to insert the certificate — no unattended runs.
+
+**Solution (`electron/main.js`, `runAllAutomationTasks`):** When the batch has active work (`hasActiveWork` — any LTA not in a terminal/no-session phase), open **both** sessions up-front and **in parallel** via `Promise.all([ensurePortnetSession(), ensureBadrSession()])`. The user solves the Portnet CAPTCHA and inserts the BADR USB certificate once at the start; the batch then runs unattended. BADR opening up-front is non-fatal on failure (logged warn) since every later BADR step already goes through `ensureBadrSession()`, which reuses the shared session (no second prompt) or lazily retries.
+
+**Files changed:** `electron/main.js`
+
+---
+
+## 2026-06-15 — Require obligatory fields before launching an LTA
+
+**Problem:** An LTA could be launched (and a DS Combinée submitted) with no scellés (`No scelle1/scelle2 in formData – skipping Demandes diverses`) or other missing key data, producing an incomplete declaration.
+
+**Solution:** Obligatory fields = **scelle1, scelle2, nombreContenant, poidTotal, totalValue**. New shared helper `src/ui/requiredFields.js` (`getMissingRequiredFields(ach)` + `REQUIRED_FIELDS`) is the single source of truth, used in two places:
+
+- `src/ui/components/AcheminementCard.jsx`: the "Lancer" button is disabled while any required field is empty, with a tooltip + an amber inline banner listing the missing fields.
+- `src/ui/App.jsx` (`handleRunAll`): incomplete LTAs are skipped in the batch run, each logged as `<name>: ignoré — champs obligatoires manquants : …`; if none are complete, logs and returns.
+
+**Note:** the rule applies to all LTAs including partiels (so scellés must be entered up-front, not just at the signature step). Manifest-derived fields (nombreContenant/poidTotal/totalValue) are normally auto-filled, so in practice it's usually the scellés that gate launch.
+
+**Files changed:** `src/ui/requiredFields.js` (new), `src/ui/components/AcheminementCard.jsx`, `src/ui/App.jsx`
+
+---
+
 ## 2026-06-15 — DS Combinée: fix iframe form hang (stacked zoom destabilized clicks)
 
 **Problem:** After adding the global 90% page zoom (in `portnetLogin`), the DS Combinée creation flow hung at "Selecting Numéro d'agrément…", with the form visibly auto-scrolling up/down. The form lives in a cross-origin iframe that already applies its own 65% zoom; the outer page's 90% zoom stacked on top of it, making element geometry unstable so Playwright's click actionability check scroll-looped forever and timed out.
@@ -12,6 +47,8 @@ _Format: `## YYYY-MM-DD — <title>`_
 **Fix (`src/portnet/portnetDsCombine.js`):** In `openCreationPage`, after locating the iframe, reset the OUTER page zoom to 100% (`document.documentElement.style.zoom = ""` / `body.style.zoom = ""`) before applying the iframe's own zoom. Restores the pre-global-zoom behavior for the form while keeping the iframe readable. (Outer shell zoom is invisible anyway — the real form is inside the iframe.)
 
 **Follow-up (same day):** Changed the iframe zoom 65% → **90%** so the form matches the rest of the Portnet session (login/consultation are 90%). Zoom is applied INSIDE the cross-origin iframe (not via the parent) because parent-side CSS zoom on a cross-origin frame throws off Playwright's click coordinates — so the proven in-iframe mechanism is kept, just at 90%. Note: the long pause before the form fills is the `networkidle` 60 s timeout on the DS page (the form keeps background connections open), unrelated to zoom.
+
+**Follow-up 2 (same day):** Same hang reproduced on the **Consultation** page (status polling) — it also has a grid inside an `iframe[title="iframe"]`, and the outer-page 90% zoom destabilized the sort-header click (scroll-loop). Added the outer-page zoom reset to 100% at the start of `_ensureConsultationSortedByCreatedAtDesc()`, which runs both on initial open and after every poll-loop `page.reload()` (the reload re-applies the global zoom, so the reset must run each cycle).
 
 **Files changed:** `src/portnet/portnetDsCombine.js`
 

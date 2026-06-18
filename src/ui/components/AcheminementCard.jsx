@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import StatusBadge from "./StatusBadge.jsx";
+import { getMissingRequiredFields } from "../requiredFields.js";
 
 /**
  * Card representing one acheminement folder.
@@ -53,6 +54,11 @@ export default function AcheminementCard({
   ].includes(status);
   const isError = status === "error" || status === "weight-mismatch";
   const isWaitingSignature = status === "partiel-waiting-signature";
+
+  // Obligatory fields (scellés, nb contenant, poids total, valeur totale).
+  // The LTA cannot be launched until they are all filled.
+  const missingRequired = getMissingRequiredFields(ach);
+  const hasMissingRequired = missingRequired.length > 0;
 
   // Local state for the signed-serie input (prefilled with the validated serie)
   const [signedSerie, setSignedSerie] = useState(
@@ -345,10 +351,25 @@ export default function AcheminementCard({
           </button>
         </div>
       ) : (
-        <button
-          onClick={() => onRun(ach)}
-          disabled={isGlobalRunning || (!!ach.refMismatch && !ach.manifestRef)}
-          className={`mt-1 w-full py-2 rounded-lg text-sm font-semibold transition-all duration-200
+        <>
+          {hasMissingRequired && !isRunning && (
+            <p className="text-[11px] text-amber-400 bg-amber-900/20 border border-amber-700/40 rounded px-2 py-1">
+              ⚠ Champs obligatoires manquants : {missingRequired.join(", ")}
+            </p>
+          )}
+          <button
+            onClick={() => onRun(ach)}
+            disabled={
+              isGlobalRunning ||
+              (!!ach.refMismatch && !ach.manifestRef) ||
+              (hasMissingRequired && !isRunning)
+            }
+            title={
+              hasMissingRequired
+                ? `Champs obligatoires manquants : ${missingRequired.join(", ")}`
+                : undefined
+            }
+            className={`mt-1 w-full py-2 rounded-lg text-sm font-semibold transition-all duration-200
             ${
               isError
                 ? "bg-red-600 hover:bg-red-500 text-white border border-red-500 disabled:opacity-50"
@@ -356,9 +377,10 @@ export default function AcheminementCard({
                   ? "bg-blue-700/40 text-blue-300 cursor-not-allowed border border-blue-700/40 animate-pulse"
                   : "bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
             }`}
-        >
-          {isRunning ? "En cours…" : isError ? "↺ Réessayer" : "Lancer"}
-        </button>
+          >
+            {isRunning ? "En cours…" : isError ? "↺ Réessayer" : "Lancer"}
+          </button>
+        </>
       )}
     </div>
   );
