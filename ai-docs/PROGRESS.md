@@ -5,6 +5,40 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-19 — Auto-fill scellés from the LTA folder name
+
+**Need:** Users name LTA folders like `4eme LTA 1234567-1234568`, where `1234567` / `1234568` are the two scellé numbers. The app should read them from the folder name so users don't retype them; if the name has no such numbers, the scellé inputs stay empty for manual entry (as before).
+
+**Implementation (`electron/main.js`, `folder:scan`):**
+
+- New `parseScellesFromFolderName(name)` — matches `(\d+)\s*-\s*(\d+)` (e.g. `"… 1234567-1234568"`); returns `{ scelle1, scelle2 }` or nulls.
+- During scan: folder-derived scellés **fill empty** `saved.scelle1/scelle2` (a value already saved — e.g. a manual edit — is kept; folder name only fills gaps), and are **persisted to `acheminement.json`**. Persistence matters because the partiel declare-scellés IPC reads scellés straight from `acheminement.json`, and the normal-flow form fill reads them from the scanned object — both now populated.
+
+**Effect:** correctly-named folders auto-populate scellés (so the required-field gate passes and "Lancer" is enabled without typing); mis-/un-named folders behave exactly as before.
+
+**Files changed:** `electron/main.js`
+
+---
+
+## 2026-06-19 — Annexe: split oversized manifests instead of illegal first/last-page truncation
+
+**Problem:** When a manifest PDF exceeded Portnet's 2 MB annexe limit, the old chain compressed it and, if still too big, uploaded a PDF containing only the **first + last page**. Moroccan customs flags that truncation as **illegal**.
+
+**Solution:** Removed the first/last-page fallback entirely and replaced it with **re-save → (split only if needed)**:
+
+- `src/utils/compressPdfChain.js`:
+  - Deleted `writeFirstLastPagesToPath` and all `first_last` branches. `compressPdfForAnnex` now compresses one PDF to ≤ 2 MB via iLovePDF ×3 → Adobe, and **throws** if it can't (no page-dropping). Return mode is now `'original' | 'compressed'`.
+  - Added `_resaveWholePdf` — lossless, free pdf-lib re-save that strips incremental-update/unused-object bloat (a 15 MB digital manifest dropped to ~3.3 MB this way).
+  - Added `_splitInHalves(inputPath, log)` — splits a PDF into two page-halves (e.g. 101 → 51 + 50) via `pdf-lib` (each half is auto de-bloated by pdf-lib's save). If a half is still > 2 MB it's compressed; if compression still can't, that half is halved again (recursion = safety net so huge manifests never block).
+  - Added `prepareManifestPartsForAnnex(inputPath, log)` with **compress-first ordering**: (1) ≤ 2 MB → whole; (2) re-save whole → if ≤ 2 MB → whole (no split); (3) still too big → split in half (compress an oversized half). Parts named `<base>-part-<k>.pdf`.
+  - **Fix history:** the first cut split the *bloated original* (69 KB/page estimate) → 9 tiny parts. Switched to: re-save first (15 MB → ~3.3 MB), then split in half → 2 parts (~1.65 MB each, no compression needed). `SAFE_BYTES` removed (halving uses `MAX_BYTES`).
+- `src/portnet/portnetDsCombine.js` (`fillAnnexe`): manifest is prepared via `prepareManifestPartsForAnnex` and **each part uploaded as its own A0006-FACTURE row** (grid row count incremented per part); MAWB uploaded after as A0004-TITRE (Ghostscript, unchanged). Extracted `uploadOnePart` for the physical upload+grid-verify. Manifest parts cached in `<LTA>/compress/` and reused only when all are fresh/valid/≤2 MB (else re-split); `PORTNET_IGNORE_COMPRESS_CACHE=true` forces re-split.
+- `src/badr/badrDumNormalPartiel.js`: unchanged — it already wraps `compressPdfForAnnex` in try/catch, so with first/last removed it gracefully falls back to the original file instead of producing an illegal truncated PDF. (BADR DUM still uploads a single annexe file; splitting there is out of scope.)
+
+**Files changed:** `src/utils/compressPdfChain.js`, `src/portnet/portnetDsCombine.js`
+
+---
+
 ## 2026-06-19 — Hide "Contactez-nous" (Click2Connect) widget that blocks form buttons
 
 **Problem:** Portnet renders a floating "Contactez-nous" (Click2Connect) widget bottom-right with a high z-index. It can overlay form/submit buttons, intercepting Playwright's clicks and making the automation fail.
@@ -20,6 +54,8 @@ _Format: `## YYYY-MM-DD — <title>`_
 **Problem:** Navigating to the Consultation page (status polling) paused ~30 s at "Navigating to Consultation page…" even though the grid was already visible. Cause: a `waitForLoadState("networkidle", 30 s)` after the goto — but the page keeps background XHR open so it never goes idle, burning the full timeout every time. The poll loop's `reload({ waitUntil: "networkidle" })` had the same dead wait on every cycle.
 
 **Fix (`src/portnet/portnetDsCombine.js`):** Removed the post-goto networkidle wait in `openConsultationPage` (the following `_ensureConsultationSortedByCreatedAtDesc()` already waits for the actual grid header — the real readiness signal). Changed the poll-loop `reload` from `waitUntil: "networkidle"` → `"domcontentloaded"`.
+
+**Follow-up (2026-06-19):** Same dead ~60 s `networkidle` wait existed on the DS **creation** page (`navigate()`); removed it too — the iframe + Anticipation-select `waitFor` are the real readiness signals.
 
 **Files changed:** `src/portnet/portnetDsCombine.js`
 

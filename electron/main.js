@@ -1662,6 +1662,16 @@ ipcMain.handle("folder:delete-done", async (_event, { folders }) => {
   return { deleted, cancelled: false };
 });
 
+// Parse the two scellé numbers from an LTA folder name, e.g.
+// "4eme LTA 1234567-1234568" → { scelle1: "1234567", scelle2: "1234568" }.
+// Returns nulls when the name has no "<digits>-<digits>" group (user forgot —
+// the scellé inputs stay empty for manual entry).
+function parseScellesFromFolderName(name) {
+  const m = String(name || "").match(/(\d+)\s*-\s*(\d+)/);
+  if (!m) return { scelle1: null, scelle2: null };
+  return { scelle1: m[1], scelle2: m[2] };
+}
+
 // ── IPC: Scan folder for acheminements ────────────────────────────────────────
 ipcMain.handle("folder:scan", async (_event, folderPath) => {
   if (!folderPath || !fs.existsSync(folderPath)) return [];
@@ -1838,6 +1848,23 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
     const refMismatch = filenameMismatch || pdfVsFilenameMismatch;
 
     const saved = readAcheminementFile(dirPath);
+
+    // Scellés may be encoded in the folder name ("… 1234567-1234568"). Use them
+    // to fill empty scellés, and PERSIST so downstream readers (notably the
+    // partiel declare-scellés handler, which reads acheminement.json) see them.
+    // A value already saved (e.g. a manual edit) is kept — folder name only fills
+    // gaps. If the name has no numbers, scellés stay empty for manual entry.
+    const folderScelles = parseScellesFromFolderName(entry.name);
+    let scellesChanged = false;
+    if (!saved.scelle1 && folderScelles.scelle1) {
+      saved.scelle1 = folderScelles.scelle1;
+      scellesChanged = true;
+    }
+    if (!saved.scelle2 && folderScelles.scelle2) {
+      saved.scelle2 = folderScelles.scelle2;
+      scellesChanged = true;
+    }
+    if (scellesChanged) writeAcheminementFile(dirPath, saved);
 
     const mergedNombre = pickSavedOrExtracted(
       saved.nombreContenant,

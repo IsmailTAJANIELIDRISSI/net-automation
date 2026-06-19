@@ -23,7 +23,7 @@ const path = require("path");
 const config = require("../config/config");
 const { createLogger } = require("../utils/logger");
 const {
-  compressPdfForAnnex,
+  prepareManifestPartsForAnnex,
   compressMawbGhostscript,
   isLikelyValidPdf,
 } = require("../utils/compressPdfChain");
@@ -193,12 +193,9 @@ class PortnetDsCombine {
       { waitUntil: "domcontentloaded", timeout: TIMEOUT },
     );
 
-    // On slow connections the outer page may still be loading JS after DOMContentLoaded.
-    await this.page
-      .waitForLoadState("networkidle", { timeout: 60_000 })
-      .catch(() =>
-        log.warn("networkidle timed-out on DS Combinée page – proceeding"),
-      );
+    // Do NOT wait for networkidle: this page keeps background XHR connections
+    // open so it never goes idle — that was a dead ~60 s wait. The iframe + the
+    // Anticipation select waitFor below are the real readiness signals.
 
     // The real form is inside an iframe (manifeste-prod.portnet.ma/combineEnteteMead)
     const iframeLoc = this.page.locator("main iframe");
@@ -599,14 +596,6 @@ class PortnetDsCombine {
     log.info("Connaissement Ajouter clicked – row added to grid");
   }
 
-  /**
-   * Prepare annex PDF: iLovePDF (×3) → Adobe → first+last fallback (see compressPdfChain).
-   * @returns {Promise<{ uploadPath: string, mode: 'original' | 'compressed' | 'first_last' }>}
-   */
-  async _compressPdfIfNeeded(filePath) {
-    return compressPdfForAnnex(filePath, log);
-  }
-
   // ── Annexe section ─────────────────────────────────────────────────────────
   /**
    * Upload Manifeste (FACTURE) + MAWB (TITRE DE TRANSPORT) PDFs from folderPath.
@@ -636,147 +625,81 @@ class PortnetDsCombine {
     // Scoped grid locator – only the Annexe section's DataGrid
     const annexeGrid = annexeSection.locator('[role="grid"]').first();
 
-    /**
-     * Upload one document and wait until the Annexe grid reaches expectedRowCount rows.
-     * expectedRowCount is 1-based (1 after first upload, 2 after second, etc.)
-     */
-    const uploadFile = async (
-      typeDataValue,
-      filenamePredicate,
-      label,
-      expectedRowCount,
-      compressFn = null,
-    ) => {
+    const MAX_ANNEX_BYTES = 2 * 1024 * 1024;
+
+    const findMatched = (predicate) => {
       let dirEntries;
       try {
         dirEntries = fs.readdirSync(folderPath);
       } catch (e) {
         log.warn(`Annexe: cannot read folder "${folderPath}": ${e.message}`);
-        return;
+        return null;
       }
-
-      const matched = dirEntries.find(
-        (n) =>
-          filenamePredicate(n.toLowerCase()) &&
-          n.toLowerCase().endsWith(".pdf"),
+      return (
+        dirEntries.find(
+          (n) => predicate(n.toLowerCase()) && n.toLowerCase().endsWith(".pdf"),
+        ) || null
       );
-      if (!matched) {
-        log.warn(
-          `Annexe: no file matching (${label}) in "${folderPath}" – skipping`,
-        );
-        return;
-      }
+    };
 
-      const fullPath = path.join(folderPath, matched);
-      const baseName = path.parse(matched).name;
-      const cachePath = path.join(
-        compressedOutputDir,
-        `${baseName}_compressed.pdf`,
-      );
-      const MAX_ANNEX_BYTES = 2 * 1024 * 1024;
-
-      /** Reuse last prepared PDF so retests skip API calls until the source file changes. */
-      const canUseCompressCache = () => {
-        if (IGNORE_ANNEX_COMPRESS_CACHE) return false;
-        if (!fs.existsSync(cachePath)) return false;
-        let srcStat;
-        let cacheStat;
-        try {
-          srcStat = fs.statSync(fullPath);
-          cacheStat = fs.statSync(cachePath);
-        } catch {
-          return false;
-        }
-        if (cacheStat.size > MAX_ANNEX_BYTES) return false;
-        if (cacheStat.mtimeMs < srcStat.mtimeMs) return false;
+    /** True when a cached prepared file is valid, ≤ 2 MB and newer than its source. */
+    const isFreshCache = (cachePath, srcMtimeMs) => {
+      if (IGNORE_ANNEX_COMPRESS_CACHE) return false;
+      try {
+        const st = fs.statSync(cachePath);
+        if (st.size > MAX_ANNEX_BYTES) return false;
+        if (st.mtimeMs < srcMtimeMs) return false;
         return isLikelyValidPdf(cachePath);
-      };
-
-      let uploadPath;
-      let sourceUsed;
-
-      if (canUseCompressCache()) {
-        uploadPath = cachePath;
-        sourceUsed = "compress_cache";
-      } else {
-        const compress = compressFn || ((fp) => this._compressPdfIfNeeded(fp));
-        const { uploadPath: preparedPath, mode: compressMode } =
-          await compress(fullPath);
-        sourceUsed =
-          preparedPath === fullPath
-            ? "original"
-            : compressMode === "first_last"
-              ? "first_last_pages"
-              : "compressed";
-
-        fs.mkdirSync(compressedOutputDir, { recursive: true });
-        fs.copyFileSync(preparedPath, cachePath);
-        if (preparedPath !== fullPath && fs.existsSync(preparedPath)) {
-          try {
-            fs.unlinkSync(preparedPath);
-          } catch {}
-        }
-        uploadPath = cachePath;
-        log.info(
-          `Annexe: wrote prepared annex to "${cachePath}" (source=${sourceUsed})`,
-        );
+      } catch {
+        return false;
       }
+    };
 
-      const uploadSizeBytes = fs.statSync(uploadPath).size;
+    /** Upload one ready file and wait until the Annexe grid reaches expectedRowCount rows. */
+    const uploadOnePart = async ({
+      typeDataValue,
+      name,
+      filePath,
+      label,
+      expectedRowCount,
+    }) => {
+      const uploadSizeBytes = fs.statSync(filePath).size;
       const uploadSizeKB = (uploadSizeBytes / 1024).toFixed(0);
-
-      if (sourceUsed === "compress_cache") {
-        log.info(
-          `Annexe: reusing compress cache (${uploadSizeKB} KB) — skipping iLovePDF/Adobe; delete "${cachePath}" or set PORTNET_IGNORE_COMPRESS_CACHE=true to force recompress`,
-        );
-      }
 
       if (uploadSizeBytes > MAX_ANNEX_BYTES) {
         const uploadSizeMB = (uploadSizeBytes / (1024 * 1024)).toFixed(2);
         throw new Error(
-          `Annexe "${matched}" remains ${uploadSizeMB} MB after maximum compression (limit is 2.00 MB). ` +
-            "Upload skipped and Portnet submission blocked to avoid draft-only request.",
+          `Annexe "${name}" is ${uploadSizeMB} MB (limit is 2.00 MB). ` +
+            "Upload skipped and Portnet submission blocked to avoid a draft-only request.",
         );
       }
 
-      // Debug stop mode: stop right after compression/save, before upload.
       if (STOP_AFTER_ANNEX_COMPRESSION) {
         log.warn(
-          `Annexe debug stop active. Skipping upload for "${matched}" after compression.`,
+          `Annexe debug stop active. Skipping upload for "${name}" after preparation.`,
         );
         return { stoppedAfterCompression: true };
       }
 
-      log.info(
-        `Annexe: uploading "${matched}" (${uploadSizeKB} KB) as ${label}`,
-      );
-
-      // Select document type
+      log.info(`Annexe: uploading "${name}" (${uploadSizeKB} KB) as ${label}`);
       await this._muiSelect("mui-component-select-typeDocument", typeDataValue);
       await this.page.waitForTimeout(500);
 
-      // Set file on the hidden <input type="file"> inside the Annexe section.
-      // Always use the original filename (matched) regardless of whether the file
-      // was compressed to a temp path, so Portnet sees the correct document name.
       const fileInput = annexeSection.locator(
         'input[type="file"][accept=".pdf"]',
       );
       await fileInput.setInputFiles({
-        name: matched,
+        name,
         mimeType: "application/pdf",
-        buffer: fs.readFileSync(uploadPath),
+        buffer: fs.readFileSync(filePath),
       });
       await this.page.waitForTimeout(500);
 
-      // Click Ajouter scoped to Annexe section
       await annexeSection.locator('button:has-text("Ajouter")').first().click();
       log.info(
-        `Annexe: Ajouter clicked for "${matched}" – waiting for ${expectedRowCount} row(s) in grid…`,
+        `Annexe: Ajouter clicked for "${name}" – waiting for ${expectedRowCount} row(s) in grid…`,
       );
 
-      // Poll the Annexe grid's aria-rowcount until it reflects the new row.
-      // aria-rowcount = data rows + 1 (aria counts the header row too), so
-      // 1 uploaded doc → aria-rowcount "2", 2 docs → "3", etc.
       const deadline = Date.now() + 15000;
       let verified = false;
       while (Date.now() < deadline) {
@@ -790,49 +713,159 @@ class PortnetDsCombine {
         }
         await this.page.waitForTimeout(600);
       }
-
       if (verified) {
         log.info(
-          `Annexe: ✓ "${matched}" confirmed in grid (${expectedRowCount} row(s) visible)`,
+          `Annexe: ✓ "${name}" confirmed in grid (${expectedRowCount} row(s) visible)`,
         );
       } else {
         log.warn(
-          `Annexe: ✗ "${matched}" – grid did not reach ${expectedRowCount} row(s) within 15 s`,
+          `Annexe: ✗ "${name}" – grid did not reach ${expectedRowCount} row(s) within 15 s`,
         );
       }
       await this.page.waitForTimeout(500);
-
       return { stoppedAfterCompression: false };
     };
 
-    // 1. Manifeste → A0006 - FACTURE (data-value="1")  → expect 1 row
-    const manifestResult = await uploadFile(
-      "1",
+    let rowsSoFar = 0;
+
+    // 1. Manifeste → A0006 - FACTURE (data-value="1"). Split into ≤ 2 MB page-range
+    //    parts when oversized; each part is uploaded as its own FACTURE row.
+    const manifestMatched = findMatched(
       (n) => n.startsWith("manifest") || n.startsWith("manifeste"),
-      "A0006 - FACTURE",
-      1,
     );
-
-    // 2. MAWB → A0004 - TITRE DE PROPRIÉTÉ ET/OU DE TRANSPORT (data-value="7") → expect 2 rows
-    const mawbResult = await uploadFile(
-      "7",
-      (n) => n.startsWith("mawb"),
-      "A0004 - TITRE DE TRANSPORT",
-      2,
-      (fp) => compressMawbGhostscript(fp, log),
-    );
-
-    if (
-      manifestResult?.stoppedAfterCompression ||
-      mawbResult?.stoppedAfterCompression
-    ) {
-      log.warn(
-        `Annexe debug stop active. Prepared files are available in "${compressedOutputDir}".`,
+    if (!manifestMatched) {
+      log.warn(`Annexe: no Manifest file in "${folderPath}" – skipping`);
+    } else {
+      const manifestFull = path.join(folderPath, manifestMatched);
+      const srcMtime = fs.statSync(manifestFull).mtimeMs;
+      const base = path.parse(manifestMatched).name;
+      const partRe = new RegExp(
+        `^${base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(-part-\\d+)?\\.pdf$`,
+        "i",
       );
-      return { stoppedAfterCompression: true, compressedOutputDir };
+
+      // Reuse cached parts in compress/ when ALL are fresh & valid; else re-prepare.
+      let parts = null;
+      if (!IGNORE_ANNEX_COMPRESS_CACHE && fs.existsSync(compressedOutputDir)) {
+        const cachedNames = fs
+          .readdirSync(compressedOutputDir)
+          .filter((n) => partRe.test(n))
+          .sort((a, b) => {
+            const na = parseInt((a.match(/-part-(\d+)/) || [])[1] || "0", 10);
+            const nb = parseInt((b.match(/-part-(\d+)/) || [])[1] || "0", 10);
+            return na - nb;
+          });
+        if (
+          cachedNames.length > 0 &&
+          cachedNames.every((n) =>
+            isFreshCache(path.join(compressedOutputDir, n), srcMtime),
+          )
+        ) {
+          parts = cachedNames.map((n) => ({
+            name: n,
+            path: path.join(compressedOutputDir, n),
+          }));
+          log.info(
+            `Annexe: reusing ${parts.length} cached manifest part(s) — set PORTNET_IGNORE_COMPRESS_CACHE=true to force re-split`,
+          );
+        }
+      }
+
+      if (!parts) {
+        // Clear any stale cached parts for this manifest, then prepare fresh.
+        if (fs.existsSync(compressedOutputDir)) {
+          for (const n of fs.readdirSync(compressedOutputDir)) {
+            if (partRe.test(n)) {
+              try {
+                fs.unlinkSync(path.join(compressedOutputDir, n));
+              } catch {}
+            }
+          }
+        }
+        const prepared = await prepareManifestPartsForAnnex(manifestFull, log);
+        fs.mkdirSync(compressedOutputDir, { recursive: true });
+        parts = [];
+        for (const p of prepared) {
+          const dest = path.join(compressedOutputDir, p.name);
+          fs.copyFileSync(p.uploadPath, dest);
+          // Remove temp split/compressed files (never the original source).
+          if (p.uploadPath !== manifestFull && p.mode !== "original") {
+            try {
+              fs.unlinkSync(p.uploadPath);
+            } catch {}
+          }
+          parts.push({ name: p.name, path: dest });
+        }
+        log.info(
+          `Annexe: prepared manifest as ${parts.length} part(s) in "${compressedOutputDir}"`,
+        );
+      }
+
+      for (const part of parts) {
+        rowsSoFar += 1;
+        const res = await uploadOnePart({
+          typeDataValue: "1",
+          name: part.name,
+          filePath: part.path,
+          label: "A0006 - FACTURE",
+          expectedRowCount: rowsSoFar,
+        });
+        if (res?.stoppedAfterCompression) {
+          log.warn(
+            `Annexe debug stop active. Prepared files are available in "${compressedOutputDir}".`,
+          );
+          return { stoppedAfterCompression: true, compressedOutputDir };
+        }
+      }
     }
 
-    log.info("Annexe: both documents uploaded and verified in grid");
+    // 2. MAWB → A0004 - TITRE DE TRANSPORT (data-value="7"), Ghostscript-compressed.
+    const mawbMatched = findMatched((n) => n.startsWith("mawb"));
+    if (!mawbMatched) {
+      log.warn(`Annexe: no MAWB file in "${folderPath}" – skipping`);
+    } else {
+      const mawbFull = path.join(folderPath, mawbMatched);
+      const srcMtime = fs.statSync(mawbFull).mtimeMs;
+      const cachePath = path.join(
+        compressedOutputDir,
+        `${path.parse(mawbMatched).name}_compressed.pdf`,
+      );
+
+      let mawbPath;
+      if (isFreshCache(cachePath, srcMtime)) {
+        mawbPath = cachePath;
+        log.info(
+          `Annexe: reusing MAWB compress cache — set PORTNET_IGNORE_COMPRESS_CACHE=true to force recompress`,
+        );
+      } else {
+        const { uploadPath } = await compressMawbGhostscript(mawbFull, log);
+        fs.mkdirSync(compressedOutputDir, { recursive: true });
+        fs.copyFileSync(uploadPath, cachePath);
+        if (uploadPath !== mawbFull) {
+          try {
+            fs.unlinkSync(uploadPath);
+          } catch {}
+        }
+        mawbPath = cachePath;
+      }
+
+      rowsSoFar += 1;
+      const res = await uploadOnePart({
+        typeDataValue: "7",
+        name: mawbMatched,
+        filePath: mawbPath,
+        label: "A0004 - TITRE DE TRANSPORT",
+        expectedRowCount: rowsSoFar,
+      });
+      if (res?.stoppedAfterCompression) {
+        log.warn(
+          `Annexe debug stop active. Prepared files are available in "${compressedOutputDir}".`,
+        );
+        return { stoppedAfterCompression: true, compressedOutputDir };
+      }
+    }
+
+    log.info("Annexe: all documents uploaded and verified in grid");
     return { stoppedAfterCompression: false, compressedOutputDir };
   }
 

@@ -1,12 +1,12 @@
 "use strict";
 
 /**
- * Shared annex compression: iLovePDF (primary → partner → partner2) → Adobe → first+last fallback.
- * Used by PortnetDsCombine and scripts/compress-pdf-chain.js.
- *
- * @param {string} inputPath - absolute path to source PDF
- * @param {{ info?: Function, warn?: Function }} log - logger (e.g. Portnet logger)
- * @returns {Promise<{ uploadPath: string, mode: 'original' | 'compressed' | 'first_last' }>}
+ * Shared annex PDF helpers:
+ *  - compressPdfForAnnex: compress one PDF to ≤ 2 MB via iLovePDF ×3 → Adobe, or throw.
+ *  - prepareManifestPartsForAnnex: split an oversized manifest into ≤ 2 MB page-range
+ *    parts (compressing any part that's still too big). The legal replacement for the
+ *    old first/last-page truncation, which Moroccan customs flags as illegal.
+ * Used by PortnetDsCombine, badrDumNormalPartiel and scripts/compress-pdf-chain.js.
  */
 
 const fs = require("fs");
@@ -25,7 +25,6 @@ const {
 } = require("@adobe/pdfservices-node-sdk");
 
 const MAX_BYTES = 2 * 1024 * 1024; // 2 MB — Portnet hard upload limit
-const SAFE_BYTES = 1900 * 1024; // 1900 KB — acceptance threshold; above this → first+last fallback
 
 function mb(bytes) {
   return (bytes / (1024 * 1024)).toFixed(2);
@@ -160,25 +159,22 @@ async function compressViaAdobe(filePath, clientId, clientSecret) {
   }
 }
 
-async function writeFirstLastPagesToPath(inputPath, outputPath) {
-  const bytes = fs.readFileSync(inputPath);
-  const src = await PDFDocument.load(bytes);
-  const n = src.getPageCount();
-  if (n < 1) throw new Error("PDF has no pages");
-  const out = await PDFDocument.create();
-  const indexes = n === 1 ? [0] : [0, n - 1];
-  const pages = await out.copyPages(src, indexes);
-  for (const p of pages) out.addPage(p);
-  const outBytes = await out.save({
-    useObjectStreams: true,
-    addDefaultPage: false,
-  });
-  fs.writeFileSync(outputPath, outBytes);
+function unlinkSafe(p) {
+  try {
+    if (p && fs.existsSync(p)) fs.unlinkSync(p);
+  } catch {}
 }
 
 /**
+ * Compress a single PDF to ≤ 2 MB via the API chain (iLovePDF ×3 → Adobe).
+ * Throws if it cannot bring the file under 2 MB. There is NO page-dropping
+ * fallback: Moroccan customs flags first/last-page-only manifests as illegal,
+ * so an oversized manifest must be SPLIT (see prepareManifestPartsForAnnex)
+ * rather than truncated.
+ *
  * @param {string} inputPath
  * @param {{ info?: Function, warn?: Function }} log
+ * @returns {Promise<{ uploadPath: string, mode: 'original' | 'compressed' }>}
  */
 async function compressPdfForAnnex(inputPath, log = {}) {
   const L = {
@@ -233,42 +229,20 @@ async function compressPdfForAnnex(inputPath, log = {}) {
       "",
   ).trim();
 
-  function unlinkSafe(p) {
-    try {
-      if (p && fs.existsSync(p)) fs.unlinkSync(p);
-    } catch {}
-  }
-
   for (const acc of iloveAccounts) {
     try {
       L.info(`PDF compress: trying ${acc.label}…`);
       const tmp = await compressViaIlove(resolved, acc.label, acc.pub, acc.sec);
       const sz = fs.statSync(tmp).size;
       L.info(`PDF compress (${acc.label}): ${mb(sz)} MB`);
-      if (sz <= SAFE_BYTES) {
-        L.info(
-          `PDF compress: ✓ ${mb(sz)} MB ≤ 1900 KB — using compressed file`,
-        );
+      if (sz <= MAX_BYTES) {
+        L.info(`PDF compress: ✓ ${mb(sz)} MB ≤ 2 MB — using compressed file`);
         return { uploadPath: tmp, mode: "compressed" };
       }
       unlinkSafe(tmp);
       L.warn(
-        `PDF compress (${acc.label}): result ${mb(sz)} MB > 1900 KB — building first+last page PDF only (no more API calls).`,
+        `PDF compress (${acc.label}): result ${mb(sz)} MB > 2 MB — trying next provider`,
       );
-      const flPath = path.join(
-        os.tmpdir(),
-        `portnet_annex_firstlast_${Date.now()}_${path.basename(resolved)}`,
-      );
-      await writeFirstLastPagesToPath(resolved, flPath);
-      const fz = fs.statSync(flPath).size;
-      L.info(`PDF compress (first+last): ${mb(fz)} MB`);
-      if (fz > MAX_BYTES) {
-        unlinkSafe(flPath);
-        throw new Error(
-          `First+last page fallback still exceeds 2 MB (${mb(fz)} MB).`,
-        );
-      }
-      return { uploadPath: flPath, mode: "first_last" };
     } catch (err) {
       if (isIloveQuotaError(err)) {
         L.warn(
@@ -291,26 +265,11 @@ async function compressPdfForAnnex(inputPath, log = {}) {
       );
       const sz = fs.statSync(tmp).size;
       L.info(`PDF compress (Adobe): ${mb(sz)} MB`);
-      if (sz <= SAFE_BYTES) {
+      if (sz <= MAX_BYTES) {
         return { uploadPath: tmp, mode: "compressed" };
       }
       unlinkSafe(tmp);
-      L.warn(
-        `PDF compress (Adobe): result ${mb(sz)} MB > 1900 KB — building first+last page PDF only.`,
-      );
-      const flPath = path.join(
-        os.tmpdir(),
-        `portnet_annex_firstlast_${Date.now()}_${path.basename(resolved)}`,
-      );
-      await writeFirstLastPagesToPath(resolved, flPath);
-      const fz = fs.statSync(flPath).size;
-      if (fz > MAX_BYTES) {
-        unlinkSafe(flPath);
-        throw new Error(
-          `First+last page fallback still exceeds 2 MB (${mb(fz)} MB).`,
-        );
-      }
-      return { uploadPath: flPath, mode: "first_last" };
+      L.warn(`PDF compress (Adobe): result ${mb(sz)} MB > 2 MB`);
     } catch (err) {
       if (isAdobeLimitError(err)) {
         L.warn(`PDF compress (Adobe) quota/limit: ${err?.message || err}`);
@@ -324,23 +283,182 @@ async function compressPdfForAnnex(inputPath, log = {}) {
     );
   }
 
-  L.warn(
-    "PDF compress: all API steps failed — building first+last page fallback from original PDF.",
+  throw new Error(
+    `Annex PDF "${path.basename(resolved)}" cannot be reduced under 2 MB via compression ` +
+      `(source ${mb(inSize)} MB). Split it into smaller parts instead.`,
   );
-  const flPath = path.join(
+}
+
+// ── Manifest splitting (legal alternative to page-dropping) ──────────────────
+
+/** Build a temp PDF from pages [startIdx, endExclusive) of srcDoc. */
+async function _buildPartPdf(srcDoc, startIdx, endExclusive, baseName, partNum) {
+  const out = await PDFDocument.create();
+  const indexes = [];
+  for (let i = startIdx; i < endExclusive; i++) indexes.push(i);
+  const pages = await out.copyPages(srcDoc, indexes);
+  for (const p of pages) out.addPage(p);
+  const outBytes = await out.save({
+    useObjectStreams: true,
+    addDefaultPage: false,
+  });
+  const outPath = path.join(
     os.tmpdir(),
-    `portnet_annex_firstlast_${Date.now()}_${path.basename(resolved)}`,
+    `manifest_part${partNum}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${baseName}.pdf`,
   );
-  await writeFirstLastPagesToPath(resolved, flPath);
-  const fz = fs.statSync(flPath).size;
-  L.info(`PDF compress (first+last fallback): ${mb(fz)} MB`);
-  if (fz > MAX_BYTES) {
-    unlinkSafe(flPath);
-    throw new Error(
-      `Annex PDF cannot be reduced under 2 MB (first+last is ${mb(fz)} MB).`,
+  fs.writeFileSync(outPath, outBytes);
+  return outPath;
+}
+
+/**
+ * Split a PDF into two page-halves (e.g. 101 pages → 51 + 50). If a half is
+ * still > 2 MB, compress it; if compression still can't reach 2 MB, recurse
+ * (halve that half again) so a very large manifest never blocks. Returns temp
+ * file paths of the resulting parts, each ≤ 2 MB, in page order.
+ *
+ * @returns {Promise<string[]>}
+ */
+async function _splitInHalves(inputPath, log = {}, depth = 0) {
+  const L = {
+    info: typeof log.info === "function" ? log.info.bind(log) : console.log,
+    warn: typeof log.warn === "function" ? log.warn.bind(log) : console.warn,
+  };
+
+  const resolved = path.resolve(inputPath);
+  const src = await PDFDocument.load(fs.readFileSync(resolved));
+  const n = src.getPageCount();
+  const baseName = path.parse(resolved).name;
+
+  if (n <= 1) {
+    // Can't halve a single page — compress it (throws if impossible).
+    L.warn(
+      `Split: "${path.basename(resolved)}" is a single page > 2 MB — compressing…`,
     );
+    const { uploadPath } = await compressPdfForAnnex(resolved, log);
+    return [uploadPath];
   }
-  return { uploadPath: flPath, mode: "first_last" };
+
+  const mid = Math.ceil(n / 2);
+  L.info(
+    `Split: ${n} pages → 2 halves (${mid} + ${n - mid})${depth ? ` [depth ${depth}]` : ""}…`,
+  );
+  const halves = [
+    await _buildPartPdf(src, 0, mid, baseName, `${depth}a`),
+    await _buildPartPdf(src, mid, n, baseName, `${depth}b`),
+  ];
+
+  const out = [];
+  for (const half of halves) {
+    const size = fs.statSync(half).size;
+    if (size <= MAX_BYTES) {
+      L.info(`Split: half ${mb(size)} MB ≤ 2 MB ✓`);
+      out.push(half);
+      continue;
+    }
+    // Half still too big → compress it (the user's "compress the convenable part").
+    L.warn(`Split: half ${mb(size)} MB > 2 MB — compressing this half…`);
+    try {
+      const { uploadPath } = await compressPdfForAnnex(half, log);
+      if (uploadPath !== half) unlinkSafe(half);
+      out.push(uploadPath);
+    } catch (e) {
+      // Compression couldn't reach 2 MB → halve this half again (safety net).
+      L.warn(
+        `Split: half still > 2 MB after compression — halving it again. (${e.message})`,
+      );
+      const sub = await _splitInHalves(half, log, depth + 1);
+      unlinkSafe(half);
+      out.push(...sub);
+    }
+  }
+  return out;
+}
+
+/**
+ * Re-save an entire PDF via pdf-lib, stripping incremental-update / unused-object
+ * bloat. This is lossless (all pages/content kept) and free (no API), and on its
+ * own brings most oversized "digital" manifests well under 2 MB. Returns a temp path.
+ */
+async function _resaveWholePdf(inputPath) {
+  const src = await PDFDocument.load(fs.readFileSync(inputPath));
+  const out = await PDFDocument.create();
+  const pages = await out.copyPages(src, src.getPageIndices());
+  for (const p of pages) out.addPage(p);
+  const bytes = await out.save({
+    useObjectStreams: true,
+    addDefaultPage: false,
+  });
+  const outPath = path.join(
+    os.tmpdir(),
+    `manifest_resaved_${Date.now()}_${path.parse(inputPath).name}.pdf`,
+  );
+  fs.writeFileSync(outPath, bytes);
+  return outPath;
+}
+
+/**
+ * Prepare a manifest for the Portnet annexe as one or more upload-ready parts,
+ * each ≤ 2 MB. Order of operations (compress first, split only if needed):
+ *   1. ≤ 2 MB → upload the original whole.
+ *   2. Re-save (strip bloat, lossless, free). ≤ 2 MB → upload the whole re-saved.
+ *   3. Still too big → split the RE-SAVED file into the MINIMAL number of
+ *      ≤ 2 MB page-range parts (using realistic page sizes, so 2 parts not 9).
+ *      Any part that is still > 2 MB (e.g. a heavy single page) is compressed
+ *      via the API chain (throws if even that fails — no illegal page-dropping).
+ *
+ * @returns {Promise<Array<{ uploadPath: string, name: string, mode: string }>>}
+ */
+async function prepareManifestPartsForAnnex(inputPath, log = {}) {
+  const L = {
+    info: typeof log.info === "function" ? log.info.bind(log) : console.log,
+    warn: typeof log.warn === "function" ? log.warn.bind(log) : console.warn,
+  };
+
+  const resolved = path.resolve(inputPath);
+  if (!fs.existsSync(resolved)) throw new Error(`Manifest not found: ${resolved}`);
+  if (!isLikelyValidPdf(resolved))
+    throw new Error(`Invalid manifest PDF: ${resolved}`);
+
+  const baseName = path.parse(resolved).name;
+  const inSize = fs.statSync(resolved).size;
+
+  // 1. Already small enough.
+  if (inSize <= MAX_BYTES) {
+    L.info(
+      `Manifest "${path.basename(resolved)}" is ${mb(inSize)} MB ≤ 2 MB — uploading whole.`,
+    );
+    return [
+      { uploadPath: resolved, name: path.basename(resolved), mode: "original" },
+    ];
+  }
+
+  // 2. Compression-first: re-save the whole PDF (strips bloat). This alone
+  //    brings most oversized digital manifests under 2 MB → single upload.
+  L.info(
+    `Manifest "${path.basename(resolved)}" is ${mb(inSize)} MB > 2 MB — re-saving to strip bloat…`,
+  );
+  const resaved = await _resaveWholePdf(resolved);
+  const resavedSize = fs.statSync(resaved).size;
+  L.info(`Manifest re-saved: ${mb(inSize)} → ${mb(resavedSize)} MB.`);
+
+  if (resavedSize <= MAX_BYTES) {
+    L.info("Manifest fits ≤ 2 MB after re-save — uploading whole (no split).");
+    return [{ uploadPath: resaved, name: `${baseName}.pdf`, mode: "resaved" }];
+  }
+
+  // 3. Still too big → split into 2 page-halves; compress an oversized half
+  //    (recurse only if a compressed half is somehow still > 2 MB).
+  L.info(`Manifest still ${mb(resavedSize)} MB > 2 MB — splitting in half…`);
+  const partPaths = await _splitInHalves(resaved, log);
+  unlinkSafe(resaved); // halves are independent temp files
+  const total = partPaths.length;
+  const result = partPaths.map((p, i) => ({
+    uploadPath: p,
+    name: total > 1 ? `${baseName}-part-${i + 1}.pdf` : `${baseName}.pdf`,
+    mode: "split",
+  }));
+  L.info(`Manifest prepared as ${total} part(s).`);
+  return result;
 }
 
 // ── MAWB Ghostscript compression (no API keys) ──────────────────────────────
@@ -563,6 +681,7 @@ async function compressMawbGhostscript(filePath, log = {}) {
 
 module.exports = {
   compressPdfForAnnex,
+  prepareManifestPartsForAnnex,
   compressMawbGhostscript,
   MAX_BYTES,
   isLikelyValidPdf,
