@@ -60,6 +60,30 @@ class PortnetLogin {
       }
     });
 
+    // Hide the floating "Contactez-nous" (Click2Connect) widget on every page
+    // AND every frame. It sits bottom-right with a high z-index and can overlay
+    // form/submit buttons, intercepting clicks and making the automation fail.
+    // A CSS rule is robust: it works whether or not the widget is present, and
+    // survives the widget re-rendering asynchronously. Class is matched by prefix
+    // (`Click2Connect`) so a hashed CSS-module suffix can't break it.
+    await this.context.addInitScript(() => {
+      const injectHideStyle = () => {
+        if (!document.head || document.getElementById("__hideClick2Connect")) {
+          return;
+        }
+        const style = document.createElement("style");
+        style.id = "__hideClick2Connect";
+        style.textContent =
+          '[class*="Click2Connect"]{display:none !important;}';
+        document.head.appendChild(style);
+      };
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", injectHideStyle);
+      } else {
+        injectHideStyle();
+      }
+    });
+
     this.page = await this.context.newPage();
     this.page.setDefaultTimeout(config.timeout);
 

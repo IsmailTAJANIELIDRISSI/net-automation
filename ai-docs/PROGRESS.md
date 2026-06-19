@@ -5,6 +5,16 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-19 — Hide "Contactez-nous" (Click2Connect) widget that blocks form buttons
+
+**Problem:** Portnet renders a floating "Contactez-nous" (Click2Connect) widget bottom-right with a high z-index. It can overlay form/submit buttons, intercepting Playwright's clicks and making the automation fail.
+
+**Solution (`src/portnet/portnetLogin.js`):** Added a second `context.addInitScript` that injects a `<style>` hiding `[class*="Click2Connect"]` (matched by prefix so a hashed CSS-module suffix can't break it) on **every page and every frame** for the whole session. CSS-based so it's a no-op when the widget is absent and survives the widget re-rendering asynchronously — no per-form "check then remove" needed. Runs in all frames (not top-only like the zoom script) since the widget sits on the outer page over the form iframe.
+
+**Files changed:** `src/portnet/portnetLogin.js`
+
+---
+
 ## 2026-06-15 — Consultation polling: drop dead ~30 s networkidle waits
 
 **Problem:** Navigating to the Consultation page (status polling) paused ~30 s at "Navigating to Consultation page…" even though the grid was already visible. Cause: a `waitForLoadState("networkidle", 30 s)` after the goto — but the page keeps background XHR open so it never goes idle, burning the full timeout every time. The poll loop's `reload({ waitUntil: "networkidle" })` had the same dead wait on every cycle.
