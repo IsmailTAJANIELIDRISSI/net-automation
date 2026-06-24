@@ -5,6 +5,51 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-24 — MAWB: fix Total Prepaid (fret) extraction returning null
+
+**Problem:** On a scanned MAWB whose prepaid total (155068.89 = weight 143258.89 + other charges due carrier 11810.00) is printed just below/outside the literal "Total Prepaid" cell, Gemini Vision returned `fret=null`. Cause: the prompt said *"the value in the 'Total Prepaid' box … if the box is blank or zero, return null"* — so the model saw the cell as blank and returned null.
+
+**Fix (`src/utils/mawbShipperExtract.js`):** Reworded the TOTAL PREPAID instruction in both `extractVisionMeta` (scanned-PDF path) and `supplementCurrencyFretViaVision` (text-PDF path): describe it as the prepaid total at the bottom-left of the charges grid (= Weight Charge + Valuation + Tax + Other Charges Due Agent/Carrier), tell the model to read the printed figure even if it sits slightly outside the cell, and return null ONLY for a fully collect shipment.
+
+**Files changed:** `src/utils/mawbShipperExtract.js`
+
+---
+
+## 2026-06-24 — BADR DUM partiel: apply manifest re-save/split to FACTURE upload
+
+**Problem:** `Upload of FACTURE did not appear in the document list` on the BADR DUM Normale Partiel flow. Regression from the 2026-06-19 "remove first/last-page" change: `compressPdfForAnnex` now throws when it can't reduce a file ≤ 2 MB, and `badrDumNormalPartiel._addDocument` caught that throw and fell back to uploading the **oversized original** manifest, which BADR silently rejects (row never appears). The stale `<LTA>/compress/fac_*.pdf` cache held that oversized file, so re-runs kept failing.
+
+**Fix (`src/badr/badrDumNormalPartiel.js`):**
+
+- New `_addManifestFacture` prepares the manifest with `prepareManifestPartsForAnnex` (re-save → split into ≤ 2 MB parts) and uploads each part as its own FACTURE row (BADR's annexe is a multi-row table).
+- Extracted `_uploadPreparedDoc` (type select + ref + date + setInputFiles + verify) with **row-count** verification (`count(tr:has-text(label)) >= expectedCount`) so multiple same-label rows verify correctly.
+- `_addDocument` (now MAWB/TITRE only) compresses a single oversized file and cleans up the temp; no longer falls back to an oversized upload silently.
+- Bypasses the old `fac_*` compress cache (re-prepares from the raw manifest each run), so the stale oversized cache is ignored.
+
+**Files changed:** `src/badr/badrDumNormalPartiel.js`
+
+---
+
+## 2026-06-19 — Email notifications (success PDF, pending, weight/colis alerts)
+
+**Need:** Notify operators by email at key points instead of the old `[TODO MAIL]` log placeholders.
+
+**Infra:**
+- New `src/utils/mailer.js` — `sendNotification({ subject, text, attachments })` via nodemailer + `config.email`; sends to `EMAIL_TO` with `EMAIL_CC` in copy; no-op when disabled; drops attachment entries whose path doesn't exist.
+- `src/config/config.js`: added `email.cc` (`EMAIL_CC`).
+- `.env`: enabled email + set sender/recipient/CC (`EMAIL_ENABLED=true`, sender `tajanielidrissi.ismail@gmail.com` with app password, `EMAIL_TO` same, `EMAIL_CC=cursorcompte06@gmail.com`).
+
+**Notifications wired in `electron/main.js`:**
+1. **DS success** (`finalizeAcceptedOnBadr`): after `badr_done`, emails the downloaded DS PDF (`processFinalization` now captured as `dsPdfPath`). Subject `"<folder> — <ref>"`.
+2. **DUM partiel success** (`automation:declare-scelles-partiel`): after `partiel_done`, emails the DUM PDF (`state.pdfPath`). Subject `"<folder> — <ref>"`.
+3. **Pending > 30 min** (monitor loop): one-time email (guarded by `state.pendingEmailSent`) when an LTA is submitted but not accepted ≥ 30 min after `submittedAt`; body `"En cours validation portnet"`.
+4. **Weight mismatch** (`prepareLotAndWeightCheck`, > 5 kg and > 20 kg branches): screenshots the préapurement page to `~/Downloads/poid difference LTA <ref>.png` and emails it (replaces the `[TODO MAIL]` logs).
+5. **Colis mismatch** (`prepareLotAndWeightCheck`): **blocking** — when BADR's `nombreContenants` ≠ the user's `nombreContenant`, the LTA stops (phase `error`), emails `"Merci de rectifier le nombre de colis a propos LTA <ref> [<folder>]"`, and the operator rectifies + retries.
+
+**Files changed:** `src/utils/mailer.js` (new), `src/config/config.js`, `.env`, `electron/main.js`
+
+---
+
 ## 2026-06-19 — Auto-fill scellés from the LTA folder name
 
 **Need:** Users name LTA folders like `4eme LTA 1234567-1234568`, where `1234567` / `1234568` are the two scellé numbers. The app should read them from the folder name so users don't retype them; if the name has no such numbers, the scellé inputs stay empty for manual entry (as before).
@@ -33,7 +78,7 @@ _Format: `## YYYY-MM-DD — <title>`_
   - Added `prepareManifestPartsForAnnex(inputPath, log)` with **compress-first ordering**: (1) ≤ 2 MB → whole; (2) re-save whole → if ≤ 2 MB → whole (no split); (3) still too big → split in half (compress an oversized half). Parts named `<base>-part-<k>.pdf`.
   - **Fix history:** the first cut split the *bloated original* (69 KB/page estimate) → 9 tiny parts. Switched to: re-save first (15 MB → ~3.3 MB), then split in half → 2 parts (~1.65 MB each, no compression needed). `SAFE_BYTES` removed (halving uses `MAX_BYTES`).
 - `src/portnet/portnetDsCombine.js` (`fillAnnexe`): manifest is prepared via `prepareManifestPartsForAnnex` and **each part uploaded as its own A0006-FACTURE row** (grid row count incremented per part); MAWB uploaded after as A0004-TITRE (Ghostscript, unchanged). Extracted `uploadOnePart` for the physical upload+grid-verify. Manifest parts cached in `<LTA>/compress/` and reused only when all are fresh/valid/≤2 MB (else re-split); `PORTNET_IGNORE_COMPRESS_CACHE=true` forces re-split.
-- `src/badr/badrDumNormalPartiel.js`: unchanged — it already wraps `compressPdfForAnnex` in try/catch, so with first/last removed it gracefully falls back to the original file instead of producing an illegal truncated PDF. (BADR DUM still uploads a single annexe file; splitting there is out of scope.)
+- `src/badr/badrDumNormalPartiel.js`: see the 2026-06-24 follow-up below — the original "graceful fallback to the original file" turned out to upload an **oversized** manifest to BADR and fail.
 
 **Files changed:** `src/utils/compressPdfChain.js`, `src/portnet/portnetDsCombine.js`
 

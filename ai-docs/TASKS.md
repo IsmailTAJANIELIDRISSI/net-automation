@@ -46,6 +46,12 @@ The core automation flow is **fully implemented and working in production**:
   - `automation:declare-scelles-partiel` IPC: user-triggered after manual signing in BADR
   - Batch runner skips `partiel_waiting_signature` LTAs (no automation possible without human action)
   - **Fixed signed-serie+clé parsing and per-step retry ✅** (2026-06-12): user's combined input (e.g. "12345S"/"12345 S") is now split into numeric série + BADR-assigned clé; on failure the card stays on the waiting-signature panel (with an error banner) so the user retries just the scellés step instead of the whole partiel flow
+- **Email notifications ✅** (2026-06-19)
+  - `src/utils/mailer.js` (`sendNotification`) + `EMAIL_CC` config; enabled in `.env`
+  - DS success → emails downloaded DS PDF; DUM partiel success → emails DUM PDF
+  - Pending > 30 min → one-time "En cours validation portnet" email
+  - Weight mismatch (>5/>20 kg) → screenshots préapurement page to Downloads + emails it
+  - Colis mismatch (BADR vs saisie) → "Merci de rectifier le nombre de colis…" email
 - **Scellés auto-filled from LTA folder name ✅** (2026-06-19)
   - Folder named `… 1234567-1234568` → `parseScellesFromFolderName` fills + persists scelle1/scelle2 to `acheminement.json` during `folder:scan`; fills only empty values (manual edits kept); no numbers in name → inputs stay empty
 - **MAWB shipper extraction form-label bug ✅** (2026-06-04)

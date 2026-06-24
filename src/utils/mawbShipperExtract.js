@@ -281,8 +281,15 @@ async function extractVisionMeta(pdfPath, knownCompanies, log) {
 
 2. CURRENCY — the 3-letter currency code in the "Currency" field (e.g. CNY, USD, HKD, EUR).
 
-3. TOTAL PREPAID — the numeric value in the "Total Prepaid" box at the bottom of the form.
-   Return it as a plain number string (e.g. "131555.40"). If the box is blank or zero, return null.
+3. TOTAL PREPAID — the total PREPAID charges, printed at the bottom-left of the charges
+   grid. It equals the prepaid Weight Charge total plus Valuation Charge, Tax, Total Other
+   Charges Due Agent and Total Other Charges Due Carrier (e.g. weight 143258.89 + other
+   charges due carrier 11810.00 = 155068.89). The figure is shown in — or just below/next
+   to — the "Total Prepaid" cell; READ that printed number, do NOT treat the cell as blank
+   just because the amount sits slightly outside its borders.
+   - Return a plain number with the decimal point, no thousands separators, no currency code
+     (e.g. "155068.89").
+   - Return null ONLY for a fully "collect" shipment where no prepaid amount is printed.
 
 Respond in this EXACT JSON (no markdown fences):
 {
@@ -421,12 +428,16 @@ async function supplementCurrencyFretViaVision(pdfPath, log) {
 
   const prompt = `This is an Air Waybill (MAWB). Extract exactly two values:
 1. CURRENCY — the 3-letter ISO code in the "Currency" column (e.g. CNY, USD, TWD, HKD).
-2. TOTAL PREPAID — the numeric amount in the "Total Prepaid" box at the bottom of the form.
+2. TOTAL PREPAID — the total PREPAID charges at the bottom-left of the charges grid. It
+   equals the prepaid Weight Charge total plus Valuation Charge, Tax and Total Other Charges
+   (Due Agent + Due Carrier) — e.g. 143258.89 + 11810.00 = 155068.89. It is shown in, or just
+   below/next to, the "Total Prepaid" cell; READ that printed number even if it sits slightly
+   outside the cell — do not call it blank.
    STRICT RULES for the number:
    - Strip any currency code prefix (e.g. "TWD575,770.00" → "575770.00").
    - Remove ALL thousands-separator commas (e.g. "575,770.00" → "575770.00").
    - KEEP the decimal point and exactly 2 decimal places (e.g. "575770.00", NOT "57577000").
-   - If the box is blank or shows zero, return null.
+   - Return null ONLY for a fully "collect" shipment with no prepaid amount printed.
 
 Respond ONLY in this exact JSON (no markdown):
 {"currency": "TWD", "total_prepaid": "575770.00"}`;

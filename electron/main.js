@@ -9,6 +9,8 @@
 const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
+const { sendNotification } = require("../src/utils/mailer");
 
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
@@ -529,8 +531,75 @@ async function prepareLotAndWeightCheck(acheminement) {
     const poidsBadr = parseFloat(String(poidsInfo.poidsBrut).replace(",", "."));
     const poidsUser = parseFloat(String(poidMerged).replace(",", "."));
 
+    // Nombre de colis check — STOP if BADR's count differs from the user's entry,
+    // notify the operator, and let them rectify the acheminement data and retry.
+    const colisBadr = parseInt(
+      String(poidsInfo.nombreContenants || "").replace(/\D/g, ""),
+      10,
+    );
+    const colisUser = parseInt(String(nombreMerged || "").replace(/\D/g, ""), 10);
+    if (!isNaN(colisBadr) && !isNaN(colisUser) && colisBadr !== colisUser) {
+      const error = `Nombre de colis différent (BADR=${colisBadr}, saisie=${colisUser}) — rectification requise`;
+      updateAutomationState(folderPath, {
+        phase: "error",
+        error,
+        badrColis: colisBadr,
+        userColis: colisUser,
+      });
+      sendLog(
+        "warn",
+        "ColisCheck",
+        `${error} pour ${resolvedRef} — traitement arrêté, notification envoyée`,
+      );
+      await sendNotification({
+        subject: `Nombre de colis à rectifier — ${id} (${resolvedRef})`,
+        text:
+          `Merci de rectifier le nombre de colis a propos LTA ${resolvedRef} [${id}].\n\n` +
+          `Nombre trouvé dans BADR : ${colisBadr}\n` +
+          `Nombre saisi : ${colisUser}\n\n` +
+          `-- MedAfrica Automation`,
+      }).catch(() => {});
+      sendProgress(id, "error", { error });
+      return { success: false, error };
+    }
+
     if (!isNaN(poidsBadr) && !isNaN(poidsUser)) {
       const diff = Math.abs(poidsBadr - poidsUser);
+
+      // Screenshot the préapurement page → Downloads, then email it on a mismatch.
+      const notifyWeightMismatch = async (kind) => {
+        const shotPath = path.join(
+          os.homedir(),
+          "Downloads",
+          `poid difference LTA ${resolvedRef}.png`,
+        );
+        let captured = false;
+        try {
+          await badrConn.page.screenshot({ path: shotPath });
+          captured = true;
+          sendLog(
+            "info",
+            "WeightCheck",
+            `Capture d'écran enregistrée: ${shotPath}`,
+          );
+        } catch (e) {
+          sendLog(
+            "warn",
+            "WeightCheck",
+            `Capture d'écran écart poids échouée: ${e.message}`,
+          );
+        }
+        await sendNotification({
+          subject: `Écart de poids (${kind}) — ${id} (${resolvedRef})`,
+          text:
+            `Écart de poids détecté pour LTA ${resolvedRef} [${id}].\n\n` +
+            `Poids BADR : ${poidsBadr} kg\n` +
+            `Poids saisi : ${poidsUser} kg\n` +
+            `Écart : ${diff.toFixed(2)} kg\n\n` +
+            `Merci de vérifier.\n\n-- MedAfrica Automation`,
+          attachments: captured ? [{ path: shotPath }] : [],
+        }).catch(() => {});
+      };
 
       if (diff > 20) {
         updateAutomationState(folderPath, {
@@ -545,11 +614,7 @@ async function prepareLotAndWeightCheck(acheminement) {
           "WeightCheck",
           `Écart de poids > 20 kg (${diff.toFixed(2)} kg) — traitement arrêté (LTA partielle)`,
         );
-        sendLog(
-          "warn",
-          "ALERT_MAIL",
-          `[TODO MAIL] Écart poids critique pour ${resolvedRef}: ${diff.toFixed(2)} kg (BADR=${poidsBadr}, SAISIE=${poidsUser})`,
-        );
+        await notifyWeightMismatch("critique > 20 kg");
         sendProgress(id, "partiel-skip", {
           badrWeight: poidsBadr,
           userWeight: poidsUser,
@@ -576,11 +641,7 @@ async function prepareLotAndWeightCheck(acheminement) {
           "WeightCheck",
           `Écart de poids ${diff.toFixed(2)} kg (> 5 kg) (BADR: ${poidsBadr} kg / saisie: ${poidsUser} kg) — arrêt et vérification requise`,
         );
-        sendLog(
-          "warn",
-          "ALERT_MAIL",
-          `[TODO MAIL] Écart poids > 5kg pour ${resolvedRef}: ${diff.toFixed(2)} kg (BADR=${poidsBadr}, SAISIE=${poidsUser})`,
-        );
+        await notifyWeightMismatch("> 5 kg");
         sendProgress(id, "weight-mismatch", {
           badrWeight: poidsBadr,
           userWeight: poidsUser,
@@ -799,7 +860,7 @@ async function finalizeAcceptedOnBadr(acheminement, badrRef) {
     const parsedSerie = badrRef.slice(0, -1);
     const parsedCle = badrRef.slice(-1);
 
-    await finalizer.processFinalization(
+    const dsPdfPath = await finalizer.processFinalization(
       "301",
       "000",
       parsedSerie,
@@ -816,6 +877,18 @@ async function finalizeAcceptedOnBadr(acheminement, badrRef) {
       completedAt: new Date().toISOString(),
       error: null,
     });
+
+    // Email the downloaded DS PDF to the configured recipients.
+    const dsRef = lotReference || badrRef;
+    await sendNotification({
+      subject: `${id} — ${dsRef}`,
+      text:
+        `Bonjour,\n\n` +
+        `Veuillez trouver ci-joint la déclaration DS (entrée marchandise) pour ${id} (référence ${dsRef}).\n\n` +
+        `-- MedAfrica Automation`,
+      attachments: dsPdfPath ? [{ path: dsPdfPath }] : [],
+    }).catch(() => {});
+
     sendProgress(id, "done", { declarationRef: badrRef });
     sendLog("info", "Process", `Workflow fully complete for "${id}"!`);
     return { success: true, declarationRef: badrRef };
@@ -1033,6 +1106,32 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
           "Portnet",
           `Current status for ${state.portnetRef}: ${statusText}`,
         );
+
+        // One-time "still pending" email after 30 min without acceptance.
+        if (!isAcceptedStatus(statusText) && !state.pendingEmailSent) {
+          const submittedAtMs = state.submittedAt
+            ? Date.parse(state.submittedAt)
+            : null;
+          if (
+            submittedAtMs &&
+            Date.now() - submittedAtMs >= 30 * 60 * 1000
+          ) {
+            const ref = state.portnetRef || ach.refNumber || "";
+            await sendNotification({
+              subject: `${ach.id} — ${ref} — En cours validation Portnet`,
+              text:
+                `En cours validation portnet\n\n` +
+                `LTA : ${ach.id}\nRéférence : ${ref}\n\n` +
+                `-- MedAfrica Automation`,
+            }).catch(() => {});
+            updateAutomationState(ach.folderPath, { pendingEmailSent: true });
+            sendLog(
+              "info",
+              "Mail",
+              `Notification "en cours validation Portnet" envoyée pour "${ach.id}" (>30 min sans acceptation).`,
+            );
+          }
+        }
 
         if (
           isEnvoyeeStatus(statusText) &&
@@ -2166,6 +2265,19 @@ ipcMain.handle(
         "BADR",
         `[${id}] ✓ Scellés déclarés — DUM Normale Partiel terminée`,
       );
+
+      // Email the DUM Normale Partiel PDF (saved during run, path kept in state).
+      const dumPdfPath = getAutomationState(folderPath)?.pdfPath;
+      const dumRef = saved.refNumber || `${serie} ${cle}`;
+      await sendNotification({
+        subject: `${id} — ${dumRef}`,
+        text:
+          `Bonjour,\n\n` +
+          `Veuillez trouver ci-joint le DUM Normale Partiel pour ${id} (référence ${dumRef}).\n\n` +
+          `-- MedAfrica Automation`,
+        attachments: dumPdfPath ? [{ path: dumPdfPath }] : [],
+      }).catch(() => {});
+
       sendProgress(id, "done");
       return { ok: true };
     } catch (err) {

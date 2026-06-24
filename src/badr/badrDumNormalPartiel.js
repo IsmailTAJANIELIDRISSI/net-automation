@@ -19,6 +19,7 @@ const { createLogger } = require("../utils/logger");
 const { fetchMADRate, roundBADR } = require("../utils/exchangeRate");
 const {
   compressPdfForAnnex,
+  prepareManifestPartsForAnnex,
   isLikelyValidPdf,
 } = require("../utils/compressPdfChain");
 
@@ -721,13 +722,8 @@ class BADRDumNormalPartiel {
     await iframe.locator("#mainTab\\:form7").waitFor({ timeout: 10000 });
     await this.page.waitForTimeout(500);
 
-    // ── Document 1: FACTURE (manifest PDF) ──────────────────────────────
-    await this._addDocument(iframe, ach, {
-      typeLabel: "FACTURE",
-      reference: "fac",
-      pdfFilename: ach.manifeste,
-      expectLabel: "FACTURE",
-    });
+    // ── Document 1: FACTURE (manifest PDF) — split into ≤2 MB parts if needed ──
+    await this._addManifestFacture(iframe, ach);
 
     // ── Document 2: TITRE DE TRANSPORT (MAWB PDF) ────────────────────────
     await this._addDocument(iframe, ach, {
@@ -742,6 +738,50 @@ class BADRDumNormalPartiel {
     log.info("Step 6 — Documents saved");
   }
 
+  // Upload the manifest as FACTURE — re-saved/compressed to ≤ 2 MB, and split
+  // into multiple FACTURE rows when a single ≤ 2 MB file isn't possible (BADR's
+  // annexe is a multi-row table). Replaces the old single-file upload that, after
+  // first/last-page truncation was removed, fell back to the oversized original.
+  async _addManifestFacture(iframe, ach) {
+    if (!ach.manifeste) {
+      log.warn("Skipping FACTURE — no manifest PDF");
+      return;
+    }
+    const manifestPath = path.join(ach.folderPath, ach.manifeste);
+    if (!fs.existsSync(manifestPath)) {
+      log.warn(`Manifest not found: ${manifestPath}`);
+      return;
+    }
+
+    let parts;
+    try {
+      parts = await prepareManifestPartsForAnnex(manifestPath, log);
+    } catch (e) {
+      throw new Error(`Préparation FACTURE (manifeste) échouée: ${e.message}`);
+    }
+
+    let factureCount = 0;
+    for (const part of parts) {
+      factureCount += 1;
+      await this._uploadPreparedDoc(iframe, {
+        typeLabel: "FACTURE",
+        reference: "fac",
+        expectLabel: "FACTURE",
+        filePath: part.uploadPath,
+        displayName: part.name,
+        expectedCount: factureCount,
+      });
+      // Remove temp split/re-saved files (never the original manifest).
+      if (part.uploadPath !== manifestPath && part.mode !== "original") {
+        try {
+          fs.unlinkSync(part.uploadPath);
+        } catch {}
+      }
+    }
+    log.info(`FACTURE uploaded as ${factureCount} document(s)`);
+  }
+
+  // Single-file annexe (e.g. MAWB / TITRE). Compresses to ≤ 2 MB if oversized.
   async _addDocument(
     iframe,
     ach,
@@ -751,7 +791,51 @@ class BADRDumNormalPartiel {
       log.warn(`Skipping document ${typeLabel} — no PDF file`);
       return;
     }
+    const rawPath = path.join(ach.folderPath, pdfFilename);
+    if (!fs.existsSync(rawPath)) {
+      log.warn(`Document file not found: ${rawPath}`);
+      return;
+    }
 
+    let filePath = rawPath;
+    let temp = null;
+    const MAX_SIZE = 2 * 1024 * 1024;
+    if (fs.statSync(rawPath).size > MAX_SIZE) {
+      try {
+        const { uploadPath } = await compressPdfForAnnex(rawPath, log);
+        filePath = uploadPath;
+        if (uploadPath !== rawPath) temp = uploadPath;
+      } catch (e) {
+        log.warn(
+          `Compression failed for ${pdfFilename}: ${e.message} — uploading original (may exceed 2 MB).`,
+        );
+      }
+    }
+
+    try {
+      await this._uploadPreparedDoc(iframe, {
+        typeLabel,
+        reference,
+        expectLabel,
+        filePath,
+        displayName: pdfFilename,
+        expectedCount: 1,
+      });
+    } finally {
+      if (temp) {
+        try {
+          fs.unlinkSync(temp);
+        } catch {}
+      }
+    }
+  }
+
+  // Perform the BADR annexe UI steps for ONE prepared file, then verify that the
+  // number of rows for expectLabel has reached expectedCount.
+  async _uploadPreparedDoc(
+    iframe,
+    { typeLabel, reference, expectLabel, filePath, displayName, expectedCount },
+  ) {
     // Select type
     const typeTrigger = iframe
       .locator("#mainTab\\:form7\\:comp1 .ui-selectonemenu-trigger")
@@ -773,7 +857,6 @@ class BADRDumNormalPartiel {
     }
 
     // Date — jQuery UI datepicker ignores .fill(); must click through calendar UI.
-    // Click the trigger button → wait for picker → click today's highlighted cell.
     const calTrigger = iframe.locator(
       "#mainTab\\:form7\\:dateannexe .ui-datepicker-trigger",
     );
@@ -782,10 +865,8 @@ class BADRDumNormalPartiel {
       .catch(() => {});
     if (await calTrigger.isVisible().catch(() => false)) {
       await calTrigger.click();
-      // Picker div is appended to iframe body by jQuery UI
       const calDiv = iframe.locator("#ui-datepicker-div");
       await calDiv.waitFor({ state: "visible", timeout: 5000 });
-      // Click today's cell (has ui-datepicker-today class on the <td>)
       const todayCell = iframe.locator(
         "#ui-datepicker-div td.ui-datepicker-today a",
       );
@@ -794,61 +875,29 @@ class BADRDumNormalPartiel {
       await this.page.waitForTimeout(300);
     }
 
-    // ── Compression cache ──────────────────────────────────────────────────
-    // Short deterministic name (≤ 49 chars): <ref>_<sanitized-stem>.pdf
-    // Saved to <LTA folder>/compress/ so the compression API is never called
-    // twice for the same file (avoids quota waste on re-runs).
-    const rawPath = path.join(ach.folderPath, pdfFilename);
-    const ext = ".pdf";
-    const originalStem = sanitizeFilename(
-      path.basename(pdfFilename, path.extname(pdfFilename)),
+    log.info(
+      `Uploading ${typeLabel} "${displayName}" (${(fs.statSync(filePath).size / 1024).toFixed(0)} KB)…`,
     );
-    const stem = `${reference}_${originalStem}`.slice(0, 45);
-    const shortName = `${stem}${ext}`;
-    const compressDir = path.join(ach.folderPath, "compress");
-    const cachedPath = path.join(compressDir, shortName);
-
-    let uploadPath;
-    if (fs.existsSync(cachedPath) && isLikelyValidPdf(cachedPath)) {
-      log.info(`Using cached compressed PDF: ${shortName}`);
-      uploadPath = cachedPath;
-    } else {
-      if (!fs.existsSync(rawPath)) {
-        log.warn(`Document file not found: ${rawPath}`);
-        return;
-      }
-      if (!fs.existsSync(compressDir))
-        fs.mkdirSync(compressDir, { recursive: true });
-      const MAX_SIZE = 2 * 1024 * 1024;
-      let sourcePath = rawPath;
-      if (fs.statSync(rawPath).size > MAX_SIZE) {
-        try {
-          const result = await compressPdfForAnnex(rawPath, log);
-          if (result && result.uploadPath && fs.existsSync(result.uploadPath))
-            sourcePath = result.uploadPath;
-        } catch (e) {
-          log.warn(`PDF compression failed for ${pdfFilename}: ${e.message}`);
-        }
-      }
-      fs.copyFileSync(sourcePath, cachedPath);
-      uploadPath = cachedPath;
-    }
-
     const fileInput = iframe
       .locator("#mainTab\\:form7\\:comp2_input, input[id*='annexeFile']")
       .first();
-    await fileInput.setInputFiles(uploadPath);
+    await fileInput.setInputFiles(filePath);
     await this.page.waitForTimeout(2000);
 
-    // Verify upload — waitFor retries until the row appears or times out
-    const uploadedRow = iframe.locator(
+    // Verify: rows for this label reached expectedCount (handles multiple FACTURE rows).
+    const rowsForLabel = iframe.locator(
       `#mainTab\\:form7\\:listFichiersAnnexeDT_data tr:has-text("${expectLabel}")`,
     );
-    const uploaded = await uploadedRow
-      .waitFor({ state: "visible", timeout: 15000 })
-      .then(() => true)
-      .catch(() => false);
-    if (!uploaded) {
+    const deadline = Date.now() + 15000;
+    let ok = false;
+    while (Date.now() < deadline) {
+      if ((await rowsForLabel.count().catch(() => 0)) >= expectedCount) {
+        ok = true;
+        break;
+      }
+      await this.page.waitForTimeout(500);
+    }
+    if (!ok) {
       throw new Error(
         `Upload of ${typeLabel} did not appear in the document list`,
       );
