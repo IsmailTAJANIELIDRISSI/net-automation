@@ -156,122 +156,145 @@ class BADRLotLookup {
       process.env.BADR_SEARCH_RETRY_SHIFT_DAYS || windowDays,
     );
 
-    let lastResult = null;
-
     const retryStartExtraDays = Number(
       process.env.BADR_SEARCH_RETRY_START_EXTRA_DAYS || 1,
     );
 
-    for (let attempt = 0; attempt < retryAttempts; attempt++) {
-      const endOffsetDays = -attempt * retryShiftDays;
-      const { dateDu, dateAu } = this._computeDateRange(
-        endOffsetDays,
-        windowDays,
-        attempt === 0 ? 0 : retryStartExtraDays,
-      );
+    // Opérateurs essayés dans l'ordre : RAM d'abord, puis SWIFTAIR en secours
+    // si RAM ne donne aucun lot sur toutes les fenêtres de dates.
+    const operateurs = [
+      { query: "cie national", label: "CIE NATIONALE ROYAL AIR MAROC" },
+      { query: "swiftair maroc", label: "SWIFTAIR MAROC" },
+    ];
 
-      log.info("Filling lot search form", {
-        attempt: attempt + 1,
-        retryAttempts,
-        lotReference,
-        normalizedLotReference,
-        dateDu,
-        dateAu,
-      });
+    // ── Champs statiques (indépendants de l'opérateur) — remplis une seule fois ──
+    await p.fill(`#${FORM}\\:j_id_1p`, normalizedLotReference);
 
-      if (attempt === 0) {
-        // ── Référence du Lot ───────────────────────────────────────────────
-        await p.fill(`#${FORM}\\:j_id_1p`, normalizedLotReference);
+    // Bureau autocomplete: "301" → CASA/NOUASSER-FRET(301). pressSequentially
+    // (not fill) so PrimeFaces keydown handlers fire.
+    const bureauInput = p.locator(`#${FORM}\\:burCmbId_INPUT_input`);
+    await bureauInput.click();
+    await bureauInput.pressSequentially("301", { delay: 100 });
+    await p.waitForSelector(
+      `#${FORM}\\:burCmbId_INPUT_panel li.ui-autocomplete-item`,
+      { state: "visible", timeout: 15000 },
+    );
+    await p
+      .locator(`#${FORM}\\:burCmbId_INPUT_panel li.ui-autocomplete-item`)
+      .first()
+      .click();
+    await p.waitForTimeout(300);
+    log.info('Bureau "301" selected');
 
-        // ── Bureau autocomplete: type "301" → select CASA/NOUASSER-FRET(301)
-        // Must use pressSequentially (not fill) so PrimeFaces keydown handlers fire
-        const bureauInput = p.locator(`#${FORM}\\:burCmbId_INPUT_input`);
-        await bureauInput.click();
-        await bureauInput.pressSequentially("301", { delay: 100 });
-        await p.waitForSelector(
-          `#${FORM}\\:burCmbId_INPUT_panel li.ui-autocomplete-item`,
-          { state: "visible", timeout: 15000 },
+    // Type de déclaration: DS(01)
+    await p.click(`#${FORM}\\:j_id_30 .ui-selectonemenu-trigger`);
+    await p.waitForSelector('li[data-label="DS(01)"]', {
+      state: "visible",
+      timeout: 5000,
+    });
+    await p.click('li[data-label="DS(01)"]');
+    log.info("Type déclaration = DS(01)");
+
+    // Mode de transport: AERIEN(02)
+    await p.click(`#${FORM}\\:j_id_36 .ui-selectonemenu-trigger`);
+    await p.waitForSelector('li[data-label="AERIEN(02)"]', {
+      state: "visible",
+      timeout: 5000,
+    });
+    await p.click('li[data-label="AERIEN(02)"]');
+    log.info("Mode transport = AERIEN(02)");
+
+    let lastResult = null;
+
+    for (let opIdx = 0; opIdx < operateurs.length; opIdx++) {
+      const op = operateurs[opIdx];
+      const isLastOperateur = opIdx === operateurs.length - 1;
+
+      await this._selectOperateur(op.query, op.label);
+
+      for (let attempt = 0; attempt < retryAttempts; attempt++) {
+        const endOffsetDays = -attempt * retryShiftDays;
+        const { dateDu, dateAu } = this._computeDateRange(
+          endOffsetDays,
+          windowDays,
+          attempt === 0 ? 0 : retryStartExtraDays,
         );
-        await p
-          .locator(`#${FORM}\\:burCmbId_INPUT_panel li.ui-autocomplete-item`)
-          .first()
-          .click();
-        await p.waitForTimeout(300);
-        log.info('Bureau "301" selected');
 
-        // ── Opérateur autocomplete: type "cie national" → select RAM
-        const opInput = p.locator(`#${FORM}\\:operateurCmbId_INPUT_input`);
-        await opInput.click();
-        await opInput.pressSequentially("cie national", { delay: 80 });
-        await p.waitForSelector(
-          `#${FORM}\\:operateurCmbId_INPUT_panel li.ui-autocomplete-item`,
-          { state: "visible", timeout: 15000 },
+        log.info("Filling lot search form", {
+          operateur: op.label,
+          attempt: attempt + 1,
+          retryAttempts,
+          lotReference,
+          normalizedLotReference,
+          dateDu,
+          dateAu,
+        });
+
+        // ── Période voyage: du → au (always update per attempt) ─────────────
+        await p.fill(`#${FORM}\\:j_id_1v_input`, dateDu);
+        await p.press(`#${FORM}\\:j_id_1v_input`, "Tab");
+        await p.fill(`#${FORM}\\:j_id_1z_input`, dateAu);
+        await p.press(`#${FORM}\\:j_id_1z_input`, "Tab");
+
+        // ── Submit ───────────────────────────────────────────────────────────
+        log.info("Clicking Valider…");
+        await p.click(`#${FORM}\\:confirmButon`);
+
+        // Wait for PrimeFaces partial update: result panel must contain the count text
+        await p.waitForFunction(
+          () => {
+            const panel = document.getElementById("j_id_1h:resultPanel");
+            return (
+              panel && panel.textContent.includes("Nombre d'enregistrements")
+            );
+          },
+          { timeout: 30000 },
         );
-        await p
-          .locator(
-            `#${FORM}\\:operateurCmbId_INPUT_panel li.ui-autocomplete-item`,
-          )
-          .first()
-          .click();
-        await p.waitForTimeout(300);
-        log.info('Opérateur "CIE NATIONALE ROYAL AIR MAROC" selected');
+        await p.waitForTimeout(500);
 
-        // ── Type de déclaration: DS(01)
-        await p.click(`#${FORM}\\:j_id_30 .ui-selectonemenu-trigger`);
-        await p.waitForSelector('li[data-label="DS(01)"]', {
-          state: "visible",
-          timeout: 5000,
+        const isFinalAttempt = attempt === retryAttempts - 1;
+        // Only send the "no result" email on the very last try (last window of
+        // the last opérateur) — otherwise we'd email before trying SWIFTAIR.
+        lastResult = await this._parseResults(normalizedLotReference, {
+          sendNoResultEmail: isFinalAttempt && isLastOperateur,
         });
-        await p.click('li[data-label="DS(01)"]');
-        log.info("Type déclaration = DS(01)");
 
-        // ── Mode de transport: AERIEN(02)
-        await p.click(`#${FORM}\\:j_id_36 .ui-selectonemenu-trigger`);
-        await p.waitForSelector('li[data-label="AERIEN(02)"]', {
-          state: "visible",
-          timeout: 5000,
-        });
-        await p.click('li[data-label="AERIEN(02)"]');
-        log.info("Mode transport = AERIEN(02)");
+        if (!lastResult?.isEmpty) return lastResult;
+
+        if (!isFinalAttempt) {
+          log.warn(
+            `No result yet — retrying earlier window (attempt ${attempt + 2}/${retryAttempts})…`,
+          );
+        }
       }
 
-      // ── Période voyage: du → au (always update per attempt) ─────────────
-      await p.fill(`#${FORM}\\:j_id_1v_input`, dateDu);
-      await p.press(`#${FORM}\\:j_id_1v_input`, "Tab");
-      await p.fill(`#${FORM}\\:j_id_1z_input`, dateAu);
-      await p.press(`#${FORM}\\:j_id_1z_input`, "Tab");
-
-      // ── Submit ───────────────────────────────────────────────────────────
-      log.info("Clicking Valider…");
-      await p.click(`#${FORM}\\:confirmButon`);
-
-      // Wait for PrimeFaces partial update: result panel must contain the count text
-      await p.waitForFunction(
-        () => {
-          const panel = document.getElementById("j_id_1h:resultPanel");
-          return (
-            panel && panel.textContent.includes("Nombre d'enregistrements")
-          );
-        },
-        { timeout: 30000 },
-      );
-      await p.waitForTimeout(500);
-
-      const isFinalAttempt = attempt === retryAttempts - 1;
-      lastResult = await this._parseResults(normalizedLotReference, {
-        sendNoResultEmail: isFinalAttempt,
-      });
-
-      if (!lastResult?.isEmpty) return lastResult;
-
-      if (!isFinalAttempt) {
+      if (!isLastOperateur) {
         log.warn(
-          `No result yet — retrying earlier window (attempt ${attempt + 2}/${retryAttempts})…`,
+          `Aucun lot pour opérateur "${op.label}" — essai avec "${operateurs[opIdx + 1].label}"…`,
         );
       }
     }
 
     return lastResult;
+  }
+
+  /** Select an opérateur in the lot-search autocomplete (clears any previous value). */
+  async _selectOperateur(query, label) {
+    const p = this.popupPage;
+    const opInput = p.locator(`#${FORM}\\:operateurCmbId_INPUT_input`);
+    await opInput.click();
+    await opInput.fill(""); // clear any previously selected opérateur
+    await opInput.pressSequentially(query, { delay: 80 });
+    await p.waitForSelector(
+      `#${FORM}\\:operateurCmbId_INPUT_panel li.ui-autocomplete-item`,
+      { state: "visible", timeout: 15000 },
+    );
+    await p
+      .locator(`#${FORM}\\:operateurCmbId_INPUT_panel li.ui-autocomplete-item`)
+      .first()
+      .click();
+    await p.waitForTimeout(300);
+    log.info(`Opérateur "${label}" selected`);
   }
 
   // ────────────────────────────────────────────────────────────────────────────

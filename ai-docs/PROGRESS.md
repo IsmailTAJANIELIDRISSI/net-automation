@@ -15,6 +15,20 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-25 — BADR lot lookup: SWIFTAIR fallback opérateur
+
+**Need:** Some lots aren't filed under RAM ("CIE NATIONALE ROYAL AIR MAROC") — when RAM returns no lot, retry the search under "SWIFTAIR MAROC(81/125361)".
+
+**Implementation (`src/badr/badrLotLookup.js`, `searchLot`):**
+- Moved the static, opérateur-independent fields (Référence, Bureau 301, Type DS(01), Mode AERIEN(02)) to a one-time fill before the search loops.
+- Extracted `_selectOperateur(query, label)` (clears the autocomplete, types, selects first item).
+- Wrapped the existing date-window retry loop in an outer loop over `[RAM, SWIFTAIR]`: RAM is tried across all date windows first; only if it's empty everywhere does SWIFTAIR get tried. First non-empty result returns immediately.
+- The "Pas encore manifest" email now fires only on the **last window of the last opérateur** (`isFinalAttempt && isLastOperateur`) so it isn't sent before SWIFTAIR is attempted.
+
+**Files changed:** `src/badr/badrLotLookup.js`
+
+---
+
 ## 2026-06-25 — Cross-check manifest pieces/weight against the MAWB (all LTAs)
 
 **Need:** Catch data discrepancies before processing — the manifest's piece count / gross weight must match the MAWB's "No of Pieces RCP" / "Gross Weight". Applies to **every** LTA (not only partiels).
