@@ -358,6 +358,23 @@ async function prepareLotAndWeightCheck(acheminement) {
     return { success: false, skipped: true, reason: "partiel" };
   }
 
+  // Block if the manifest's pieces/weight disagree with the MAWB's (cross-check
+  // applies to all LTAs — partiels are blocked in runPartielDumFlow).
+  const mawbMismatch =
+    acheminement.mawbMismatch ||
+    computeMawbVsManifestMismatch({
+      manifestNbr: acheminement.nombreContenant,
+      manifestPoids: acheminement.poidTotal,
+      mawbNbr: acheminement.mawbNbrPieces,
+      mawbPoids: acheminement.mawbGrossWeight,
+    });
+  if (mawbMismatch) {
+    updateAutomationState(folderPath, { phase: "error", error: mawbMismatch });
+    sendLog("warn", "MAWB", `[${id}] ${mawbMismatch} — traitement bloqué`);
+    sendProgress(id, "error", { error: mawbMismatch });
+    return { success: false, error: mawbMismatch };
+  }
+
   const folderLotReference = extractLotReferenceFromFolder(folderPath);
 
   let manifestPdfMetrics = null;
@@ -1353,6 +1370,23 @@ async function runPartielDumFlow(acheminement) {
     return { success: false, skipped: true, reason: "partiel_waiting_lots" };
   }
 
+  // Block if the manifest's pieces/weight disagree with the MAWB's — the operator
+  // must reconcile the documents before this LTA is processed.
+  const mawbMismatch =
+    acheminement.mawbMismatch ||
+    computeMawbVsManifestMismatch({
+      manifestNbr: acheminement.nombreContenant,
+      manifestPoids: acheminement.poidTotal,
+      mawbNbr: acheminement.mawbNbrPieces,
+      mawbPoids: acheminement.mawbGrossWeight,
+    });
+  if (mawbMismatch) {
+    updateAutomationState(folderPath, { phase: "error", error: mawbMismatch });
+    sendLog("warn", "MAWB", `[${id}] ${mawbMismatch} — traitement bloqué`);
+    sendProgress(id, "error", { error: mawbMismatch });
+    return { success: false, error: mawbMismatch };
+  }
+
   try {
     const BADRLotLookup = require("../src/badr/badrLotLookup");
     const BADRDumNormalPartiel = require("../src/badr/badrDumNormalPartiel");
@@ -1600,12 +1634,15 @@ async function runAllAutomationTasks(acheminements) {
       "partiel_waiting_signature",
       "weight_mismatch",
     ];
-    const hasActiveWork = toProcess.some(
-      (ach) =>
-        !noSessionPhases.includes(getAutomationState(ach.folderPath)?.phase),
+    const isActive = (ach) =>
+      !noSessionPhases.includes(getAutomationState(ach.folderPath)?.phase);
+    // Partiel (DUM Normale) LTAs never touch Portnet — only open the Portnet
+    // session if at least one NON-partiel LTA still has work. BADR is needed for
+    // both kinds, so it opens whenever anything is active.
+    const needsPortnet = toProcess.some(
+      (ach) => ach.partiel !== true && isActive(ach),
     );
-    const needsPortnet = hasActiveWork;
-    const needsBadr = hasActiveWork;
+    const needsBadr = toProcess.some((ach) => isActive(ach));
 
     // Open Portnet + BADR sessions UP-FRONT and IN PARALLEL, so the user solves
     // the Portnet CAPTCHA and inserts the BADR USB certificate once at the start,
@@ -1771,6 +1808,30 @@ function parseScellesFromFolderName(name) {
   return { scelle1: m[1], scelle2: m[2] };
 }
 
+// Cross-check the manifest's pieces/weight against the MAWB's (No of Pieces RCP
+// / Gross Weight). Returns a clear French message when they differ, else null.
+// Only compares when the MAWB values are known (scanned MAWB → Gemini Vision).
+function computeMawbVsManifestMismatch({
+  manifestNbr,
+  manifestPoids,
+  mawbNbr,
+  mawbPoids,
+}) {
+  const issues = [];
+  const mn = parseInt(String(manifestNbr ?? "").replace(/\D/g, ""), 10);
+  const xn = parseInt(String(mawbNbr ?? "").replace(/\D/g, ""), 10);
+  if (!isNaN(mn) && !isNaN(xn) && mn !== xn) {
+    issues.push(`nombre de colis (manifeste ${mn} ≠ MAWB ${xn})`);
+  }
+  const mp = parseFloat(String(manifestPoids ?? "").replace(",", "."));
+  const xp = parseFloat(String(mawbPoids ?? "").replace(",", "."));
+  if (!isNaN(mp) && !isNaN(xp) && Math.round(mp) !== Math.round(xp)) {
+    issues.push(`poids brut (manifeste ${mp} kg ≠ MAWB ${xp} kg)`);
+  }
+  if (issues.length === 0) return null;
+  return `Incohérence manifeste / MAWB sur le ${issues.join(" et le ")}. Vérifiez les documents avant de lancer.`;
+}
+
 // ── IPC: Scan folder for acheminements ────────────────────────────────────────
 ipcMain.handle("folder:scan", async (_event, folderPath) => {
   if (!folderPath || !fs.existsSync(folderPath)) return [];
@@ -1885,7 +1946,15 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
 
     // ── Auto-extract shipper name from MAWB PDF (partiel LTAs) ──────────
     const savedForShipper = readAcheminementFile(dirPath);
-    if (savedForShipper.partiel && !savedForShipper.shipperName && mawb) {
+    // Extract MAWB metrics for ANY LTA with a MAWB (pieces/weight are cross-checked
+    // against the manifest for all LTAs). Shipper/currency/fret are also captured —
+    // only used for partiels, but the single Vision call returns them anyway.
+    if (
+      mawb &&
+      (savedForShipper.mawbNbrPieces == null ||
+        savedForShipper.mawbGrossWeight == null ||
+        (savedForShipper.partiel && !savedForShipper.shipperName))
+    ) {
       try {
         const mawbPath = path.join(dirPath, mawb);
         const knowCompaniesPath = path.join(
@@ -1901,7 +1970,13 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
         const meta = await extractMawbMeta(mawbPath, knowCompaniesPath, (msg) =>
           sendLog("info", "MAWB", `[${entry.name}] ${msg}`),
         );
-        if (meta.shipperName || meta.mawbCurrency || meta.fretValue) {
+        if (
+          meta.shipperName ||
+          meta.mawbCurrency ||
+          meta.fretValue ||
+          meta.nbrPieces ||
+          meta.grossWeight
+        ) {
           savedForShipper.shipperName =
             meta.shipperName || savedForShipper.shipperName;
           // Persist back so it shows up on next scan
@@ -1910,11 +1985,14 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
           if (meta.shipperName) patch.shipperName = meta.shipperName;
           if (meta.mawbCurrency) patch.mawbCurrency = meta.mawbCurrency;
           if (meta.fretValue) patch.fretValue = meta.fretValue;
+          // MAWB pieces/weight — used to cross-check against the manifest.
+          if (meta.nbrPieces != null) patch.mawbNbrPieces = meta.nbrPieces;
+          if (meta.grossWeight != null) patch.mawbGrossWeight = meta.grossWeight;
           writeAcheminementFile(dirPath, { ...current, ...patch });
           sendLog(
             "info",
             "MAWB",
-            `[${entry.name}] ✓ Extrait: expéditeur="${meta.shipperName}" devise=${meta.mawbCurrency} fret=${meta.fretValue}`,
+            `[${entry.name}] ✓ Extrait: expéditeur="${meta.shipperName}" devise=${meta.mawbCurrency} fret=${meta.fretValue} colis=${meta.nbrPieces} poids=${meta.grossWeight}`,
           );
         } else {
           sendLog(
@@ -2016,6 +2094,16 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
         "",
       ),
       partiels: saved.partiels ?? null,
+      mawbNbrPieces: saved.mawbNbrPieces ?? null,
+      mawbGrossWeight: saved.mawbGrossWeight ?? null,
+      // Flag a manifest-vs-MAWB pieces/weight discrepancy (all LTAs) so the card
+      // shows it and the run is blocked. Null when MAWB metrics are unknown.
+      mawbMismatch: computeMawbVsManifestMismatch({
+        manifestNbr: mergedNombre,
+        manifestPoids: mergedPoids,
+        mawbNbr: saved.mawbNbrPieces,
+        mawbPoids: saved.mawbGrossWeight,
+      }),
       automationState: saved[CHECKPOINT_KEY] ?? null,
     });
   }

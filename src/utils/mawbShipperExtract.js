@@ -256,7 +256,7 @@ async function extractVisionMeta(pdfPath, knownCompanies, log) {
     log(
       "PDF scanné détecté mais GEMINI_API_KEY absent — impossible d'utiliser la vision IA",
     );
-    return { shipperName: null, mawbCurrency: null, fretValue: null };
+    return { shipperName: null, mawbCurrency: null, fretValue: null, nbrPieces: null, grossWeight: null };
   }
 
   let genai;
@@ -264,13 +264,13 @@ async function extractVisionMeta(pdfPath, knownCompanies, log) {
     genai = require("@google/genai");
   } catch {
     log("@google/genai non installé — vision IA ignorée");
-    return { shipperName: null, mawbCurrency: null, fretValue: null };
+    return { shipperName: null, mawbCurrency: null, fretValue: null, nbrPieces: null, grossWeight: null };
   }
 
   const client = new genai.GoogleGenAI({ apiKey });
   const pdfBase64 = fs.readFileSync(pdfPath).toString("base64");
 
-  const prompt = `This is an Air Waybill (MAWB) document. Extract the following three values:
+  const prompt = `This is an Air Waybill (MAWB) document. Extract the following values:
 
 1. SHIPPER NAME — from the "Shipper's Name and Address" box (top-left of the form).
    - Return ONLY the company name (no address, no street, no phone, no email).
@@ -291,11 +291,19 @@ async function extractVisionMeta(pdfPath, knownCompanies, log) {
      (e.g. "155068.89").
    - Return null ONLY for a fully "collect" shipment where no prepaid amount is printed.
 
+4. NO OF PIECES — the integer in the "No. of Pieces RCP" column of the cargo line, at the
+   bottom-left of the goods table (e.g. 121). Plain integer, no other text.
+
+5. GROSS WEIGHT — the number in the "Gross Weight" column of the cargo line, next to the
+   pieces count (e.g. 2311). Plain number, no unit ("kg"), no thousands separators.
+
 Respond in this EXACT JSON (no markdown fences):
 {
   "shipper_name": "COMPANY NAME OR null",
   "currency": "CNY",
-  "total_prepaid": "131555.40"
+  "total_prepaid": "131555.40",
+  "no_of_pieces": "121",
+  "gross_weight": "2311"
 }`;
 
   let lastError = null;
@@ -343,9 +351,11 @@ Respond in this EXACT JSON (no markdown fences):
         shipperName: parsed.shipper_name || null,
         mawbCurrency: parsed.currency || null,
         fretValue: parsed.total_prepaid || null,
+        nbrPieces: parsed.no_of_pieces || null,
+        grossWeight: parsed.gross_weight || null,
       };
       log(
-        `Gemini Vision résultat: expéditeur="${result.shipperName}" devise=${result.mawbCurrency} fret=${result.fretValue}`,
+        `Gemini Vision résultat: expéditeur="${result.shipperName}" devise=${result.mawbCurrency} fret=${result.fretValue} colis=${result.nbrPieces} poids=${result.grossWeight}`,
       );
       return result;
     } catch (e) {
@@ -355,7 +365,7 @@ Respond in this EXACT JSON (no markdown fences):
   }
 
   log(`Tous les modèles Gemini Vision ont échoué: ${lastError?.message}`);
-  return { shipperName: null, mawbCurrency: null, fretValue: null };
+  return { shipperName: null, mawbCurrency: null, fretValue: null, nbrPieces: null, grossWeight: null };
 }
 
 // ── Currency / fret extraction for text-based PDFs ────────────────────────────
@@ -405,28 +415,38 @@ function extractMetaFromText(text, log) {
 }
 
 /**
- * Supplemental Gemini Vision call used only when regex couldn’t find currency or fret.
- * Asks ONLY for currency + total_prepaid (no shipper name needed here).
- * Returns { mawbCurrency, fretValue }.
+ * Supplemental Gemini Vision call used when the text regex couldn't find the
+ * currency/fret (and to read pieces/weight, which the text layout rarely yields).
+ * Returns { mawbCurrency, fretValue, nbrPieces, grossWeight }.
  */
 async function supplementCurrencyFretViaVision(pdfPath, log) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     log("GEMINI_API_KEY absent — complément Vision ignoré");
-    return { mawbCurrency: null, fretValue: null };
+    return {
+      mawbCurrency: null,
+      fretValue: null,
+      nbrPieces: null,
+      grossWeight: null,
+    };
   }
 
   let genai;
   try {
     genai = require("@google/genai");
   } catch {
-    return { mawbCurrency: null, fretValue: null };
+    return {
+      mawbCurrency: null,
+      fretValue: null,
+      nbrPieces: null,
+      grossWeight: null,
+    };
   }
 
   const client = new genai.GoogleGenAI({ apiKey });
   const pdfBase64 = fs.readFileSync(pdfPath).toString("base64");
 
-  const prompt = `This is an Air Waybill (MAWB). Extract exactly two values:
+  const prompt = `This is an Air Waybill (MAWB). Extract exactly four values:
 1. CURRENCY — the 3-letter ISO code in the "Currency" column (e.g. CNY, USD, TWD, HKD).
 2. TOTAL PREPAID — the total PREPAID charges at the bottom-left of the charges grid. It
    equals the prepaid Weight Charge total plus Valuation Charge, Tax and Total Other Charges
@@ -438,9 +458,13 @@ async function supplementCurrencyFretViaVision(pdfPath, log) {
    - Remove ALL thousands-separator commas (e.g. "575,770.00" → "575770.00").
    - KEEP the decimal point and exactly 2 decimal places (e.g. "575770.00", NOT "57577000").
    - Return null ONLY for a fully "collect" shipment with no prepaid amount printed.
+3. NO OF PIECES — the integer in the "No. of Pieces RCP" column of the cargo line (e.g. 121).
+   Plain integer, no other text.
+4. GROSS WEIGHT — the number in the "Gross Weight" column of the cargo line (e.g. 2311).
+   Plain number, no unit ("kg"), no thousands separators.
 
 Respond ONLY in this exact JSON (no markdown):
-{"currency": "TWD", "total_prepaid": "575770.00"}`;
+{"currency": "TWD", "total_prepaid": "575770.00", "no_of_pieces": "121", "gross_weight": "2311"}`;
 
   for (const modelName of GEMINI_MODEL_FALLBACKS) {
     try {
@@ -493,16 +517,23 @@ Respond ONLY in this exact JSON (no markdown):
       const result = {
         mawbCurrency: parsed.currency || null,
         fretValue,
+        nbrPieces: parsed.no_of_pieces || null,
+        grossWeight: parsed.gross_weight || null,
       };
       log(
-        `Complément Vision: devise=${result.mawbCurrency} fret=${result.fretValue}`,
+        `Complément Vision: devise=${result.mawbCurrency} fret=${result.fretValue} colis=${result.nbrPieces} poids=${result.grossWeight}`,
       );
       return result;
     } catch (e) {
       log(`Complément Vision ${modelName} échoué: ${e.message}`);
     }
   }
-  return { mawbCurrency: null, fretValue: null };
+  return {
+    mawbCurrency: null,
+    fretValue: null,
+    nbrPieces: null,
+    grossWeight: null,
+  };
 }
 
 /**
@@ -562,10 +593,13 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
 
   // Extract currency and fret value via regex first
   let { mawbCurrency, fretValue } = extractMetaFromText(text, log);
+  let nbrPieces = null;
+  let grossWeight = null;
 
-  // If regex missed either field, supplement with a targeted Gemini Vision call.
-  // This handles PDFs where pdf-parse flattens the layout (no "Total Prepaid" label in text).
-  if (!mawbCurrency || !fretValue) {
+  // Supplement with a Vision call when the regex missed currency/fret OR to read
+  // the pieces/weight (text MAWBs rarely expose those cleanly, so this runs for
+  // virtually every text-based MAWB — needed for the manifest cross-check).
+  if (!mawbCurrency || !fretValue || nbrPieces == null || grossWeight == null) {
     log(
       `Régex incomplet (devise=${mawbCurrency ?? "null"}, fret=${fretValue ?? "null"}) — complément Gemini Vision`,
     );
@@ -573,6 +607,8 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
     if (!mawbCurrency && supplement.mawbCurrency)
       mawbCurrency = supplement.mawbCurrency;
     if (!fretValue && supplement.fretValue) fretValue = supplement.fretValue;
+    if (supplement.nbrPieces != null) nbrPieces = supplement.nbrPieces;
+    if (supplement.grossWeight != null) grossWeight = supplement.grossWeight;
   }
 
   const anchorPatterns = [
@@ -617,7 +653,8 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
     log(`Anchor trouvee -> candidats: ${JSON.stringify(candidates)}`);
 
     const shipperName = await resolveCandidate(candidates, knownCompanies, log);
-    if (shipperName) return { shipperName, mawbCurrency, fretValue };
+    if (shipperName)
+      return { shipperName, mawbCurrency, fretValue, nbrPieces, grossWeight };
   }
 
   log(
@@ -630,11 +667,11 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
 
   if (candidates.length === 0) {
     log("Aucun candidat societe trouve — retour null");
-    return { shipperName: null, mawbCurrency, fretValue };
+    return { shipperName: null, mawbCurrency, fretValue, nbrPieces, grossWeight };
   }
 
   const shipperName = await resolveCandidate(candidates, knownCompanies, log);
-  return { shipperName, mawbCurrency, fretValue };
+  return { shipperName, mawbCurrency, fretValue, nbrPieces, grossWeight };
 }
 
 /** Backward-compat wrapper — returns just the shipper name string. */

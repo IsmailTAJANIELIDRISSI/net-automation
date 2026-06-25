@@ -753,11 +753,79 @@ class BADRDumNormalPartiel {
       return;
     }
 
-    let parts;
-    try {
-      parts = await prepareManifestPartsForAnnex(manifestPath, log);
-    } catch (e) {
-      throw new Error(`Préparation FACTURE (manifeste) échouée: ${e.message}`);
+    // Cache prepared parts in <LTA>/compress/ and reuse them on a retry (same as
+    // the non-partiel DS Combiné flow) — avoids re-saving/re-compressing and
+    // burning Gemini/iLovePDF quota every run.
+    const MAX = 2 * 1024 * 1024;
+    const compressDir = path.join(ach.folderPath, "compress");
+    const base = path.parse(ach.manifeste).name;
+    const partRe = new RegExp(
+      `^${base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(-part-\\d+)?\\.pdf$`,
+      "i",
+    );
+    const srcMtime = fs.statSync(manifestPath).mtimeMs;
+    const isFresh = (p) => {
+      try {
+        const st = fs.statSync(p);
+        return st.size <= MAX && st.mtimeMs >= srcMtime && isLikelyValidPdf(p);
+      } catch {
+        return false;
+      }
+    };
+    const partNum = (n) =>
+      parseInt((n.match(/-part-(\d+)/) || [])[1] || "0", 10);
+
+    let parts = null;
+    if (fs.existsSync(compressDir)) {
+      const cached = fs
+        .readdirSync(compressDir)
+        .filter((n) => partRe.test(n))
+        .sort((a, b) => partNum(a) - partNum(b));
+      if (
+        cached.length > 0 &&
+        cached.every((n) => isFresh(path.join(compressDir, n)))
+      ) {
+        parts = cached.map((n) => ({
+          name: n,
+          path: path.join(compressDir, n),
+        }));
+        log.info(`Réutilisation de ${parts.length} partie(s) FACTURE en cache`);
+      }
+    }
+
+    if (!parts) {
+      // Clear any stale cached parts for this manifest, then prepare fresh.
+      if (fs.existsSync(compressDir)) {
+        for (const n of fs.readdirSync(compressDir)) {
+          if (partRe.test(n)) {
+            try {
+              fs.unlinkSync(path.join(compressDir, n));
+            } catch {}
+          }
+        }
+      }
+      let prepared;
+      try {
+        prepared = await prepareManifestPartsForAnnex(manifestPath, log);
+      } catch (e) {
+        throw new Error(`Préparation FACTURE (manifeste) échouée: ${e.message}`);
+      }
+      fs.mkdirSync(compressDir, { recursive: true });
+      parts = [];
+      for (const p of prepared) {
+        const dest = path.join(compressDir, p.name);
+        fs.copyFileSync(p.uploadPath, dest);
+        // Remove temp split/re-saved files (never the original manifest).
+        if (p.uploadPath !== manifestPath && p.mode !== "original") {
+          try {
+            fs.unlinkSync(p.uploadPath);
+          } catch {}
+        }
+        parts.push({ name: p.name, path: dest });
+      }
+      log.info(
+        `FACTURE préparée en ${parts.length} partie(s) dans "${compressDir}"`,
+      );
     }
 
     let factureCount = 0;
@@ -767,16 +835,10 @@ class BADRDumNormalPartiel {
         typeLabel: "FACTURE",
         reference: "fac",
         expectLabel: "FACTURE",
-        filePath: part.uploadPath,
+        filePath: part.path,
         displayName: part.name,
         expectedCount: factureCount,
       });
-      // Remove temp split/re-saved files (never the original manifest).
-      if (part.uploadPath !== manifestPath && part.mode !== "original") {
-        try {
-          fs.unlinkSync(part.uploadPath);
-        } catch {}
-      }
     }
     log.info(`FACTURE uploaded as ${factureCount} document(s)`);
   }
@@ -848,13 +910,52 @@ class BADRDumNormalPartiel {
       await this.page.waitForTimeout(300);
     }
 
-    // Reference
-    const refInput = iframe
-      .locator("#mainTab\\:form7\\:j_id_3p_25r_2_2m_b, [id*='refAnnexe']")
-      .first();
-    if (await refInput.isVisible().catch(() => false)) {
-      await refInput.fill(reference);
+    // Reference — REQUIRED by BADR ("Veuillez saisir la référence du document
+    // annexe"). Mirrors the proven Selenium approach for this exact form: type
+    // with real keystrokes (PrimeFaces captures the value live), verify it stuck,
+    // and retry up to 3× re-locating the field. The JSF id is dynamic and other
+    // tabs also render a "Référence" label, so the locators are scoped to the
+    // annexe form (mainTab:form7) / the maxlength=10 reference input.
+    const refSelectors = [
+      'xpath=//*[@id="mainTab:form7"]//tr[td//label[contains(normalize-space(),"Référence")]]//input[@type="text" and @maxlength="10"]',
+      'xpath=//label[contains(text(),"Référence")]/parent::td/following-sibling::td//input[@type="text" and @maxlength="10"]',
+      'xpath=//input[contains(@id,"mainTab:form7:j_id") and @type="text" and @maxlength="10" and not(@disabled)]',
+    ];
+    let refOk = false;
+    for (let attempt = 1; attempt <= 3 && !refOk; attempt++) {
+      for (const sel of refSelectors) {
+        const refInput = iframe.locator(sel).first();
+        if (!(await refInput.isVisible().catch(() => false))) continue;
+        try {
+          await refInput.fill(""); // focuses + clears (no click → no scroll-loop)
+          await refInput.pressSequentially(reference, { delay: 60 });
+          // Commit: real typing fires key events; also dispatch change + blur so
+          // PrimeFaces persists the value before the auto-upload re-renders.
+          await refInput
+            .evaluate((el) => {
+              el.dispatchEvent(new Event("change", { bubbles: true }));
+              el.blur();
+            })
+            .catch(() => {});
+          const got = await refInput.inputValue().catch(() => "");
+          if (got === reference) {
+            log.info(`Référence annexe = "${got}"`);
+            refOk = true;
+            break;
+          }
+          log.warn(
+            `Référence non enregistrée (tentative ${attempt}) — valeur="${got}"`,
+          );
+        } catch (e) {
+          log.warn(`Référence tentative ${attempt} échouée: ${e.message}`);
+        }
+      }
+      if (!refOk) await this.page.waitForTimeout(800);
     }
+    if (!refOk) {
+      throw new Error("Impossible de saisir la référence du document annexe");
+    }
+    await this.page.waitForTimeout(500);
 
     // Date — jQuery UI datepicker ignores .fill(); must click through calendar UI.
     const calTrigger = iframe.locator(
@@ -875,20 +976,41 @@ class BADRDumNormalPartiel {
       await this.page.waitForTimeout(300);
     }
 
+    // Upload from a buffer with a clean, original-based name. setInputFiles(path)
+    // would send the temp file's name (e.g. "manifest_resaved_<ts>_…"), and BADR
+    // rejects filenames > 50 chars. Keep the original name, clamped to 50 chars.
+    let uploadName = displayName || path.basename(filePath);
+    if (uploadName.length > 50) {
+      const ext = path.extname(uploadName) || ".pdf";
+      const stem = uploadName.slice(0, uploadName.length - ext.length);
+      uploadName = stem.slice(0, 50 - ext.length) + ext;
+    }
     log.info(
-      `Uploading ${typeLabel} "${displayName}" (${(fs.statSync(filePath).size / 1024).toFixed(0)} KB)…`,
+      `Uploading ${typeLabel} "${uploadName}" (${(fs.statSync(filePath).size / 1024).toFixed(0)} KB)…`,
     );
     const fileInput = iframe
       .locator("#mainTab\\:form7\\:comp2_input, input[id*='annexeFile']")
       .first();
-    await fileInput.setInputFiles(filePath);
-    await this.page.waitForTimeout(2000);
+    await fileInput.setInputFiles({
+      name: uploadName,
+      mimeType: "application/pdf",
+      buffer: fs.readFileSync(filePath),
+    });
+    await this.page.waitForTimeout(1000);
+
+    // The upload runs an AJAX "Traitement en cours…" spinner (ui-blockui); a 2 MB
+    // file can take several seconds. Wait for it to clear before checking the list.
+    await iframe
+      .locator(".ui-blockui-content")
+      .first()
+      .waitFor({ state: "hidden", timeout: 45000 })
+      .catch(() => {});
 
     // Verify: rows for this label reached expectedCount (handles multiple FACTURE rows).
     const rowsForLabel = iframe.locator(
       `#mainTab\\:form7\\:listFichiersAnnexeDT_data tr:has-text("${expectLabel}")`,
     );
-    const deadline = Date.now() + 15000;
+    const deadline = Date.now() + 30000;
     let ok = false;
     while (Date.now() < deadline) {
       if ((await rowsForLabel.count().catch(() => 0)) >= expectedCount) {

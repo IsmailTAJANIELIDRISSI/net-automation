@@ -52,6 +52,9 @@ The core automation flow is **fully implemented and working in production**:
   - Pending > 30 min → one-time "En cours validation portnet" email
   - Weight mismatch (>5/>20 kg) → screenshots préapurement page to Downloads + emails it
   - Colis mismatch (BADR vs saisie) → "Merci de rectifier le nombre de colis…" email
+- **Manifest ↔ MAWB pieces/weight cross-check ✅** (2026-06-25)
+  - MAWB Vision extraction adds `nbrPieces` (No of Pieces RCP) + `grossWeight` (Gross Weight)
+  - Partiel LTAs: `computeMawbVsManifestMismatch` blocks the run (phase `error`) + red card banner + "Lancer" disabled when manifest colis/poids ≠ MAWB
 - **Scellés auto-filled from LTA folder name ✅** (2026-06-19)
   - Folder named `… 1234567-1234568` → `parseScellesFromFolderName` fills + persists scelle1/scelle2 to `acheminement.json` during `folder:scan`; fills only empty values (manual edits kept); no numbers in name → inputs stay empty
 - **MAWB shipper extraction form-label bug ✅** (2026-06-04)

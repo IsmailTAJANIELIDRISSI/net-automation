@@ -121,6 +121,15 @@ export default function AcheminementCard({
         ))}
       </div>
 
+      {/* ── Manifest ↔ MAWB pieces/weight mismatch (partiel) ──────────────── */}
+      {ach.mawbMismatch && (
+        <div className="flex items-start gap-2 bg-red-900/40 border border-red-700/60 rounded-lg px-3 py-2">
+          <span className="text-red-400 text-xs font-semibold leading-snug">
+            ⚠️ {ach.mawbMismatch}
+          </span>
+        </div>
+      )}
+
       {/* ── Ref mismatch warning ────────────────────────────────────────── */}
       {ach.refMismatch && (
         <div className="flex flex-col gap-2 bg-red-900/40 border border-red-700/60 rounded-lg px-3 py-2">
@@ -362,12 +371,15 @@ export default function AcheminementCard({
             disabled={
               isGlobalRunning ||
               (!!ach.refMismatch && !ach.manifestRef) ||
+              !!ach.mawbMismatch ||
               (hasMissingRequired && !isRunning)
             }
             title={
-              hasMissingRequired
-                ? `Champs obligatoires manquants : ${missingRequired.join(", ")}`
-                : undefined
+              ach.mawbMismatch
+                ? ach.mawbMismatch
+                : hasMissingRequired
+                  ? `Champs obligatoires manquants : ${missingRequired.join(", ")}`
+                  : undefined
             }
             className={`mt-1 w-full py-2 rounded-lg text-sm font-semibold transition-all duration-200
             ${

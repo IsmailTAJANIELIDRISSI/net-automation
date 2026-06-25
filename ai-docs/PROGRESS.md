@@ -5,6 +5,32 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-25 — "Lancer tous": don't open Portnet for an all-partiel batch
+
+**Problem:** With only partiel (DUM Normale) LTAs in the folder, "Lancer tous" still launched the Portnet session (CAPTCHA prompt) alongside BADR. Partiel LTAs never use Portnet, so that session is pointless.
+
+**Fix (`electron/main.js`, `runAllAutomationTasks`):** `needsPortnet` now requires at least one **non-partiel** LTA with active work (`ach.partiel !== true && isActive(ach)`); `needsBadr` stays "any active LTA". So an all-partiel batch opens BADR only, a mixed batch opens both, an all-normal batch opens both (Portnet + BADR up-front as before).
+
+**Files changed:** `electron/main.js`
+
+---
+
+## 2026-06-25 — Cross-check manifest pieces/weight against the MAWB (all LTAs)
+
+**Need:** Catch data discrepancies before processing — the manifest's piece count / gross weight must match the MAWB's "No of Pieces RCP" / "Gross Weight". Applies to **every** LTA (not only partiels).
+
+**Implementation:**
+- `src/utils/mawbShipperExtract.js`: the Gemini Vision MAWB extraction now also returns `nbrPieces` (No of Pieces RCP) and `grossWeight` (Gross Weight). Both the **scanned** path (`extractVisionMeta`) and the **text** path (`supplementCurrencyFretViaVision`) extract them — the supplement now runs for virtually every text-based MAWB (pieces/weight aren't reliably in the flattened text), so the cross-check works for text MAWBs too, not just scanned ones.
+- `electron/main.js`:
+  - Scan extracts + persists `mawbNbrPieces` / `mawbGrossWeight` for **any** LTA that has a MAWB (one Vision call returns shipper/currency/fret too — those are still only used by partiels).
+  - New `computeMawbVsManifestMismatch()` compares manifest `nombreContenant`/`poidTotal` vs MAWB pieces/weight (colis exact, poids rounded), returning a clear French message (e.g. *"Incohérence manifeste / MAWB sur le nombre de colis (manifeste 121 ≠ MAWB 120). Vérifiez les documents avant de lancer."*); only when MAWB values are known.
+  - Each scanned ach carries `mawbMismatch` (+ `mawbNbrPieces`/`mawbGrossWeight`). Blocked (phase `error`) before any BADR/Portnet work in **both** flows: `runPartielDumFlow` (partiels) and `prepareLotAndWeightCheck` (non-partiels).
+- `src/ui/components/AcheminementCard.jsx`: red banner shows `ach.mawbMismatch`, and "Lancer" is disabled while a mismatch exists (not partiel-gated).
+
+**Files changed:** `src/utils/mawbShipperExtract.js`, `electron/main.js`, `src/ui/components/AcheminementCard.jsx`
+
+---
+
 ## 2026-06-24 — MAWB: fix Total Prepaid (fret) extraction returning null
 
 **Problem:** On a scanned MAWB whose prepaid total (155068.89 = weight 143258.89 + other charges due carrier 11810.00) is printed just below/outside the literal "Total Prepaid" cell, Gemini Vision returned `fret=null`. Cause: the prompt said *"the value in the 'Total Prepaid' box … if the box is blank or zero, return null"* — so the model saw the cell as blank and returned null.
@@ -27,6 +53,17 @@ _Format: `## YYYY-MM-DD — <title>`_
 - Bypasses the old `fac_*` compress cache (re-prepares from the raw manifest each run), so the stale oversized cache is ignored.
 
 **Files changed:** `src/badr/badrDumNormalPartiel.js`
+
+**Follow-up (2026-06-25):** the new upload used `setInputFiles(path)`, which sends the temp file's name (`manifest_resaved_<ts>_Manifeste ….pdf`, 57 chars) → BADR rejected it (*"le nom du fichier ne doit pas dépasser 50 caractères"*). Fixed `_uploadPreparedDoc` to upload from a **buffer** with the clean original-based name (`displayName`, e.g. `Manifeste 235-98082924.pdf`), clamped to 50 chars — same buffer+name approach the Portnet annexe uses.
+
+**Follow-up 2 (2026-06-25):** three more fixes in `badrDumNormalPartiel.js`:
+- **Référence not committed** → BADR error *"Veuillez saisir la référence du document annexe."* Two layered causes: (a) the hardcoded JSF id (`j_id_3p_25r…`) was stale (live `j_id_3p_26c…`) and an unscoped label XPath matched a "Référence" field in another tab → now **scoped to the annexe form** (`//*[@id="mainTab:form7"]//tr[td//label[="Référence"]]//input`, fallback `#mainTab:form7 input[maxlength="10"]:not([id*="date"])`); (b) even once the right field was filled (read-back confirmed `"fac"`), the auto-upload re-rendered the panel from the server bean and wiped it — because `.fill()` fires only `input`, never `change`, so PrimeFaces' on-change AJAX never committed the value. A programmatic `.blur()` doesn't fire `change` either. Fix: **dispatch a real `change` event** (+ blur) and wait ~1.2 s for the commit AJAX before selecting the file. Fills `"fac"` (FACTURE) / `"LTA"` (TITRE).
+
+**Follow-up 3 (2026-06-25):** that change accidentally added `await refInput.click()` before the fill, which scroll-looped for the full 120 s action timeout (BADR's huge layout made the input an unstable click target).
+
+**Follow-up 4 (2026-06-25):** reworked the Référence step to mirror a proven Selenium implementation of this exact BADR form — a **retry loop (×3)** that re-locates the field across 3 scoped selectors (form7 label-row → label→sibling-cell → `mainTab:form7:j_id…[maxlength=10]:not([disabled])`), **types with real keystrokes** (`pressSequentially`, PrimeFaces-friendly) instead of `.fill()`, dispatches `change`+blur, and **verifies the value stuck** (`inputValue() === reference`) before moving on — throwing if all attempts fail. No `.click()` (avoids the scroll-loop).
+- **Upload timeout** → waits for the `ui-blockui` "Traitement en cours…" spinner to clear (≤45 s) and extends the row-appears check to 30 s (a 2 MB upload exceeded the old 15 s).
+- **Manifest caching** → `_addManifestFacture` now caches prepared parts in `<LTA>/compress/` and reuses them when fresh (≤2 MB, valid, newer than source), mirroring the DS Combiné non-partiel flow — a retry no longer re-saves/re-compresses (saves ~28 s + API quota).
 
 ---
 
