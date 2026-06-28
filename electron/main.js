@@ -554,7 +554,10 @@ async function prepareLotAndWeightCheck(acheminement) {
       String(poidsInfo.nombreContenants || "").replace(/\D/g, ""),
       10,
     );
-    const colisUser = parseInt(String(nombreMerged || "").replace(/\D/g, ""), 10);
+    const colisUser = parseInt(
+      String(nombreMerged || "").replace(/\D/g, ""),
+      10,
+    );
     if (!isNaN(colisBadr) && !isNaN(colisUser) && colisBadr !== colisUser) {
       const error = `Nombre de colis différent (BADR=${colisBadr}, saisie=${colisUser}) — rectification requise`;
       updateAutomationState(folderPath, {
@@ -574,7 +577,7 @@ async function prepareLotAndWeightCheck(acheminement) {
           `Merci de rectifier le nombre de colis a propos LTA ${resolvedRef} [${id}].\n\n` +
           `Nombre trouvé dans BADR : ${colisBadr}\n` +
           `Nombre saisi : ${colisUser}\n\n` +
-          `-- MedAfrica Automation`,
+          `-- MedAfrica --`,
       }).catch(() => {});
       sendProgress(id, "error", { error });
       return { success: false, error };
@@ -613,7 +616,7 @@ async function prepareLotAndWeightCheck(acheminement) {
             `Poids BADR : ${poidsBadr} kg\n` +
             `Poids saisi : ${poidsUser} kg\n` +
             `Écart : ${diff.toFixed(2)} kg\n\n` +
-            `Merci de vérifier.\n\n-- MedAfrica Automation`,
+            `Merci de vérifier.\n\n-- MedAfrica --`,
           attachments: captured ? [{ path: shotPath }] : [],
         }).catch(() => {});
       };
@@ -896,13 +899,13 @@ async function finalizeAcceptedOnBadr(acheminement, badrRef) {
     });
 
     // Email the downloaded DS PDF to the configured recipients.
-    const dsRef = lotReference || badrRef;
+    const dsRef = extractLtaRefFromFolderName(folderName) || lotReference || badrRef;
     await sendNotification({
-      subject: `${id} — ${dsRef}`,
+      subject: buildAcheminementSubject(folderName, "DS Combinée", dsRef),
       text:
         `Bonjour,\n\n` +
-        `Veuillez trouver ci-joint la déclaration DS (entrée marchandise) pour ${id} (référence ${dsRef}).\n\n` +
-        `-- MedAfrica Automation`,
+        `Veuillez trouver ci-joint la déclaration DS Combinée (entrée marchandise) pour la LTA N° ${dsRef}.\n\n` +
+        `-- MedAfrica --`,
       attachments: dsPdfPath ? [{ path: dsPdfPath }] : [],
     }).catch(() => {});
 
@@ -1129,17 +1132,14 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
           const submittedAtMs = state.submittedAt
             ? Date.parse(state.submittedAt)
             : null;
-          if (
-            submittedAtMs &&
-            Date.now() - submittedAtMs >= 30 * 60 * 1000
-          ) {
+          if (submittedAtMs && Date.now() - submittedAtMs >= 30 * 60 * 1000) {
             const ref = state.portnetRef || ach.refNumber || "";
             await sendNotification({
               subject: `${ach.id} — ${ref} — En cours validation Portnet`,
               text:
                 `En cours validation portnet\n\n` +
                 `LTA : ${ach.id}\nRéférence : ${ref}\n\n` +
-                `-- MedAfrica Automation`,
+                `-- MedAfrica --`,
             }).catch(() => {});
             updateAutomationState(ach.folderPath, { pendingEmailSent: true });
             sendLog(
@@ -1385,6 +1385,17 @@ async function runPartielDumFlow(acheminement) {
     sendLog("warn", "MAWB", `[${id}] ${mawbMismatch} — traitement bloqué`);
     sendProgress(id, "error", { error: mawbMismatch });
     return { success: false, error: mawbMismatch };
+  }
+
+  // Block if the MAWB freight wasn't confidently extracted and the operator
+  // hasn't typed it — never submit a guessed customs freight value.
+  if (!String(acheminement.fretValue || "").trim()) {
+    const error =
+      "Valeur fret MAWB manquante (non vérifiée automatiquement) — saisissez-la manuellement avant de lancer.";
+    updateAutomationState(folderPath, { phase: "error", error });
+    sendLog("warn", "MAWB", `[${id}] ${error}`);
+    sendProgress(id, "error", { error });
+    return { success: false, error };
   }
 
   try {
@@ -1808,6 +1819,27 @@ function parseScellesFromFolderName(name) {
   return { scelle1: m[1], scelle2: m[2] };
 }
 
+// The LTA reference inside a folder name like
+// "2EME 13458331-13458332 — 72-74340954" → the LAST "<digits>-<digits>" group
+// (the LTA ref comes after the scellés). Returns "" when there is none.
+function extractLtaRefFromFolderName(name) {
+  const matches = String(name || "").match(/\d+-\d+/g);
+  return matches && matches.length ? matches[matches.length - 1] : "";
+}
+
+// Build an email subject from the folder name + declaration type, e.g.
+// "2éme acheminement DS Combinée LTA N° 72-74340954". Uses only the acheminement
+// rank and the LTA reference — never scellés or DS series.
+function buildAcheminementSubject(folderName, typeLabel, ref) {
+  const m = String(folderName || "").match(/^\s*(\d+)/);
+  const n = m ? parseInt(m[1], 10) : null;
+  const ordinal =
+    n != null
+      ? `${n}${n === 1 ? "er" : "éme"} acheminement`
+      : String(folderName || "").trim();
+  return `${ordinal} ${typeLabel} LTA N° ${ref}`;
+}
+
 // Cross-check the manifest's pieces/weight against the MAWB's (No of Pieces RCP
 // / Gross Weight). Returns a clear French message when they differ, else null.
 // Only compares when the MAWB values are known (scanned MAWB → Gemini Vision).
@@ -1984,15 +2016,21 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
           const patch = {};
           if (meta.shipperName) patch.shipperName = meta.shipperName;
           if (meta.mawbCurrency) patch.mawbCurrency = meta.mawbCurrency;
-          if (meta.fretValue) patch.fretValue = meta.fretValue;
+          // Freight: only auto-fill when the Total Prepaid was confidently
+          // reconciled (printed total ≈ sum of charges). Otherwise leave it empty
+          // and flag it — a partiel LTA then can't run until it's filled manually.
+          if (meta.fretValue && meta.fretConfident)
+            patch.fretValue = meta.fretValue;
+          patch.fretUncertain = !meta.fretConfident;
           // MAWB pieces/weight — used to cross-check against the manifest.
           if (meta.nbrPieces != null) patch.mawbNbrPieces = meta.nbrPieces;
-          if (meta.grossWeight != null) patch.mawbGrossWeight = meta.grossWeight;
+          if (meta.grossWeight != null)
+            patch.mawbGrossWeight = meta.grossWeight;
           writeAcheminementFile(dirPath, { ...current, ...patch });
           sendLog(
             "info",
             "MAWB",
-            `[${entry.name}] ✓ Extrait: expéditeur="${meta.shipperName}" devise=${meta.mawbCurrency} fret=${meta.fretValue} colis=${meta.nbrPieces} poids=${meta.grossWeight}`,
+            `[${entry.name}] ✓ Extrait: expéditeur="${meta.shipperName}" devise=${meta.mawbCurrency} fret=${meta.fretValue ?? "—"} (confiance=${meta.fretConfident}) colis=${meta.nbrPieces} poids=${meta.grossWeight}`,
           );
         } else {
           sendLog(
@@ -2096,6 +2134,8 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
       partiels: saved.partiels ?? null,
       mawbNbrPieces: saved.mawbNbrPieces ?? null,
       mawbGrossWeight: saved.mawbGrossWeight ?? null,
+      // Freight couldn't be confidently reconciled from the MAWB → must be typed.
+      fretUncertain: saved.fretUncertain ?? false,
       // Flag a manifest-vs-MAWB pieces/weight discrepancy (all LTAs) so the card
       // shows it and the run is blocked. Null when MAWB metrics are unknown.
       mawbMismatch: computeMawbVsManifestMismatch({
@@ -2301,11 +2341,14 @@ ipcMain.handle(
       return failWaiting("Numéros de scellés manquants");
     }
 
-    // Parse the user-entered combined serie, e.g. "12345S" or "12345 S"
-    // (digits + optional space + the BADR-assigned letter "clé").
-    const trimmed = signedSerie.trim();
-    const withLetter = trimmed.match(/^(\d+)\s*([A-Za-z])$/);
-    const digitsOnly = trimmed.match(/^(\d+)$/);
+    // Normalize the user-entered signed serie: strip ALL whitespace anywhere
+    // (spaces, tabs, newlines, non-breaking spaces), then split into digits +
+    // optional trailing letter. Accepts "12847 F", "12847F", "0012847 F",
+    // "0012847F", "12847\nF", even "12 847 F". Leading zeros are dropped below
+    // via parseInt; the letter is uppercased.
+    const cleaned = String(signedSerie || "").replace(/\s+/g, "");
+    const withLetter = cleaned.match(/^(\d+)([A-Za-z])$/);
+    const digitsOnly = cleaned.match(/^(\d+)$/);
 
     let serie;
     let cle;
@@ -2356,13 +2399,13 @@ ipcMain.handle(
 
       // Email the DUM Normale Partiel PDF (saved during run, path kept in state).
       const dumPdfPath = getAutomationState(folderPath)?.pdfPath;
-      const dumRef = saved.refNumber || `${serie} ${cle}`;
+      const dumRef = extractLtaRefFromFolderName(id) || saved.refNumber || "";
       await sendNotification({
-        subject: `${id} — ${dumRef}`,
+        subject: buildAcheminementSubject(id, "Dum Normale", dumRef),
         text:
           `Bonjour,\n\n` +
-          `Veuillez trouver ci-joint le DUM Normale Partiel pour ${id} (référence ${dumRef}).\n\n` +
-          `-- MedAfrica Automation`,
+          `Veuillez trouver ci-joint le DUM Normale Partiel pour la LTA N° ${dumRef}.\n\n` +
+          `-- MedAfrica --`,
         attachments: dumPdfPath ? [{ path: dumPdfPath }] : [],
       }).catch(() => {});
 

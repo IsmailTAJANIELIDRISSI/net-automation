@@ -29,6 +29,51 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-28 — Signed-serie input: strip all whitespace before parsing
+
+Hardened the `automation:declare-scelles-partiel` serie parse: instead of `trim()` + `\s*` (only handled whitespace between the number and letter), it now removes ALL whitespace anywhere (`replace(/\s+/g, "")`) before matching `^(\d+)([A-Za-z])$`. So `"12847 F"`, `"12847F"`, `"0012847 F"`, `"0012847F"`, `"12847\nF"`, `"12 847 F"`, `"  12847f  "` all normalize to serie `12847` / clé `F` (leading zeros dropped, letter uppercased). Digits-only still falls back to the previously-validated `dumCle`. The letter is always the one the user typed — never a stale value.
+
+**Files changed:** `electron/main.js`
+
+---
+
+## 2026-06-28 — Success-email subjects normalised (rank + type + LTA ref)
+
+**Need:** Success emails used `"<FOLDER> — <ds-series>"` (e.g. `3EME 13458333-13458334 — 3526 M`), leaking scellés + DS series. Wanted: `"<N>éme acheminement DS Combinée LTA N° <ref>"` (non-partiel) / `"… Dum Normale LTA N° <ref>"` (partiel) — only the acheminement rank, type, and LTA reference.
+
+**Implementation (`electron/main.js`):**
+- `extractLtaRefFromFolderName()` — the LAST `<digits>-<digits>` group in the folder name (the LTA ref comes after the scellés), e.g. `2EME 13458331-13458332 — 72-74340954` → `72-74340954`.
+- `buildAcheminementSubject(folderName, typeLabel, ref)` → `"<N>éme acheminement <type> LTA N° <ref>"` (1 → "1er"). No scellés / series.
+- DS success email (`finalizeAcceptedOnBadr`) → type "DS Combinée". DUM partiel email (`declare-scelles-partiel`) → type "Dum Normale". Ref prefers the folder-name LTA ref, falling back to `lotReference`/`refNumber`.
+
+**Files changed:** `electron/main.js`
+
+---
+
+## 2026-06-27 — Card shows the error message (colis mismatch et al.)
+
+The manifest-vs-BADR **nombre de colis** check already existed (`prepareLotAndWeightCheck`: compares `poidsInfo.nombreContenants` from the préapurement `nbrContenantLotId` span vs the LTA's count → on mismatch sets phase `error`, emails "Merci de rectifier le nombre de colis…", and stops before Portnet). But the card only showed a generic red "↺ Réessayer" without the reason. Added a red message banner on the card for any error status (`isError && error`) — driven by the progress payload live and by `automationState.error` after a re-scan (already carried by `statusesFromScan`). So colis/weight/any blocking error now shows its message on the LTA card.
+
+**Files changed:** `src/ui/components/AcheminementCard.jsx`
+
+---
+
+## 2026-06-26 — MAWB freight: reconcile Total Prepaid, block when uncertain
+
+**Problem:** On hand-filled/scanned MAWBs the "Total Prepaid" is often misplaced or misread, so the extractor grabbed a partial figure (e.g. 130860.89 instead of 142083.09 = 130860.89 + 11222.20). A wrong freight value feeds a Moroccan customs declaration — unacceptable to guess.
+
+**Solution — arithmetic reconciliation, not blind trust:**
+- `src/utils/mawbShipperExtract.js`: both Vision prompts (`extractVisionMeta` scanned + `supplementCurrencyFretViaVision` text) now return **`total_prepaid`** (printed) AND **`charges_sum`** (sum of the prepaid charge lines). New `reconcileFret()` trusts the freight only when the two agree (≈ within 0.5 %), returning `{ fretValue, fretConfident }` — `fretValue` is **null** (→ manual entry) on any mismatch/unreadable case. The unverified regex Total-Prepaid is no longer used as the freight.
+- `electron/main.js`: scan persists `fretValue` only when `fretConfident`, and sets `fretUncertain = !fretConfident`. `runPartielDumFlow` **blocks** (phase `error`) when a partiel LTA has no freight value typed.
+- `src/ui/requiredFields.js`: partiel LTAs now require `fretValue` (empty → "Lancer" disabled, batch skips).
+- `src/ui/components/AcheminementCard.jsx`: amber banner on partiel LTAs when the freight is uncertain and still empty — prompting manual entry.
+
+**Net:** clean MAWBs auto-fill; the common "displaced total" case auto-fills *only* if the printed total still reconciles with the charge sum; genuinely ambiguous ones stop and require the operator to type the freight rather than submitting a wrong value.
+
+**Files changed:** `src/utils/mawbShipperExtract.js`, `electron/main.js`, `src/ui/requiredFields.js`, `src/ui/components/AcheminementCard.jsx`
+
+---
+
 ## 2026-06-25 — Cross-check manifest pieces/weight against the MAWB (all LTAs)
 
 **Need:** Catch data discrepancies before processing — the manifest's piece count / gross weight must match the MAWB's "No of Pieces RCP" / "Gross Weight". Applies to **every** LTA (not only partiels).

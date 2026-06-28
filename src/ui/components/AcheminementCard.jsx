@@ -130,6 +130,17 @@ export default function AcheminementCard({
         </div>
       )}
 
+      {/* ── Uncertain MAWB freight (partiel) — must be typed manually ──────── */}
+      {ach.partiel && ach.fretUncertain && !String(ach.fretValue ?? "").trim() && (
+        <div className="flex items-start gap-2 bg-amber-900/30 border border-amber-700/50 rounded-lg px-3 py-2">
+          <span className="text-amber-300 text-xs font-semibold leading-snug">
+            ⚠️ Valeur fret MAWB non vérifiée (Total Prepaid mal placé ou illisible
+            sur le MAWB) — vérifiez le document et saisissez-la manuellement
+            ci-dessous avant de lancer.
+          </span>
+        </div>
+      )}
+
       {/* ── Ref mismatch warning ────────────────────────────────────────── */}
       {ach.refMismatch && (
         <div className="flex flex-col gap-2 bg-red-900/40 border border-red-700/60 rounded-lg px-3 py-2">
@@ -361,6 +372,11 @@ export default function AcheminementCard({
         </div>
       ) : (
         <>
+          {isError && error && (
+            <p className="text-[11px] text-red-400 bg-red-900/20 border border-red-700/40 rounded px-2 py-1 leading-snug">
+              ⚠ {error}
+            </p>
+          )}
           {hasMissingRequired && !isRunning && (
             <p className="text-[11px] text-amber-400 bg-amber-900/20 border border-amber-700/40 rounded px-2 py-1">
               ⚠ Champs obligatoires manquants : {missingRequired.join(", ")}

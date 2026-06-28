@@ -246,9 +246,43 @@ OUTPUT FORMAT (exact JSON, no markdown fences):
 }
 
 /**
+ * Reconcile the MAWB Total Prepaid: the printed total and the summed prepaid
+ * charge lines must agree. Hand-filled scans often misplace/misread the total,
+ * so we only TRUST the freight when the two cross-check (≈ within 0.5 %).
+ * Returns { fretValue, fretConfident } — fretValue is null when unsure, which
+ * forces manual entry. For a customs figure, "unsure → ask the human" is safer
+ * than guessing.
+ */
+function reconcileFret(totalRaw, sumRaw, log = () => {}) {
+  const num = (v) => {
+    if (v == null) return null;
+    const s = String(v).replace(/[^\d.]/g, ""); // strip currency code / commas
+    if (!s) return null;
+    const n = parseFloat(s);
+    return isNaN(n) ? null : n;
+  };
+  const total = num(totalRaw);
+  const sum = num(sumRaw);
+  if (total != null && sum != null) {
+    const tol = Math.max(1, Math.max(total, sum) * 0.005); // 0.5 % or 1 unit
+    if (Math.abs(total - sum) <= tol) {
+      return { fretValue: total.toFixed(2), fretConfident: true };
+    }
+    log(
+      `Fret INCERTAIN: total imprimé (${total}) ≠ somme des charges (${sum}) — saisie manuelle requise`,
+    );
+    return { fretValue: null, fretConfident: false };
+  }
+  log(
+    `Fret non vérifiable (total=${total ?? "?"}, somme=${sum ?? "?"}) — saisie manuelle requise`,
+  );
+  return { fretValue: null, fretConfident: false };
+}
+
+/**
  * Scanned-PDF fallback: send raw PDF bytes to Gemini Vision.
- * Extracts shipper name, currency, AND total prepaid in ONE call.
- * Returns { shipperName, mawbCurrency, fretValue } — any field may be null.
+ * Extracts shipper name, currency, total prepaid, pieces and weight in ONE call.
+ * Returns { shipperName, mawbCurrency, fretValue, fretConfident, nbrPieces, grossWeight }.
  */
 async function extractVisionMeta(pdfPath, knownCompanies, log) {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -256,7 +290,7 @@ async function extractVisionMeta(pdfPath, knownCompanies, log) {
     log(
       "PDF scanné détecté mais GEMINI_API_KEY absent — impossible d'utiliser la vision IA",
     );
-    return { shipperName: null, mawbCurrency: null, fretValue: null, nbrPieces: null, grossWeight: null };
+    return { shipperName: null, mawbCurrency: null, fretValue: null, fretConfident: false, nbrPieces: null, grossWeight: null };
   }
 
   let genai;
@@ -264,7 +298,7 @@ async function extractVisionMeta(pdfPath, knownCompanies, log) {
     genai = require("@google/genai");
   } catch {
     log("@google/genai non installé — vision IA ignorée");
-    return { shipperName: null, mawbCurrency: null, fretValue: null, nbrPieces: null, grossWeight: null };
+    return { shipperName: null, mawbCurrency: null, fretValue: null, fretConfident: false, nbrPieces: null, grossWeight: null };
   }
 
   const client = new genai.GoogleGenAI({ apiKey });
@@ -281,15 +315,16 @@ async function extractVisionMeta(pdfPath, knownCompanies, log) {
 
 2. CURRENCY — the 3-letter currency code in the "Currency" field (e.g. CNY, USD, HKD, EUR).
 
-3. TOTAL PREPAID — the total PREPAID charges, printed at the bottom-left of the charges
-   grid. It equals the prepaid Weight Charge total plus Valuation Charge, Tax, Total Other
-   Charges Due Agent and Total Other Charges Due Carrier (e.g. weight 143258.89 + other
-   charges due carrier 11810.00 = 155068.89). The figure is shown in — or just below/next
-   to — the "Total Prepaid" cell; READ that printed number, do NOT treat the cell as blank
-   just because the amount sits slightly outside its borders.
-   - Return a plain number with the decimal point, no thousands separators, no currency code
-     (e.g. "155068.89").
-   - Return null ONLY for a fully "collect" shipment where no prepaid amount is printed.
+3. TOTAL PREPAID — return TWO numbers so they can be cross-checked (hand-filled scans
+   often misplace/misread the total):
+   a) "total_prepaid": the printed Total Prepaid figure at the bottom-left of the charges
+      grid (in, or just below/next to, the "Total Prepaid" cell — read it even if it sits
+      slightly outside the cell).
+   b) "charges_sum": add up EVERY prepaid charge line you can read — Weight Charge +
+      Valuation Charge + Tax + Total Other Charges Due Agent + Total Other Charges Due
+      Carrier — and return that exact sum (e.g. 130860.89 + 11222.20 = 142083.09).
+   Both as plain numbers with the decimal point, no thousands separators, no currency code.
+   Use null for a value you genuinely cannot read, or for a fully "collect" shipment.
 
 4. NO OF PIECES — the integer in the "No. of Pieces RCP" column of the cargo line, at the
    bottom-left of the goods table (e.g. 121). Plain integer, no other text.
@@ -301,7 +336,8 @@ Respond in this EXACT JSON (no markdown fences):
 {
   "shipper_name": "COMPANY NAME OR null",
   "currency": "CNY",
-  "total_prepaid": "131555.40",
+  "total_prepaid": "142083.09",
+  "charges_sum": "142083.09",
   "no_of_pieces": "121",
   "gross_weight": "2311"
 }`;
@@ -347,15 +383,21 @@ Respond in this EXACT JSON (no markdown fences):
       }
 
       const parsed = JSON.parse(responseText);
+      const { fretValue, fretConfident } = reconcileFret(
+        parsed.total_prepaid,
+        parsed.charges_sum,
+        log,
+      );
       const result = {
         shipperName: parsed.shipper_name || null,
         mawbCurrency: parsed.currency || null,
-        fretValue: parsed.total_prepaid || null,
+        fretValue,
+        fretConfident,
         nbrPieces: parsed.no_of_pieces || null,
         grossWeight: parsed.gross_weight || null,
       };
       log(
-        `Gemini Vision résultat: expéditeur="${result.shipperName}" devise=${result.mawbCurrency} fret=${result.fretValue} colis=${result.nbrPieces} poids=${result.grossWeight}`,
+        `Gemini Vision résultat: expéditeur="${result.shipperName}" devise=${result.mawbCurrency} fret=${result.fretValue} (confiance=${result.fretConfident}) colis=${result.nbrPieces} poids=${result.grossWeight}`,
       );
       return result;
     } catch (e) {
@@ -365,7 +407,7 @@ Respond in this EXACT JSON (no markdown fences):
   }
 
   log(`Tous les modèles Gemini Vision ont échoué: ${lastError?.message}`);
-  return { shipperName: null, mawbCurrency: null, fretValue: null, nbrPieces: null, grossWeight: null };
+  return { shipperName: null, mawbCurrency: null, fretValue: null, fretConfident: false, nbrPieces: null, grossWeight: null };
 }
 
 // ── Currency / fret extraction for text-based PDFs ────────────────────────────
@@ -417,7 +459,7 @@ function extractMetaFromText(text, log) {
 /**
  * Supplemental Gemini Vision call used when the text regex couldn't find the
  * currency/fret (and to read pieces/weight, which the text layout rarely yields).
- * Returns { mawbCurrency, fretValue, nbrPieces, grossWeight }.
+ * Returns { mawbCurrency, fretValue, fretConfident, nbrPieces, grossWeight }.
  */
 async function supplementCurrencyFretViaVision(pdfPath, log) {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -446,25 +488,25 @@ async function supplementCurrencyFretViaVision(pdfPath, log) {
   const client = new genai.GoogleGenAI({ apiKey });
   const pdfBase64 = fs.readFileSync(pdfPath).toString("base64");
 
-  const prompt = `This is an Air Waybill (MAWB). Extract exactly four values:
+  const prompt = `This is an Air Waybill (MAWB). Extract these values:
 1. CURRENCY — the 3-letter ISO code in the "Currency" column (e.g. CNY, USD, TWD, HKD).
-2. TOTAL PREPAID — the total PREPAID charges at the bottom-left of the charges grid. It
-   equals the prepaid Weight Charge total plus Valuation Charge, Tax and Total Other Charges
-   (Due Agent + Due Carrier) — e.g. 143258.89 + 11810.00 = 155068.89. It is shown in, or just
-   below/next to, the "Total Prepaid" cell; READ that printed number even if it sits slightly
-   outside the cell — do not call it blank.
-   STRICT RULES for the number:
-   - Strip any currency code prefix (e.g. "TWD575,770.00" → "575770.00").
-   - Remove ALL thousands-separator commas (e.g. "575,770.00" → "575770.00").
-   - KEEP the decimal point and exactly 2 decimal places (e.g. "575770.00", NOT "57577000").
-   - Return null ONLY for a fully "collect" shipment with no prepaid amount printed.
+2. TOTAL PREPAID — return TWO numbers so they can be cross-checked (hand-filled scans often
+   misplace/misread the total):
+   a) "total_prepaid": the printed Total Prepaid figure at the bottom-left of the charges grid
+      (in, or just below/next to, the "Total Prepaid" cell — read it even if slightly outside).
+   b) "charges_sum": add up EVERY prepaid charge line you can read — Weight Charge + Valuation
+      Charge + Tax + Total Other Charges Due Agent + Total Other Charges Due Carrier — and
+      return that exact sum (e.g. 130860.89 + 11222.20 = 142083.09).
+   STRICT for BOTH numbers: strip currency-code prefixes, remove thousands-separator commas,
+   keep the decimal point and 2 decimals (e.g. "575770.00", NOT "57577000"). Use null for a
+   value you cannot read, or for a fully "collect" shipment.
 3. NO OF PIECES — the integer in the "No. of Pieces RCP" column of the cargo line (e.g. 121).
    Plain integer, no other text.
 4. GROSS WEIGHT — the number in the "Gross Weight" column of the cargo line (e.g. 2311).
    Plain number, no unit ("kg"), no thousands separators.
 
 Respond ONLY in this exact JSON (no markdown):
-{"currency": "TWD", "total_prepaid": "575770.00", "no_of_pieces": "121", "gross_weight": "2311"}`;
+{"currency": "TWD", "total_prepaid": "142083.09", "charges_sum": "142083.09", "no_of_pieces": "121", "gross_weight": "2311"}`;
 
   for (const modelName of GEMINI_MODEL_FALLBACKS) {
     try {
@@ -503,25 +545,20 @@ Respond ONLY in this exact JSON (no markdown):
         responseText = s !== -1 ? responseText.slice(s, e) : responseText;
       }
       const parsed = JSON.parse(responseText);
-      // Strip thousands-separator commas so the UI receives a plain decimal.
-      // Also guard against Gemini returning an integer without decimal (e.g. "57577000"
-      // instead of "575770.00") by detecting values that look like they lost their
-      // decimal point: any integer with ≥ 5 digits where the last two should be cents.
-      const rawFret = parsed.total_prepaid || null;
-      let fretValue = rawFret ? String(rawFret).replace(/,/g, "") : null;
-      if (fretValue && /^\d+$/.test(fretValue) && fretValue.length >= 5) {
-        // Gemini dropped the decimal point — reinsert before last 2 digits.
-        fretValue = `${fretValue.slice(0, -2)}.${fretValue.slice(-2)}`;
-        log(`Fret: décimale manquante détectée — corrigé en ${fretValue}`);
-      }
+      const { fretValue, fretConfident } = reconcileFret(
+        parsed.total_prepaid,
+        parsed.charges_sum,
+        log,
+      );
       const result = {
         mawbCurrency: parsed.currency || null,
         fretValue,
+        fretConfident,
         nbrPieces: parsed.no_of_pieces || null,
         grossWeight: parsed.gross_weight || null,
       };
       log(
-        `Complément Vision: devise=${result.mawbCurrency} fret=${result.fretValue} colis=${result.nbrPieces} poids=${result.grossWeight}`,
+        `Complément Vision: devise=${result.mawbCurrency} fret=${result.fretValue} (confiance=${result.fretConfident}) colis=${result.nbrPieces} poids=${result.grossWeight}`,
       );
       return result;
     } catch (e) {
@@ -591,22 +628,28 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
     .map((l) => l.trim())
     .filter((l) => l.length > 3);
 
-  // Extract currency and fret value via regex first
-  let { mawbCurrency, fretValue } = extractMetaFromText(text, log);
+  // Currency via regex; the regex Total Prepaid is a single UNVERIFIED read, so
+  // it is NOT trusted for the freight (customs figure) — the Vision reconciliation
+  // below is the source of truth for fretValue.
+  let { mawbCurrency } = extractMetaFromText(text, log);
+  let fretValue = null;
+  let fretConfident = false;
   let nbrPieces = null;
   let grossWeight = null;
 
-  // Supplement with a Vision call when the regex missed currency/fret OR to read
-  // the pieces/weight (text MAWBs rarely expose those cleanly, so this runs for
-  // virtually every text-based MAWB — needed for the manifest cross-check).
-  if (!mawbCurrency || !fretValue || nbrPieces == null || grossWeight == null) {
-    log(
-      `Régex incomplet (devise=${mawbCurrency ?? "null"}, fret=${fretValue ?? "null"}) — complément Gemini Vision`,
-    );
+  // Always cross-check the freight + read pieces/weight via Vision (text layout
+  // rarely yields a verifiable Total Prepaid). fretValue stays null unless the
+  // total↔charges-sum reconciliation is confident → uncertain MAWBs require
+  // manual entry instead of a silently-wrong customs value.
+  {
+    log("Complément Gemini Vision (fret vérifié + colis/poids)…");
     const supplement = await supplementCurrencyFretViaVision(pdfPath, log);
     if (!mawbCurrency && supplement.mawbCurrency)
       mawbCurrency = supplement.mawbCurrency;
-    if (!fretValue && supplement.fretValue) fretValue = supplement.fretValue;
+    if (supplement.fretConfident) {
+      fretValue = supplement.fretValue;
+      fretConfident = true;
+    }
     if (supplement.nbrPieces != null) nbrPieces = supplement.nbrPieces;
     if (supplement.grossWeight != null) grossWeight = supplement.grossWeight;
   }
@@ -654,7 +697,7 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
 
     const shipperName = await resolveCandidate(candidates, knownCompanies, log);
     if (shipperName)
-      return { shipperName, mawbCurrency, fretValue, nbrPieces, grossWeight };
+      return { shipperName, mawbCurrency, fretValue, fretConfident, nbrPieces, grossWeight };
   }
 
   log(
@@ -667,11 +710,11 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
 
   if (candidates.length === 0) {
     log("Aucun candidat societe trouve — retour null");
-    return { shipperName: null, mawbCurrency, fretValue, nbrPieces, grossWeight };
+    return { shipperName: null, mawbCurrency, fretValue, fretConfident, nbrPieces, grossWeight };
   }
 
   const shipperName = await resolveCandidate(candidates, knownCompanies, log);
-  return { shipperName, mawbCurrency, fretValue, nbrPieces, grossWeight };
+  return { shipperName, mawbCurrency, fretValue, fretConfident, nbrPieces, grossWeight };
 }
 
 /** Backward-compat wrapper — returns just the shipper name string. */
