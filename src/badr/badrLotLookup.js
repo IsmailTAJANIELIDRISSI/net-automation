@@ -477,7 +477,7 @@ class BADRLotLookup {
           ``,
           `Merci de vérifier manuellement ou de relancer l'automatisation ultérieurement.`,
           ``,
-          `-- MedAfrica DS Combinée Automation`,
+          `-- MedAfrica DS Combinée --`,
         ].join("\n"),
       });
       log.info(`Email notification sent for "${lotReference}"`);

@@ -138,12 +138,26 @@ class BADRDumNormalPartiel {
         badrConn,
       );
       if (result.mismatch) {
-        log.warn(
-          `TODOMAIL — poids mismatch > 1 kg for "${ach.id}": ${result.errorMessage}`,
-        );
+        // waiting_vol = colis sum ≠ manifest (more flights to come);
+        // poids = colis OK but weight differs. main.js reads `poidsMismatch`
+        // from the state to send the right email + screenshot.
+        const phase =
+          result.kind === "waiting_vol"
+            ? "partiel_waiting_lots"
+            : "partiel_poids_mismatch";
+        log.warn(`Step 5 — ${result.errorMessage} (${result.kind})`);
         updateState({
-          phase: "partiel_poids_mismatch",
+          phase,
           errorMessage: result.errorMessage,
+          poidsMismatch: {
+            kind: result.kind,
+            nextVol: result.nextVol ?? null,
+            totalPoids: result.totalPoids,
+            totalNbr: result.totalNbr,
+            expectedPoids: result.expectedPoids,
+            expectedNbr: result.expectedNbr,
+            screenshotPath: result.screenshotPath ?? null,
+          },
         });
         throw new Error(result.errorMessage);
       }
@@ -689,16 +703,39 @@ class BADRDumNormalPartiel {
     );
     const expectedNbr = parseInt(String(ach.nombreContenant || "0"), 10);
     const poidsDiff = Math.abs(totalPoids - expectedPoids);
+    const lotsCount = partiels.length;
+    const totals = { totalPoids, totalNbr, expectedPoids, expectedNbr };
 
-    if (poidsDiff > 1) {
-      const msg = `Poids mismatch: sum of lots=${totalPoids.toFixed(2)} kg vs manifest=${expectedPoids} kg (diff=${poidsDiff.toFixed(2)} kg)`;
-      log.error(msg);
-      return { mismatch: true, errorMessage: msg, actualPoids: totalPoids };
-    }
+    // 1. Colis check FIRST: if the lots' total nbr de contenant ≠ the manifest,
+    //    not all flights have arrived → still waiting for the next vol.
     if (expectedNbr > 0 && totalNbr !== expectedNbr) {
-      log.warn(
-        `NbrContenant mismatch: lots=${totalNbr} vs manifest=${expectedNbr}`,
-      );
+      const nextVol = lotsCount + 1;
+      const msg = `Nbre contenant lots=${totalNbr} ≠ manifeste=${expectedNbr} — en attente du ${nextVol}ème vol`;
+      log.warn(`Step 5 — ${msg}`);
+      const screenshotPath = await this._screenshotLots(iframe, ach);
+      return {
+        mismatch: true,
+        kind: "waiting_vol",
+        nextVol,
+        screenshotPath,
+        errorMessage: msg,
+        ...totals,
+      };
+    }
+
+    // 2. Colis OK → poids check.
+    if (poidsDiff > 1) {
+      const msg = `Poids différent : somme des lots=${totalPoids.toFixed(2)} kg vs manifeste=${expectedPoids} kg (écart=${poidsDiff.toFixed(2)} kg)`;
+      log.error(msg);
+      const screenshotPath = await this._screenshotLots(iframe, ach);
+      return {
+        mismatch: true,
+        kind: "poids",
+        screenshotPath,
+        errorMessage: msg,
+        actualPoids: totalPoids,
+        ...totals,
+      };
     }
 
     const poidsAdjusted = poidsDiff > 0;
@@ -712,6 +749,37 @@ class BADRDumNormalPartiel {
       totalNbr,
     });
     return { mismatch: false, actualPoids: totalPoids, poidsAdjusted };
+  }
+
+  // Screenshot the préapurement lots section (the lots datatable) to Downloads,
+  // cropped to the form3 panel; falls back to a full-page capture. Returns the
+  // saved path, or null. Used for the poids/colis mismatch notification emails.
+  async _screenshotLots(iframe, ach) {
+    const dir = path.join(os.homedir(), "Downloads");
+    const label = String(ach.refNumber || ach.id || "lots").replace(
+      /[\\/:*?"<>|]/g,
+      "_",
+    );
+    const shotPath = path.join(dir, `poid difference LTA ${label}.png`);
+    try {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const panel = iframe.locator("#mainTab\\:form3").first();
+      if (await panel.isVisible().catch(() => false)) {
+        await panel.screenshot({ path: shotPath });
+      } else {
+        await this.page.screenshot({ path: shotPath });
+      }
+      log.info(`Capture lots enregistrée: ${shotPath}`);
+      return shotPath;
+    } catch (e) {
+      log.warn(`Capture lots échouée: ${e.message}`);
+      try {
+        await this.page.screenshot({ path: shotPath });
+        return shotPath;
+      } catch {
+        return null;
+      }
+    }
   }
 
   // ── STEP 6 (6) — Documents Tab ───────────────────────────────────────────

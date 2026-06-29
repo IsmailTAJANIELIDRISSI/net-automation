@@ -571,13 +571,16 @@ async function prepareLotAndWeightCheck(acheminement) {
         "ColisCheck",
         `${error} pour ${resolvedRef} — traitement arrêté, notification envoyée`,
       );
+      const colisShot = await captureBadrPreapShot(badrConn.page, resolvedRef);
       await sendNotification({
-        subject: `Nombre de colis à rectifier — ${id} (${resolvedRef})`,
+        subject: `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${resolvedRef}`,
         text:
-          `Merci de rectifier le nombre de colis a propos LTA ${resolvedRef} [${id}].\n\n` +
+          `Bonjour,\n\n` +
+          `Merci de rectifier le nombre de colis de la LTA N° ${resolvedRef}.\n\n` +
           `Nombre trouvé dans BADR : ${colisBadr}\n` +
           `Nombre saisi : ${colisUser}\n\n` +
-          `-- MedAfrica --`,
+          `Voir la capture des lots ci-jointe.\n\n-- MedAfrica --`,
+        attachments: colisShot ? [{ path: colisShot }] : [],
       }).catch(() => {});
       sendProgress(id, "error", { error });
       return { success: false, error };
@@ -586,38 +589,26 @@ async function prepareLotAndWeightCheck(acheminement) {
     if (!isNaN(poidsBadr) && !isNaN(poidsUser)) {
       const diff = Math.abs(poidsBadr - poidsUser);
 
-      // Screenshot the préapurement page → Downloads, then email it on a mismatch.
+      // Screenshot the préapurement lots section → Downloads, then email it.
       const notifyWeightMismatch = async (kind) => {
-        const shotPath = path.join(
-          os.homedir(),
-          "Downloads",
-          `poid difference LTA ${resolvedRef}.png`,
-        );
-        let captured = false;
-        try {
-          await badrConn.page.screenshot({ path: shotPath });
-          captured = true;
+        const shotPath = await captureBadrPreapShot(badrConn.page, resolvedRef);
+        if (shotPath) {
           sendLog(
             "info",
             "WeightCheck",
             `Capture d'écran enregistrée: ${shotPath}`,
           );
-        } catch (e) {
-          sendLog(
-            "warn",
-            "WeightCheck",
-            `Capture d'écran écart poids échouée: ${e.message}`,
-          );
         }
         await sendNotification({
-          subject: `Écart de poids (${kind}) — ${id} (${resolvedRef})`,
+          subject: `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${resolvedRef}`,
           text:
-            `Écart de poids détecté pour LTA ${resolvedRef} [${id}].\n\n` +
+            `Bonjour,\n\n` +
+            `Merci de régler le poids de la LTA N° ${resolvedRef} (écart ${kind}).\n\n` +
             `Poids BADR : ${poidsBadr} kg\n` +
             `Poids saisi : ${poidsUser} kg\n` +
             `Écart : ${diff.toFixed(2)} kg\n\n` +
-            `Merci de vérifier.\n\n-- MedAfrica --`,
-          attachments: captured ? [{ path: shotPath }] : [],
+            `Voir la capture des lots ci-jointe.\n\n-- MedAfrica --`,
+          attachments: shotPath ? [{ path: shotPath }] : [],
         }).catch(() => {});
       };
 
@@ -1522,6 +1513,31 @@ async function runPartielDumFlow(acheminement) {
     sendProgress(id, "done");
     return { success: true };
   } catch (err) {
+    // Préapurement poids/colis mismatch: badrDumNormalPartiel persisted a
+    // `poidsMismatch` (with the lots screenshot) + the right phase before
+    // throwing. Email the operator once and reflect the proper card status,
+    // instead of the generic "error" state.
+    const st = getAutomationState(folderPath);
+    if (st?.poidsMismatch) {
+      await notifyPartielPoidsMismatch(id, acheminement, st);
+      if (st.poidsMismatch.kind === "waiting_vol") {
+        sendLog(
+          "warn",
+          "BADR",
+          `[${id}] ${st.errorMessage} — notification envoyée`,
+        );
+        sendProgress(id, "partiel-waiting-lots");
+        return { success: false, skipped: true, reason: "partiel_waiting_lots" };
+      }
+      sendLog(
+        "warn",
+        "WeightCheck",
+        `[${id}] ${st.errorMessage} — notification envoyée`,
+      );
+      sendProgress(id, "weight-mismatch", { error: st.errorMessage });
+      return { success: false, error: st.errorMessage };
+    }
+
     updateAutomationState(folderPath, { phase: "error", error: err.message });
     sendLog(
       "error",
@@ -1832,6 +1848,73 @@ function buildAcheminementSubject(folderName, typeLabel, ref) {
       ? `${n}${n === 1 ? "er" : "éme"} acheminement`
       : String(folderName || "").trim();
   return `${ordinal} ${typeLabel} LTA N° ${ref}`;
+}
+
+// Screenshot the BADR préapurement lots section (in #iframeMenu) to Downloads,
+// cropped to the form3 panel when visible; falls back to a full-page capture.
+// Returns the saved path, or null. Used by the weight/colis mismatch emails.
+async function captureBadrPreapShot(page, label) {
+  const dir = path.join(os.homedir(), "Downloads");
+  const safe = String(label || "lots").replace(/[\\/:*?"<>|]/g, "_");
+  const shotPath = path.join(dir, `poid difference LTA ${safe}.png`);
+  try {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const panel = page
+      .frameLocator("#iframeMenu")
+      .locator(
+        "#mainTab\\:form3\\:declarationExistante_content, #mainTab\\:form3",
+      )
+      .first();
+    if (await panel.isVisible().catch(() => false)) {
+      await panel.screenshot({ path: shotPath });
+    } else {
+      await page.screenshot({ path: shotPath });
+    }
+    return shotPath;
+  } catch {
+    try {
+      await page.screenshot({ path: shotPath });
+      return shotPath;
+    } catch {
+      return null;
+    }
+  }
+}
+
+// Email the partiel poids/colis mismatch detected during préapurement, using the
+// screenshot + totals persisted in the automation state by badrDumNormalPartiel.
+async function notifyPartielPoidsMismatch(id, acheminement, state) {
+  const pm = state?.poidsMismatch || {};
+  const ref =
+    normalizeLotReference(
+      extractLotReferenceFromFolder(acheminement.folderPath),
+    ) ||
+    acheminement.refNumber ||
+    id;
+  const attachments = pm.screenshotPath ? [{ path: pm.screenshotPath }] : [];
+
+  if (pm.kind === "waiting_vol") {
+    await sendNotification({
+      subject: `En attente du ${pm.nextVol}ème vol — LTA N° ${ref}`,
+      text:
+        `Bonjour,\n\n` +
+        `La somme du nombre de colis des lots (${pm.totalNbr}) ne correspond pas encore au manifeste (${pm.expectedNbr}) pour la LTA N° ${ref}.\n` +
+        `Cela signifie que tous les vols ne sont pas encore arrivés — en attente du ${pm.nextVol}ème vol.\n\n` +
+        `Voir la capture des lots ci-jointe.\n\n-- MedAfrica --`,
+      attachments,
+    }).catch(() => {});
+  } else {
+    await sendNotification({
+      subject: `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${ref}`,
+      text:
+        `Bonjour,\n\n` +
+        `Merci de régler le poids de la LTA N° ${ref}.\n\n` +
+        `Poids BADR (somme des lots) : ${Number(pm.totalPoids).toFixed(2)} kg\n` +
+        `Poids manifeste : ${pm.expectedPoids} kg\n\n` +
+        `Voir la capture des lots ci-jointe.\n\n-- MedAfrica --`,
+      attachments,
+    }).catch(() => {});
+  }
 }
 
 // Cross-check the manifest's pieces/weight against the MAWB's (No of Pieces RCP

@@ -13,6 +13,7 @@ The core automation flow is **fully implemented and working in production**:
 - BADR lot lookup ✅
   - Error messaging: "Pas encore manifest" when lot not found (clear user-facing message) ✅
 - BADR pré-apurement weight check ✅
+  - **Weight/colis mismatch → lots screenshot + email ✅** (2026-06-28): DS + partiel. Partiel distinguishes `waiting_vol` (colis sum ≠ manifest → "En attente du Nème vol") from `poids` (weight differs → "Merci de régler le poids"); cropped lots screenshot attached.
 - Portnet DS Combinée form (all 9 steps) ✅
 - PDF compression chain (iLovePDF → Adobe) ✅
   - **Manifest splitting for oversized annexes ✅** (2026-06-19): manifests > 2 MB are split into `<base>-part-N.pdf` page-range parts (each ≤ 2 MB), every part uploaded as its own FACTURE row. A part still > 2 MB is compressed via the chain. **First/last-page truncation removed** (Moroccan customs flags it as illegal); un-reducible files now block submission instead.

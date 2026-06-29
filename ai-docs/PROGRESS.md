@@ -29,6 +29,21 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-06-28 — Weight/colis mismatch: screenshot the lots + email (partiel & DS)
+
+**Need:** When BADR's weight/colis differs from the manifest and the app stops, screenshot the lots section, email it to the recipients with subject *"Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° …"*, and (for partiels) distinguish a real weight problem from "still waiting for another flight".
+
+**Partiel (`src/badr/badrDumNormalPartiel.js` + `electron/main.js`):**
+- `_step5_preapurement` now decides **colis-first**: if the lots' total `Nbre contenant` ≠ the manifest → `kind: "waiting_vol"` (more flights to come; `nextVol = lots.length + 1`); else if poids differs > 1 kg → `kind: "poids"`. Either way it takes a cropped screenshot of the lots table (`_screenshotLots` → `#mainTab:form3` panel → Downloads) and returns it.
+- `run()` persists `poidsMismatch { kind, nextVol, totals, screenshotPath }` + the right phase (`partiel_waiting_lots` / `partiel_poids_mismatch`) before throwing.
+- `runPartielDumFlow` catch reads `poidsMismatch` and emails once via `notifyPartielPoidsMismatch`: *"En attente du Nème vol — LTA N° …"* (waiting) or *"…Merci de régler le poids…"* (poids), screenshot attached, with the correct card status.
+
+**DS Combiné (non-partiel, `prepareLotAndWeightCheck`):** the weight-mismatch and colis-mismatch emails now use `captureBadrPreapShot()` (crops `#iframeMenu` → `#mainTab:form3` panel, full-page fallback) and the new subject. Colis email → "Merci de rectifier le nombre de colis…"; weight email → "Merci de régler le poids…", both with the lots screenshot.
+
+**Files changed:** `src/badr/badrDumNormalPartiel.js`, `electron/main.js`
+
+---
+
 ## 2026-06-28 — Signed-serie input: strip all whitespace before parsing
 
 Hardened the `automation:declare-scelles-partiel` serie parse: instead of `trim()` + `\s*` (only handled whitespace between the number and letter), it now removes ALL whitespace anywhere (`replace(/\s+/g, "")`) before matching `^(\d+)([A-Za-z])$`. So `"12847 F"`, `"12847F"`, `"0012847 F"`, `"0012847F"`, `"12847\nF"`, `"12 847 F"`, `"  12847f  "` all normalize to serie `12847` / clé `F` (leading zeros dropped, letter uppercased). Digits-only still falls back to the previously-validated `dumCle`. The letter is always the one the user typed — never a stale value.
