@@ -899,7 +899,9 @@ async function finalizeAcceptedOnBadr(acheminement, badrRef) {
     });
 
     // Email the downloaded DS PDF to the configured recipients.
-    const dsRef = extractLtaRefFromFolderName(folderName) || lotReference || badrRef;
+    // lotReference is the LTA/MAWB reference (from the manifest/MAWB filename),
+    // NOT the scellés — that is the number we want in the subject.
+    const dsRef = lotReference || badrRef;
     await sendNotification({
       subject: buildAcheminementSubject(folderName, "DS Combinée", dsRef),
       text:
@@ -1819,14 +1821,6 @@ function parseScellesFromFolderName(name) {
   return { scelle1: m[1], scelle2: m[2] };
 }
 
-// The LTA reference inside a folder name like
-// "2EME 13458331-13458332 — 72-74340954" → the LAST "<digits>-<digits>" group
-// (the LTA ref comes after the scellés). Returns "" when there is none.
-function extractLtaRefFromFolderName(name) {
-  const matches = String(name || "").match(/\d+-\d+/g);
-  return matches && matches.length ? matches[matches.length - 1] : "";
-}
-
 // Build an email subject from the folder name + declaration type, e.g.
 // "2éme acheminement DS Combinée LTA N° 72-74340954". Uses only the acheminement
 // rank and the LTA reference — never scellés or DS series.
@@ -2399,7 +2393,11 @@ ipcMain.handle(
 
       // Email the DUM Normale Partiel PDF (saved during run, path kept in state).
       const dumPdfPath = getAutomationState(folderPath)?.pdfPath;
-      const dumRef = extractLtaRefFromFolderName(id) || saved.refNumber || "";
+      // LTA/MAWB reference from the manifest/MAWB filename (NOT the scellés).
+      const dumRef =
+        normalizeLotReference(extractLotReferenceFromFolder(folderPath)) ||
+        saved.refNumber ||
+        "";
       await sendNotification({
         subject: buildAcheminementSubject(id, "Dum Normale", dumRef),
         text:

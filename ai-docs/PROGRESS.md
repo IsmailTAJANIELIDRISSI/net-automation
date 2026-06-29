@@ -42,9 +42,10 @@ Hardened the `automation:declare-scelles-partiel` serie parse: instead of `trim(
 **Need:** Success emails used `"<FOLDER> — <ds-series>"` (e.g. `3EME 13458333-13458334 — 3526 M`), leaking scellés + DS series. Wanted: `"<N>éme acheminement DS Combinée LTA N° <ref>"` (non-partiel) / `"… Dum Normale LTA N° <ref>"` (partiel) — only the acheminement rank, type, and LTA reference.
 
 **Implementation (`electron/main.js`):**
-- `extractLtaRefFromFolderName()` — the LAST `<digits>-<digits>` group in the folder name (the LTA ref comes after the scellés), e.g. `2EME 13458331-13458332 — 72-74340954` → `72-74340954`.
-- `buildAcheminementSubject(folderName, typeLabel, ref)` → `"<N>éme acheminement <type> LTA N° <ref>"` (1 → "1er"). No scellés / series.
-- DS success email (`finalizeAcceptedOnBadr`) → type "DS Combinée". DUM partiel email (`declare-scelles-partiel`) → type "Dum Normale". Ref prefers the folder-name LTA ref, falling back to `lotReference`/`refNumber`.
+- `buildAcheminementSubject(folderName, typeLabel, ref)` → `"<N>éme acheminement <type> LTA N° <ref>"` (1 → "1er"); the rank comes from the folder name's leading number.
+- DS success email (`finalizeAcceptedOnBadr`) → type "DS Combinée". DUM partiel email (`declare-scelles-partiel`) → type "Dum Normale".
+
+**Fix (same day):** the first cut derived the ref from a folder-name `<digits>-<digits>` group, which is the **scellés** (e.g. `14EME 13458371-13458372` has no appended LTA ref) — the subject showed `13458371-13458372` instead of the real LTA ref. Now the ref comes from `extractLotReferenceFromFolder()` (the MAWB/Manifeste filename, e.g. `123-789456`) for both emails — `lotReference` for DS, `extractLotReferenceFromFolder(folderPath)` for partiel. Removed `extractLtaRefFromFolderName`.
 
 **Files changed:** `electron/main.js`
 
