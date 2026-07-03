@@ -5,6 +5,18 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-07-03 — DS de référence: select the exact row by séquence + clé + année
+
+**Problem:** In the Portnet "Rechercher d'une DS de référence" dialog, the same séquence (e.g. `0009557`) returns one row per year (2022 H, 2023 J, 2024 K, 2025 L, 2026 M). The code paginated to the last page and clicked the **last-visible row** — positional. On a slow network the current-year (2026 M) row could render a beat after the older ones, so the grid's "lastVisible" was still 2025 L → wrong DS de référence selected → invalid declaration.
+
+**Fix:**
+- `electron/main.js` (fillEntete call): now passes `cle: lotInfo.cle` and `annee: lotInfo.annee` (both already produced by BADR lot lookup / manual-sequence path).
+- `src/portnet/portnetDsCombine.js`: `searchAndSelectDSReference(sequenceNum, expectedCle, expectedYear)` → new `_selectDsReferenceRow` scans **every page** and clicks the row whose `refSequence` **and** `refAnnee` (== current year) **and** `refcle` all match. Never a positional pick. Retries up to ~20 s (re-scans from page 1) so a late-rendering current-year row is still found. If no exact match ever appears, it **throws** a clear French error instead of selecting the wrong row (`année` defaults to `new Date().getFullYear()`; `clé` is a safety double-check since séquence+année already identify a unique row).
+
+**Files changed:** `src/portnet/portnetDsCombine.js`, `electron/main.js`
+
+---
+
 ## 2026-06-25 — "Lancer tous": don't open Portnet for an all-partiel batch
 
 **Problem:** With only partiel (DUM Normale) LTAs in the folder, "Lancer tous" still launched the Portnet session (CAPTCHA prompt) alongside BADR. Partiel LTAs never use Portnet, so that session is pointless.
@@ -26,6 +38,16 @@ _Format: `## YYYY-MM-DD — <title>`_
 - The "Pas encore manifest" email now fires only on the **last window of the last opérateur** (`isFinalAttempt && isLastOperateur`) so it isn't sent before SWIFTAIR is attempted.
 
 **Files changed:** `src/badr/badrLotLookup.js`
+
+---
+
+## 2026-07-03 — Manifest totalValue: Gemini Vision correction for concatenated parse
+
+**Problem:** The text parser glued the bottom "Positions" count to the Valeur totale — `779` + `8599.910` → `totalValue = "7798599.91"` (should be `8599.91`). A wrong declared value is a customs error.
+
+**Fix (`src/utils/manifestPdfExtract.js`):** After the text extraction, if `totalValue`'s integer part is **≥ 7 digits** (≥ 1 000 000 — essentially never legitimate for these air-freight LTAs, and the signature of the Positions+Valeur concatenation), re-read it with Gemini Vision. Because manifests can run **300+ pages**, a new `_buildLastPagesPdf(pdfPath, 2)` helper (pdf-lib `copyPages`) first slices out only the **last 2 pages** — where the totals row lives — so a 300-page/60 KB manifest becomes a ~1 KB, 2-page upload instead of the whole file. That temp PDF is passed to `extractManifestViaVision` (reads the 2nd of the three bottom totals), then deleted. Vision's `totalValue` (and `qteFacturee`) replace the bad text values; `_totalValueSource` records it. Normal 4–6 digit values skip Vision entirely (no cost); a genuine ≥ 1M value just gets a confirming Vision cross-check. If slicing or Vision fails, the original text value is kept (`totalValue` stays editable on the card).
+
+**Files changed:** `src/utils/manifestPdfExtract.js`
 
 ---
 

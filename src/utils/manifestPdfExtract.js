@@ -696,6 +696,45 @@ async function extractManifestMetricsFromPdfFile(pdfPath) {
     if (qteFacturee) {
       parsed.qteFacturee = qteFacturee;
     }
+
+    // Guard against the text-parse error where the bottom "Positions" count gets
+    // glued to the Valeur totale (e.g. 779 + 8599.910 → "7798599.91"). Manifest
+    // values for these air-freight LTAs are essentially never ≥ 1 000 000, so a
+    // ≥ 7-digit total means a bad parse → re-read it from the document with Gemini
+    // Vision (which reads the actual table cells on the last page).
+    const intDigits = (v) =>
+      String(v || "")
+        .split(/[.,]/)[0]
+        .replace(/\D/g, "").length;
+    if (parsed.totalValue && intDigits(parsed.totalValue) >= 7) {
+      console.warn(
+        `[manifestPdfExtract] totalValue "${parsed.totalValue}" suspect (≥ 7 chiffres) — vérification via Gemini Vision (dernières pages)`,
+      );
+      // The totals row lives on the last content page — send only the last pages
+      // to Gemini so a 300-page manifest doesn't become a giant upload.
+      const lastPagesPdf = await _buildLastPagesPdf(resolved, 2);
+      let v = null;
+      try {
+        v = await extractManifestViaVision(lastPagesPdf || resolved);
+      } catch (_) {
+        v = null;
+      } finally {
+        if (lastPagesPdf) {
+          try {
+            fs.unlinkSync(lastPagesPdf);
+          } catch (_) {}
+        }
+      }
+      if (v?.ok && v.totalValue) {
+        console.info(
+          `[manifestPdfExtract] totalValue corrigé via Vision: ${parsed.totalValue} → ${v.totalValue}`,
+        );
+        parsed.totalValue = v.totalValue;
+        if (v.qteFacturee) parsed.qteFacturee = v.qteFacturee;
+        parsed._totalValueSource = v._source;
+      }
+    }
+
     const hasAny =
       parsed.refNumber ||
       parsed.nombreContenant ||
@@ -726,6 +765,43 @@ async function extractManifestMetricsFromPdfFile(pdfPath) {
     if (visionResult?.ok) return visionResult;
 
     return { ok: false, error: String(e?.message || e) };
+  }
+}
+
+/**
+ * Build a small temp PDF containing only the last `count` pages of `pdfPath`.
+ * The manifest's bottom totals (Valeur totale / Positions) live on the last
+ * content page, so this lets Gemini read them without uploading a 300-page file.
+ * Returns the temp path, or null if the PDF is already small enough / on failure
+ * (caller then falls back to the original path).
+ */
+async function _buildLastPagesPdf(pdfPath, count = 2) {
+  try {
+    const os = require("os");
+    const { PDFDocument } = require("pdf-lib");
+    const src = await PDFDocument.load(fs.readFileSync(path.resolve(pdfPath)));
+    const total = src.getPageCount();
+    if (total <= count) return null; // small enough — use the original
+    const out = await PDFDocument.create();
+    const indexes = [];
+    for (let i = total - count; i < total; i++) indexes.push(i);
+    const pages = await out.copyPages(src, indexes);
+    for (const p of pages) out.addPage(p);
+    const bytes = await out.save({
+      useObjectStreams: true,
+      addDefaultPage: false,
+    });
+    const outPath = path.join(
+      os.tmpdir(),
+      `manifest_totals_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.pdf`,
+    );
+    fs.writeFileSync(outPath, bytes);
+    return outPath;
+  } catch (e) {
+    console.warn(
+      `[manifestPdfExtract] _buildLastPagesPdf failed: ${e.message} — utilisation du PDF complet`,
+    );
+    return null;
   }
 }
 

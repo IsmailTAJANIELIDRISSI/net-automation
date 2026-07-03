@@ -744,6 +744,10 @@ async function submitPortnetPhase(acheminement, lotInfo, portnetPage) {
   const dsCombine = new PortnetDsCombine(portnetPage);
   const fillResult = await dsCombine.fillEntete({
     sequenceNum: lotInfo.sequenceNum,
+    // clé + année pin the exact DS de référence row (séquence alone repeats
+    // across years). année defaults to the current year in the finalizer.
+    cle: lotInfo.cle || undefined,
+    annee: lotInfo.annee || undefined,
     refNumber: refNumber || undefined,
     lieuChargement: lieuChargement || undefined,
     montant: totalValue || undefined,

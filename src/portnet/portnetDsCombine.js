@@ -293,14 +293,22 @@ class PortnetDsCombine {
 
   // ── Step 5–6: DS de référence search ──────────────────────────────────────
 
-  async searchAndSelectDSReference(sequenceNum) {
+  async searchAndSelectDSReference(sequenceNum, expectedCle, expectedYear) {
     const f = this.frame;
     const sequenceDigits = String(sequenceNum || "")
       .split(/[\s-]+/)[0]
       .replace(/\D/g, "");
     const sequenceForSearch = sequenceDigits.padStart(7, "0");
+    const wantCle = String(expectedCle || "")
+      .trim()
+      .toUpperCase();
+    const wantYear = String(
+      expectedYear || new Date().getFullYear(),
+    ).trim();
 
-    log.info(`Searching DS de référence for séquence ${sequenceForSearch}…`);
+    log.info(
+      `Searching DS de référence for séquence ${sequenceForSearch} (clé ${wantCle || "?"}, année ${wantYear})…`,
+    );
 
     const dsSearchBtn = f.locator(
       'div[aria-label="Rechercher"] button[type="button"]',
@@ -324,26 +332,98 @@ class PortnetDsCombine {
       .waitFor({ timeout: 10000 });
     await this.page.waitForTimeout(500);
 
-    // Paginate to last page only if the button is enabled (multiple pages exist)
-    const lastPageBtn = dialog.locator('button[aria-label="Go to last page"]');
-    const isDisabled = await lastPageBtn.isDisabled().catch(() => true);
-    if (!isDisabled) {
-      await lastPageBtn.click();
-      // Wait for the last-visible row to update after pagination
+    await this._selectDsReferenceRow(
+      dialog,
+      sequenceForSearch,
+      wantCle,
+      wantYear,
+    );
+  }
+
+  /**
+   * Select the DS de référence row matching séquence + clé + année, scanning
+   * every page of the results grid. It NEVER falls back to a positional pick:
+   * séquence repeats across years (e.g. 0009557 exists for 2022…2026), so the
+   * only correct row is the one whose année is the current year and whose clé
+   * matches the BADR declaration. Picking the wrong year/clé produces an invalid
+   * declaration. Retries for a while because on a slow network the current-year
+   * row can render a beat after the older ones (the bug this replaces: it grabbed
+   * the "last visible" row, which was the previous year before 2026 loaded).
+   */
+  async _selectDsReferenceRow(dialog, sequenceForSearch, wantCle, wantYear) {
+    const deadline = Date.now() + 20000;
+
+    const scanCurrentPage = async () => {
+      const rows = dialog.locator(".MuiDataGrid-row");
+      const n = await rows.count();
+      for (let i = 0; i < n; i++) {
+        const row = rows.nth(i);
+        const [seq, cle, year] = await Promise.all([
+          row
+            .locator('[data-field="refSequence"]')
+            .innerText()
+            .catch(() => ""),
+          row
+            .locator('[data-field="refcle"]')
+            .innerText()
+            .catch(() => ""),
+          row
+            .locator('[data-field="refAnnee"]')
+            .innerText()
+            .catch(() => ""),
+        ]);
+        const seqOk = seq.trim() === sequenceForSearch;
+        // clé is a check digit of (bureau,régime,année,série) so séquence+année
+        // already identify a unique row; clé is a safety double-check when known.
+        const cleOk = !wantCle || cle.trim().toUpperCase() === wantCle;
+        const yearOk = year.trim() === wantYear;
+        if (seqOk && cleOk && yearOk) {
+          await row
+            .locator('div[aria-label="Sélectionner"] button')
+            .click();
+          log.info(
+            `DS référence sélectionnée: séquence ${seq.trim()}, clé ${cle.trim()}, année ${year.trim()}`,
+          );
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const goToFirstPage = async () => {
+      const firstBtn = dialog.locator('button[aria-label="Go to first page"]');
+      if (!(await firstBtn.isDisabled().catch(() => true))) {
+        await firstBtn.click();
+        await this.page.waitForTimeout(400);
+      }
+    };
+
+    while (Date.now() < deadline) {
+      await goToFirstPage();
+      // Walk every page looking for the exact match.
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        if (await scanCurrentPage()) {
+          await this.page.waitForTimeout(1000);
+          return;
+        }
+        const nextBtn = dialog.locator('button[aria-label="Go to next page"]');
+        if (await nextBtn.isDisabled().catch(() => true)) break; // last page
+        await nextBtn.click();
+        await this.page.waitForTimeout(500);
+      }
+      // Not found on any page yet — likely still loading. Wait and rescan.
+      log.warn(
+        `DS référence (séquence ${sequenceForSearch}, clé ${wantCle || "?"}, année ${wantYear}) pas encore visible — nouvelle tentative…`,
+      );
       await this.page.waitForTimeout(1000);
-      log.info("Navigated to last page of DS results");
-    } else {
-      log.info("Single page – already on last page");
     }
 
-    // Click Sélectionner on the last visible row in the dialog
-    const lastRowSelectBtn = dialog.locator(
-      '.MuiDataGrid-row--lastVisible div[aria-label="Sélectionner"] button',
+    throw new Error(
+      `DS de référence introuvable pour séquence ${sequenceForSearch}, ` +
+        `clé ${wantCle || "?"}, année ${wantYear}. Aucune ligne ne correspond ` +
+        `exactement — vérifiez la déclaration BADR.`,
     );
-    await lastRowSelectBtn.waitFor({ timeout: 10000 });
-    await lastRowSelectBtn.click();
-    await this.page.waitForTimeout(1000);
-    log.info("DS référence row selected");
   }
 
   // ── Step: Bureau de destination (dialog lookup) ────────────────────────────
@@ -1047,7 +1127,11 @@ class PortnetDsCombine {
     await this.selectAgrement();
     await this.selectAnticipationNon();
     // await this.selectTypeDSReference();
-    await this.searchAndSelectDSReference(formData.sequenceNum);
+    await this.searchAndSelectDSReference(
+      formData.sequenceNum,
+      formData.cle,
+      formData.annee,
+    );
 
     await this.page.waitForTimeout(1500);
 

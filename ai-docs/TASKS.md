@@ -79,6 +79,7 @@ The core automation flow is **fully implemented and working in production**:
   - Exported as `extractManifestViaVision` for optional direct use
   - Success log in `main.js` now shows `qteFacturée` and `(via gemini-vision:…)` source tag
   - Warn log enhanced with actionable hint based on error type (Invalid PDF / no_header_match / gemini_failed)
+  - **totalValue concatenation guard ✅** (2026-07-03): the text parser sometimes glues the bottom "Positions" count to the Valeur totale (`779` + `8599.910` → `7798599.91`). If the parsed `totalValue` integer part is ≥ 7 digits (≥ 1 000 000 — never legitimate for these LTAs), Vision re-reads the value. Manifests can be 300+ pages, so `_buildLastPagesPdf(pdfPath, 2)` (pdf-lib) first slices only the **last 2 pages** (totals row) → a ~1 KB upload; that temp PDF goes to `extractManifestViaVision` and its `totalValue`/`qteFacturee` win, then it's deleted. Normal 4–6 digit values skip Vision; on any failure the editable text value is kept.
 
 - **Gemini API robust retry mechanism ✅** (2026-06-09)
   - `src/utils/geminiRetry.js` — shared `geminiCallWithRetry()` for 503/429 transient errors
