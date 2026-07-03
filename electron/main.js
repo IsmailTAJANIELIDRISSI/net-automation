@@ -571,7 +571,7 @@ async function prepareLotAndWeightCheck(acheminement) {
         "ColisCheck",
         `${error} pour ${resolvedRef} — traitement arrêté, notification envoyée`,
       );
-      const colisShot = await captureBadrPreapShot(badrConn.page, resolvedRef);
+      const colisShot = await captureBadrPreapShot(badrConn.page, resolvedRef, folderPath);
       await sendNotification({
         subject: `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${resolvedRef}`,
         text:
@@ -591,7 +591,7 @@ async function prepareLotAndWeightCheck(acheminement) {
 
       // Screenshot the préapurement lots section → Downloads, then email it.
       const notifyWeightMismatch = async (kind) => {
-        const shotPath = await captureBadrPreapShot(badrConn.page, resolvedRef);
+        const shotPath = await captureBadrPreapShot(badrConn.page, resolvedRef, folderPath);
         if (shotPath) {
           sendLog(
             "info",
@@ -1358,8 +1358,10 @@ async function runPartielDumFlow(acheminement) {
     return { success: false, error: checkpoint.errorMessage };
   }
   if (checkpoint?.phase === "partiel_waiting_lots") {
-    sendLog("info", "BADR", `"${id}" en attente du 2ème vol — rien à faire`);
-    sendProgress(id, "partiel-waiting-lots");
+    const nextVol =
+      checkpoint.nextVol ?? checkpoint.poidsMismatch?.nextVol ?? 2;
+    sendLog("info", "BADR", `"${id}" en attente du ${nextVol}ème vol — rien à faire`);
+    sendProgress(id, "partiel-waiting-lots", { nextVol });
     return { success: false, skipped: true, reason: "partiel_waiting_lots" };
   }
 
@@ -1426,13 +1428,16 @@ async function runPartielDumFlow(acheminement) {
 
     if (!lotResult.isPartiel && lotResult.rowCount === 1) {
       // Only 1 lot found — waiting for second flight
-      updateAutomationState(folderPath, { phase: "partiel_waiting_lots" });
+      updateAutomationState(folderPath, {
+        phase: "partiel_waiting_lots",
+        nextVol: 2,
+      });
       sendLog(
         "warn",
         "BADR",
         `"${id}" — 1 seul lot trouvé, en attente du 2ème vol`,
       );
-      sendProgress(id, "partiel-waiting-lots");
+      sendProgress(id, "partiel-waiting-lots", { nextVol: 2 });
       return { success: false, skipped: true, reason: "partiel_waiting_lots" };
     }
 
@@ -1526,7 +1531,9 @@ async function runPartielDumFlow(acheminement) {
           "BADR",
           `[${id}] ${st.errorMessage} — notification envoyée`,
         );
-        sendProgress(id, "partiel-waiting-lots");
+        sendProgress(id, "partiel-waiting-lots", {
+          nextVol: st.poidsMismatch.nextVol,
+        });
         return { success: false, skipped: true, reason: "partiel_waiting_lots" };
       }
       sendLog(
@@ -1853,32 +1860,47 @@ function buildAcheminementSubject(folderName, typeLabel, ref) {
 // Screenshot the BADR préapurement lots section (in #iframeMenu) to Downloads,
 // cropped to the form3 panel when visible; falls back to a full-page capture.
 // Returns the saved path, or null. Used by the weight/colis mismatch emails.
-async function captureBadrPreapShot(page, label) {
-  const dir = path.join(os.homedir(), "Downloads");
+async function captureBadrPreapShot(page, label, folderPath) {
   const safe = String(label || "lots").replace(/[\\/:*?"<>|]/g, "_");
-  const shotPath = path.join(dir, `poid difference LTA ${safe}.png`);
+  const fileName = `screenshot-LTA-${safe}-Probleme-Poid.png`;
+  const dlDir = path.join(os.homedir(), "Downloads");
+  const targets = [];
+  if (folderPath && fs.existsSync(folderPath)) {
+    targets.push(path.join(folderPath, fileName));
+  }
   try {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const panel = page
-      .frameLocator("#iframeMenu")
-      .locator(
-        "#mainTab\\:form3\\:declarationExistante_content, #mainTab\\:form3",
-      )
-      .first();
+    if (!fs.existsSync(dlDir)) fs.mkdirSync(dlDir, { recursive: true });
+    targets.push(path.join(dlDir, fileName));
+  } catch {}
+  if (targets.length === 0) return null;
+
+  const primary = targets[0];
+  // Screenshot the iframe ELEMENT (the BADR content area) rather than the inner
+  // form panel — the latter clipped ~30% on the left. The iframe box captures
+  // the full lots table from its left edge, excluding the top-page menu.
+  const capture = async (dest) => {
+    const panel = page.locator("#iframeMenu").first();
     if (await panel.isVisible().catch(() => false)) {
-      await panel.screenshot({ path: shotPath });
+      await panel.screenshot({ path: dest });
     } else {
-      await page.screenshot({ path: shotPath });
+      await page.screenshot({ path: dest });
     }
-    return shotPath;
+  };
+  try {
+    await capture(primary);
   } catch {
     try {
-      await page.screenshot({ path: shotPath });
-      return shotPath;
+      await page.screenshot({ path: primary });
     } catch {
       return null;
     }
   }
+  for (const t of targets.slice(1)) {
+    try {
+      fs.copyFileSync(primary, t);
+    } catch {}
+  }
+  return primary;
 }
 
 // Email the partiel poids/colis mismatch detected during préapurement, using the

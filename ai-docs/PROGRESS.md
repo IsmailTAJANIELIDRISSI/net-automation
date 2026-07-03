@@ -40,6 +40,12 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 **DS Combiné (non-partiel, `prepareLotAndWeightCheck`):** the weight-mismatch and colis-mismatch emails now use `captureBadrPreapShot()` (crops `#iframeMenu` → `#mainTab:form3` panel, full-page fallback) and the new subject. Colis email → "Merci de rectifier le nombre de colis…"; weight email → "Merci de régler le poids…", both with the lots screenshot.
 
+**Screenshot fix (same day):** cropping to the inner `#mainTab:form3` panel clipped ~30 % of the left (N° column, Retour button, title). Both `_screenshotLots` and `captureBadrPreapShot` now screenshot the **iframe element** (`#iframeMenu`) instead — it captures the full BADR content area (whole lots table from its left edge) while still excluding the top-page menu.
+
+**Follow-up (same day):**
+- Screenshot is now also saved in the **LTA folder** as `screenshot-LTA-<ref>-Probleme-Poid.png` (plus the Downloads copy). `captureBadrPreapShot` gained a `folderPath` arg.
+- UI status `partiel-waiting-lots` was showing the raw English-ish key. `StatusBadge` now renders **"En attente du Nème vol"** (French) using a `nextVol` prop. `nextVol` flows live via `sendProgress(id, "partiel-waiting-lots", { nextVol })` and after a re-scan via `automationState.nextVol` (persisted at lot-lookup waiting = 2, and at the `_step5` waiting-vol = lots + 1) → `statusesFromScan` → card → badge.
+
 **Files changed:** `src/badr/badrDumNormalPartiel.js`, `electron/main.js`
 
 ---

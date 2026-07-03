@@ -55,6 +55,9 @@ export default function App() {
             declarationRef: a.automationState?.badrRef,
             error: a.automationState?.error,
             portnetRef: a.automationState?.portnetRef,
+            nextVol:
+              a.automationState?.nextVol ??
+              a.automationState?.poidsMismatch?.nextVol,
           },
         ]),
     );
@@ -495,6 +498,7 @@ export default function App() {
                   ach={ach}
                   status={statuses[ach.id]?.status ?? "idle"}
                   error={statuses[ach.id]?.error}
+                  nextVol={statuses[ach.id]?.nextVol}
                   isGlobalRunning={isRunning}
                   shipperLoading={shipperLoadingIds.has(ach.id)}
                   onChange={handleChange}

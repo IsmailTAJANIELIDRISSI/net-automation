@@ -149,6 +149,7 @@ class BADRDumNormalPartiel {
         updateState({
           phase,
           errorMessage: result.errorMessage,
+          nextVol: result.nextVol ?? null,
           poidsMismatch: {
             kind: result.kind,
             nextVol: result.nextVol ?? null,
@@ -751,35 +752,54 @@ class BADRDumNormalPartiel {
     return { mismatch: false, actualPoids: totalPoids, poidsAdjusted };
   }
 
-  // Screenshot the préapurement lots section (the lots datatable) to Downloads,
-  // cropped to the form3 panel; falls back to a full-page capture. Returns the
-  // saved path, or null. Used for the poids/colis mismatch notification emails.
+  // Screenshot the préapurement lots section to the LTA folder
+  // ("screenshot-LTA-<ref>-Probleme-Poid.png") and a copy in Downloads.
+  // Screenshots the iframe ELEMENT (full BADR content, no left clip). Returns
+  // the LTA-folder path (else the Downloads path), or null.
   async _screenshotLots(iframe, ach) {
-    const dir = path.join(os.homedir(), "Downloads");
-    const label = String(ach.refNumber || ach.id || "lots").replace(
+    const ref = String(ach.refNumber || ach.id || "lots").replace(
       /[\\/:*?"<>|]/g,
       "_",
     );
-    const shotPath = path.join(dir, `poid difference LTA ${label}.png`);
+    const fileName = `screenshot-LTA-${ref}-Probleme-Poid.png`;
+    const dlDir = path.join(os.homedir(), "Downloads");
+    const targets = [];
+    if (ach.folderPath && fs.existsSync(ach.folderPath)) {
+      targets.push(path.join(ach.folderPath, fileName));
+    }
     try {
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const panel = iframe.locator("#mainTab\\:form3").first();
+      if (!fs.existsSync(dlDir)) fs.mkdirSync(dlDir, { recursive: true });
+      targets.push(path.join(dlDir, fileName));
+    } catch {}
+    if (targets.length === 0) return null;
+
+    const primary = targets[0];
+    const capture = async (dest) => {
+      const panel = this.page.locator("#iframeMenu").first();
       if (await panel.isVisible().catch(() => false)) {
-        await panel.screenshot({ path: shotPath });
+        await panel.screenshot({ path: dest });
       } else {
-        await this.page.screenshot({ path: shotPath });
+        await this.page.screenshot({ path: dest });
       }
-      log.info(`Capture lots enregistrée: ${shotPath}`);
-      return shotPath;
+    };
+    try {
+      await capture(primary);
     } catch (e) {
       log.warn(`Capture lots échouée: ${e.message}`);
       try {
-        await this.page.screenshot({ path: shotPath });
-        return shotPath;
+        await this.page.screenshot({ path: primary });
       } catch {
         return null;
       }
     }
+    // Copy to the remaining targets (Downloads).
+    for (const t of targets.slice(1)) {
+      try {
+        fs.copyFileSync(primary, t);
+      } catch {}
+    }
+    log.info(`Capture lots enregistrée: ${primary}`);
+    return primary;
   }
 
   // ── STEP 6 (6) — Documents Tab ───────────────────────────────────────────

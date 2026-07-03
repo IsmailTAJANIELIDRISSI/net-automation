@@ -4,7 +4,7 @@ import React from "react";
  * Status badge shown on each AcheminementCard.
  * @param {{ status: 'idle'|'running'|'captcha-waiting'|'filling-form'|'submitting-portnet'|'portnet-submitted'|'monitoring-portnet'|'portnet-accepted'|'badr-downloading'|'done'|'error'|'weight-mismatch' }} props
  */
-export default function StatusBadge({ status }) {
+export default function StatusBadge({ status, nextVol }) {
   const variants = {
     idle: "bg-slate-700 text-slate-300",
     running: "bg-blue-900/60 text-blue-300 animate-pulse",
@@ -20,6 +20,7 @@ export default function StatusBadge({ status }) {
     "weight-mismatch": "bg-orange-900/60 text-orange-300",
     "partiel-skip": "bg-yellow-900/60 text-yellow-300",
     "partiel-waiting-signature": "bg-amber-900/60 text-amber-300 animate-pulse",
+    "partiel-waiting-lots": "bg-amber-900/60 text-amber-300 animate-pulse",
   };
 
   const labels = {
@@ -37,6 +38,9 @@ export default function StatusBadge({ status }) {
     "weight-mismatch": "Écart poids",
     "partiel-skip": "LTA Partielle",
     "partiel-waiting-signature": "En attente signature",
+    "partiel-waiting-lots": nextVol
+      ? `En attente ${nextVol}ème vol`
+      : "En attente prochain vol",
   };
 
   const cls = variants[status] ?? variants.idle;

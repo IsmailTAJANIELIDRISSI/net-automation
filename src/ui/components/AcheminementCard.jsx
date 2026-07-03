@@ -10,6 +10,7 @@ export default function AcheminementCard({
   ach,
   status = "idle",
   error,
+  nextVol,
   isGlobalRunning,
   shipperLoading = false,
   onChange,
@@ -93,7 +94,7 @@ export default function AcheminementCard({
             </p>
           )}
         </div>
-        <StatusBadge status={status} />
+        <StatusBadge status={status} nextVol={nextVol} />
       </div>
 
       {/* ── PDFs ───────────────────────────────────────────────────────────── */}
