@@ -358,16 +358,19 @@ async function prepareLotAndWeightCheck(acheminement) {
     return { success: false, skipped: true, reason: "partiel" };
   }
 
-  // Block if the manifest's pieces/weight disagree with the MAWB's (cross-check
-  // applies to all LTAs — partiels are blocked in runPartielDumFlow).
-  const mawbMismatch =
-    acheminement.mawbMismatch ||
-    computeMawbVsManifestMismatch({
-      manifestNbr: acheminement.nombreContenant,
-      manifestPoids: acheminement.poidTotal,
-      mawbNbr: acheminement.mawbNbrPieces,
-      mawbPoids: acheminement.mawbGrossWeight,
-    });
+  // Cross-check manifest vs MAWB (all LTAs). Only a colis discrepancy blocks;
+  // a weight gap is a non-blocking warning (the operator rectifies the poids
+  // input and launches). partiels are also checked in runPartielDumFlow.
+  const mawbCheck = computeMawbVsManifestMismatch({
+    manifestNbr: acheminement.nombreContenant,
+    manifestPoids: acheminement.poidTotal,
+    mawbNbr: acheminement.mawbNbrPieces,
+    mawbPoids: acheminement.mawbGrossWeight,
+  });
+  if (mawbCheck.warning) {
+    sendLog("warn", "MAWB", `[${id}] ${mawbCheck.warning}`);
+  }
+  const mawbMismatch = acheminement.mawbMismatch || mawbCheck.blocking;
   if (mawbMismatch) {
     updateAutomationState(folderPath, { phase: "error", error: mawbMismatch });
     sendLog("warn", "MAWB", `[${id}] ${mawbMismatch} — traitement bloqué`);
@@ -1369,16 +1372,18 @@ async function runPartielDumFlow(acheminement) {
     return { success: false, skipped: true, reason: "partiel_waiting_lots" };
   }
 
-  // Block if the manifest's pieces/weight disagree with the MAWB's — the operator
-  // must reconcile the documents before this LTA is processed.
-  const mawbMismatch =
-    acheminement.mawbMismatch ||
-    computeMawbVsManifestMismatch({
-      manifestNbr: acheminement.nombreContenant,
-      manifestPoids: acheminement.poidTotal,
-      mawbNbr: acheminement.mawbNbrPieces,
-      mawbPoids: acheminement.mawbGrossWeight,
-    });
+  // Cross-check manifest vs MAWB. Only a colis discrepancy blocks; a weight gap
+  // is a non-blocking warning the operator can rectify before launching.
+  const mawbCheck = computeMawbVsManifestMismatch({
+    manifestNbr: acheminement.nombreContenant,
+    manifestPoids: acheminement.poidTotal,
+    mawbNbr: acheminement.mawbNbrPieces,
+    mawbPoids: acheminement.mawbGrossWeight,
+  });
+  if (mawbCheck.warning) {
+    sendLog("warn", "MAWB", `[${id}] ${mawbCheck.warning}`);
+  }
+  const mawbMismatch = acheminement.mawbMismatch || mawbCheck.blocking;
   if (mawbMismatch) {
     updateAutomationState(folderPath, { phase: "error", error: mawbMismatch });
     sendLog("warn", "MAWB", `[${id}] ${mawbMismatch} — traitement bloqué`);
@@ -1952,19 +1957,32 @@ function computeMawbVsManifestMismatch({
   mawbNbr,
   mawbPoids,
 }) {
-  const issues = [];
+  // Returns { blocking, warning }:
+  //  • colis (package count) mismatch → BLOCKING: a different number of packages
+  //    is a real discrepancy the operator must reconcile before launching.
+  //  • poids (weight) mismatch → WARNING only: manifest vs MAWB weight commonly
+  //    differs by a few kg (rounding); it's rectifiable in the poids input and
+  //    the authoritative BADR weight is checked downstream, so never block on it.
+  const blocking = [];
+  const warnings = [];
   const mn = parseInt(String(manifestNbr ?? "").replace(/\D/g, ""), 10);
   const xn = parseInt(String(mawbNbr ?? "").replace(/\D/g, ""), 10);
   if (!isNaN(mn) && !isNaN(xn) && mn !== xn) {
-    issues.push(`nombre de colis (manifeste ${mn} ≠ MAWB ${xn})`);
+    blocking.push(`nombre de colis (manifeste ${mn} ≠ MAWB ${xn})`);
   }
   const mp = parseFloat(String(manifestPoids ?? "").replace(",", "."));
   const xp = parseFloat(String(mawbPoids ?? "").replace(",", "."));
   if (!isNaN(mp) && !isNaN(xp) && Math.round(mp) !== Math.round(xp)) {
-    issues.push(`poids brut (manifeste ${mp} kg ≠ MAWB ${xp} kg)`);
+    warnings.push(`poids brut (manifeste ${mp} kg ≠ MAWB ${xp} kg)`);
   }
-  if (issues.length === 0) return null;
-  return `Incohérence manifeste / MAWB sur le ${issues.join(" et le ")}. Vérifiez les documents avant de lancer.`;
+  return {
+    blocking: blocking.length
+      ? `Incohérence manifeste / MAWB sur le ${blocking.join(" et le ")}. Vérifiez les documents avant de lancer.`
+      : null,
+    warning: warnings.length
+      ? `Écart de poids manifeste / MAWB : ${warnings.join(" et ")}. Vous pouvez rectifier le poids dans le champ ci-dessous puis lancer.`
+      : null,
+  };
 }
 
 // ── IPC: Scan folder for acheminements ────────────────────────────────────────
@@ -2205,6 +2223,12 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
       saved.totalValue,
       "",
     );
+    const mawbCheck = computeMawbVsManifestMismatch({
+      manifestNbr: mergedNombre,
+      manifestPoids: mergedPoids,
+      mawbNbr: saved.mawbNbrPieces,
+      mawbPoids: saved.mawbGrossWeight,
+    });
 
     acheminements.push({
       id: entry.name,
@@ -2239,14 +2263,12 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
       mawbGrossWeight: saved.mawbGrossWeight ?? null,
       // Freight couldn't be confidently reconciled from the MAWB → must be typed.
       fretUncertain: saved.fretUncertain ?? false,
-      // Flag a manifest-vs-MAWB pieces/weight discrepancy (all LTAs) so the card
-      // shows it and the run is blocked. Null when MAWB metrics are unknown.
-      mawbMismatch: computeMawbVsManifestMismatch({
-        manifestNbr: mergedNombre,
-        manifestPoids: mergedPoids,
-        mawbNbr: saved.mawbNbrPieces,
-        mawbPoids: saved.mawbGrossWeight,
-      }),
+      // Manifest-vs-MAWB cross-check (all LTAs). mawbMismatch = blocking colis
+      // discrepancy (red banner, Lancer disabled); mawbWarning = non-blocking
+      // weight gap (amber banner, rectifiable, Lancer stays enabled). Both null
+      // when MAWB metrics are unknown.
+      mawbMismatch: mawbCheck.blocking,
+      mawbWarning: mawbCheck.warning,
       automationState: saved[CHECKPOINT_KEY] ?? null,
     });
   }

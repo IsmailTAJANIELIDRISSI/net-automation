@@ -122,11 +122,20 @@ export default function AcheminementCard({
         ))}
       </div>
 
-      {/* ── Manifest ↔ MAWB pieces/weight mismatch (partiel) ──────────────── */}
+      {/* ── Manifest ↔ MAWB colis mismatch — BLOCKING (red) ───────────────── */}
       {ach.mawbMismatch && (
         <div className="flex items-start gap-2 bg-red-900/40 border border-red-700/60 rounded-lg px-3 py-2">
           <span className="text-red-400 text-xs font-semibold leading-snug">
             ⚠️ {ach.mawbMismatch}
+          </span>
+        </div>
+      )}
+
+      {/* ── Manifest ↔ MAWB weight gap — WARNING only, not blocking (amber) ── */}
+      {ach.mawbWarning && (
+        <div className="flex items-start gap-2 bg-amber-900/30 border border-amber-700/50 rounded-lg px-3 py-2">
+          <span className="text-amber-300 text-xs font-semibold leading-snug">
+            ⚠️ {ach.mawbWarning}
           </span>
         </div>
       )}
