@@ -5,6 +5,20 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-07-03 — Manifest ↔ MAWB weight gap: warn instead of block
+
+**Problem:** The manifest-vs-MAWB cross-check blocked the launch on ANY weight difference (e.g. manifest 2020 kg vs MAWB 2022 kg — a 2 kg rounding gap). Weight commonly differs by a few kg and is rectifiable in the poids input, plus the authoritative BADR weight is checked downstream. Blocking on it was too strict.
+
+**Fix:** `computeMawbVsManifestMismatch` now returns `{ blocking, warning }`:
+- **colis (package count)** mismatch → `blocking` (unchanged: red banner, Lancer disabled, run stops).
+- **poids (weight)** mismatch → `warning` only (never blocks).
+
+`electron/main.js`: scan persists `mawbMismatch: mawbCheck.blocking` + new `mawbWarning: mawbCheck.warning`; both run-guards (`prepareLotAndWeightCheck`, `runPartielDumFlow`) block only on `.blocking` and log `.warning`. `src/ui/components/AcheminementCard.jsx`: new amber (non-blocking) banner for `ach.mawbWarning`; Lancer stays enabled — the user rectifies the poids input and launches.
+
+**Files changed:** `electron/main.js`, `src/ui/components/AcheminementCard.jsx`
+
+---
+
 ## 2026-07-03 — DS de référence: select the exact row by séquence + clé + année
 
 **Problem:** In the Portnet "Rechercher d'une DS de référence" dialog, the same séquence (e.g. `0009557`) returns one row per year (2022 H, 2023 J, 2024 K, 2025 L, 2026 M). The code paginated to the last page and clicked the **last-visible row** — positional. On a slow network the current-year (2026 M) row could render a beat after the older ones, so the grid's "lastVisible" was still 2025 L → wrong DS de référence selected → invalid declaration.
