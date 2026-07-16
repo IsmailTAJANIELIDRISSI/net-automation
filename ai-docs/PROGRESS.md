@@ -28,6 +28,8 @@ A first cut also added a manual **⏸ Pause** button, but it was removed — pau
 
 **Live UI refresh:** the first time the monitor sees a folder the UI doesn't have (`uiKnownIds` set), it emits an `acheminements-changed` IPC event; `preload.onAcheminementsChanged` + a new App.jsx effect call `handleRefresh()` (re-scan preserving user-edited fields), so the new LTA's **card appears immediately** during monitoring — no need to wait for the batch to end. (Verified in the field: log showed `"3EME …" soumis à Portnet — ajouté au suivi` and both LTAs polling, but the card was missing until this was added.)
 
+**Always-live via folder watcher:** beyond the mid-monitor case, a filesystem watcher (`fs.watch`, non-recursive, 800 ms debounce) on the acheminements root — started in the `folder:scan` IPC, torn down on quit — fires the same `acheminements-changed` event whenever a folder is added/removed at ANY time (app idle, processing, whatever). So the operator can drop an LTA folder in and its card shows up within ~1 s to be filled/edited, no manual "Actualiser". Non-recursive means the scan's own nested `acheminement.json` writes don't retrigger it (no loop); the watcher is idempotent per path.
+
 **Files changed:** `electron/main.js`, `electron/preload.js`, `src/ui/App.jsx`
 
 ---

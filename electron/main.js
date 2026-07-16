@@ -120,6 +120,44 @@ function notifyAcheminementsChanged() {
   }
 }
 
+// Watch the acheminements root folder so a folder dropped in at ANY time (app
+// idle or processing) makes its card appear live — the operator can then fill /
+// edit its fields. fs.watch is non-recursive, so it fires on subfolder add/remove
+// but NOT on the nested acheminement.json writes our own scan does (no feedback
+// loop). Events are debounced into one refresh.
+let folderWatcher = null;
+let watchedFolderPath = null;
+let watchDebounceTimer = null;
+
+function watchAcheminementsFolder(folderPath) {
+  if (watchedFolderPath === folderPath && folderWatcher) return; // already on it
+  if (folderWatcher) {
+    try {
+      folderWatcher.close();
+    } catch {
+      /* ignore */
+    }
+    folderWatcher = null;
+  }
+  watchedFolderPath = folderPath || null;
+  if (!folderPath || !fs.existsSync(folderPath)) return;
+  try {
+    folderWatcher = fs.watch(folderPath, { persistent: false }, () => {
+      if (watchDebounceTimer) clearTimeout(watchDebounceTimer);
+      watchDebounceTimer = setTimeout(() => {
+        watchDebounceTimer = null;
+        notifyAcheminementsChanged();
+      }, 800);
+    });
+    folderWatcher.on("error", (err) =>
+      sendLog("warn", "Scan", `Surveillance du dossier interrompue: ${err.message}`),
+    );
+    sendLog("info", "Scan", `Surveillance du dossier activée: ${folderPath}`);
+  } catch (err) {
+    sendLog("warn", "Scan", `Impossible de surveiller le dossier: ${err.message}`);
+  }
+}
+
 let sharedPortnetApp = null;
 let sharedPortnetPage = null;
 let sharedBadrConn = null;
@@ -2453,6 +2491,9 @@ async function scanAcheminementsFolder(folderPath) {
 
 // ── IPC: Scan folder for acheminements ────────────────────────────────────────
 ipcMain.handle("folder:scan", async (_event, folderPath) => {
+  // (Re)watch this folder so folders added later show up live without a manual
+  // refresh. Idempotent when the path is unchanged.
+  watchAcheminementsFolder(folderPath);
   return await scanAcheminementsFolder(folderPath);
 });
 
@@ -2726,5 +2767,13 @@ ipcMain.handle(
 );
 
 app.on("before-quit", async () => {
+  if (folderWatcher) {
+    try {
+      folderWatcher.close();
+    } catch {
+      /* ignore */
+    }
+    folderWatcher = null;
+  }
   await closeSharedSessions();
 });
