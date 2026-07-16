@@ -925,6 +925,26 @@ async function finalizeAcceptedOnBadr(acheminement, badrRef) {
   }
 }
 
+// Mirror of src/ui/requiredFields.js (keep in sync): an LTA is launchable only
+// when every obligatory field is filled. Duplicated because that module is ESM
+// (renderer) while this runs in the CommonJS main process. Returns missing labels.
+function acheminementMissingRequiredFields(ach) {
+  const fields = [
+    ["scelle1", "Scellé #1"],
+    ["scelle2", "Scellé #2"],
+    ["nombreContenant", "Nb. contenant"],
+    ["poidTotal", "Poids total"],
+    ["totalValue", "Valeur totale"],
+  ];
+  if (ach?.partiel) fields.push(["fretValue", "Valeur fret MAWB"]);
+  return fields
+    .filter(([key]) => {
+      const v = ach?.[key];
+      return v === undefined || v === null || String(v).trim() === "";
+    })
+    .map(([, label]) => label);
+}
+
 async function monitorPendingPortnetRequests(acheminements, portnetPage) {
   const PortnetDsCombine = require("../src/portnet/portnetDsCombine");
   const dsCombine = new PortnetDsCombine(portnetPage);
@@ -964,6 +984,108 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
   }
 
   if (pending.size === 0) return;
+
+  // ── Mid-run pickup of newly-added LTA folders ──────────────────────────────
+  // While we poll Portnet for acceptance, the operator may drop a new LTA folder
+  // into the same acheminements directory. Each poll cycle we re-scan for folders
+  // we haven't handled yet; any one that is FULLY COMPLETE (all required fields)
+  // is submitted on the live sessions and added to this polling set — no app
+  // restart, no code/CAPTCHA re-entry. Incomplete ones are left alone (logged
+  // once) and re-checked on later cycles, so they get picked up once completed.
+  const rootFolder = acheminements
+    .map((a) => a.folderPath)
+    .filter(Boolean)
+    .map((p) => path.dirname(p))[0];
+  const handledIds = new Set(acheminements.map((a) => a.id));
+  const warnedIncompleteIds = new Set();
+  const HANDLED_PHASES = [
+    "badr_done",
+    "partiel_done",
+    "partiel_skip",
+    "error",
+    "weight_mismatch",
+    "partiel_waiting_signature",
+    "partiel_waiting_lots",
+  ];
+
+  async function injectNewlyAddedLtas() {
+    if (!rootFolder || !fs.existsSync(rootFolder)) return 0;
+    let dirNames;
+    try {
+      dirNames = fs
+        .readdirSync(rootFolder, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name);
+    } catch {
+      return 0;
+    }
+
+    let submitted = 0;
+    for (const name of dirNames) {
+      if (handledIds.has(name)) continue;
+
+      let ach;
+      try {
+        ach = await scanSingleAcheminement(rootFolder, name);
+      } catch (e) {
+        sendLog("warn", "Scan", `Rescan du dossier "${name}" échoué: ${e.message}`);
+        continue;
+      }
+      if (!ach) {
+        handledIds.add(name);
+        continue;
+      }
+
+      if (HANDLED_PHASES.includes(ach.automationState?.phase)) {
+        handledIds.add(name); // already done / waiting / errored — not our job
+        continue;
+      }
+      if (ach.refMismatch && !ach.manifestRef) {
+        if (!warnedIncompleteIds.has(name)) {
+          sendLog("warn", "Automation", `Nouveau dossier "${name}" détecté mais référence manifeste/MAWB incohérente — à corriger dans l'UI.`);
+          warnedIncompleteIds.add(name);
+        }
+        continue;
+      }
+      if (ach.mawbMismatch) {
+        if (!warnedIncompleteIds.has(name)) {
+          sendLog("warn", "Automation", `Nouveau dossier "${name}" détecté mais ${ach.mawbMismatch}`);
+          warnedIncompleteIds.add(name);
+        }
+        continue;
+      }
+      const missing = acheminementMissingRequiredFields(ach);
+      if (missing.length > 0) {
+        if (!warnedIncompleteIds.has(name)) {
+          sendLog("info", "Automation", `Nouveau dossier "${name}" détecté — champs obligatoires manquants (${missing.join(", ")}). Il sera traité une fois complété.`);
+          warnedIncompleteIds.add(name);
+        }
+        continue; // leave unhandled → re-checked next cycle once completed
+      }
+
+      // Complete & launchable → process now on the live BADR/Portnet sessions.
+      sendLog("info", "Automation", `🔄 Nouveau LTA complet "${name}" détecté pendant le suivi — traitement…`);
+      warnedIncompleteIds.delete(name);
+      handledIds.add(name);
+      try {
+        const res = await runAutomationTask(ach, {
+          stopAfterSubmit: true,
+          sharedPortnetPage: portnetPage,
+        });
+        if (!ach.partiel && res?.success) {
+          const st = getAutomationState(ach.folderPath);
+          if (st?.portnetRef && !st.badrRef) {
+            pending.set(ach.id, ach);
+            submitted++;
+            sendLog("info", "Automation", `"${name}" soumis à Portnet — ajouté au suivi.`);
+          }
+        }
+      } catch (e) {
+        sendLog("error", "Automation", `Traitement du nouveau LTA "${name}" échoué: ${e.message}`);
+      }
+    }
+    return submitted;
+  }
 
   await dsCombine.openConsultationPage();
 
@@ -1010,6 +1132,24 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
   const maxAttempts = 240;
   try {
     while (pending.size > 0) {
+      // Pick up any newly-added, fully-complete LTA folder without stopping the
+      // app. Guard with badrBusy so the keepalive timer doesn't touch BADR while
+      // the new LTA's lot-lookup/pré-apurement runs.
+      badrBusy = true;
+      let injected = 0;
+      try {
+        injected = await injectNewlyAddedLtas();
+      } finally {
+        badrBusy = false;
+      }
+      if (injected > 0) {
+        // Submitting a new LTA navigated the Portnet page off the consultation
+        // view — reopen it (openConsultationPage re-applies the sort) before
+        // polling statuses again.
+        await dsCombine.openConsultationPage();
+      }
+      if (pending.size === 0) break;
+
       let highestAttempts = 0;
 
       for (const ach of pending.values()) {
@@ -1985,18 +2125,11 @@ function computeMawbVsManifestMismatch({
   };
 }
 
-// ── IPC: Scan folder for acheminements ────────────────────────────────────────
-ipcMain.handle("folder:scan", async (_event, folderPath) => {
-  if (!folderPath || !fs.existsSync(folderPath)) return [];
-
-  sendLog("info", "Scan", `Dossier acheminements: ${folderPath}`);
-
-  const entries = fs.readdirSync(folderPath, { withFileTypes: true });
-  const acheminements = [];
-
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const dirPath = path.join(folderPath, entry.name);
+// ── Scan ONE subfolder into an acheminement object. Extracted so the monitor can
+// rescan a single newly-added LTA folder mid-run (not just via the folder:scan IPC).
+async function scanSingleAcheminement(rootFolderPath, entryName) {
+    const entry = { name: entryName };
+    const dirPath = path.join(rootFolderPath, entry.name);
     const files = fs
       .readdirSync(dirPath)
       .filter((f) => f.toLowerCase().endsWith(".pdf"));
@@ -2230,7 +2363,7 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
       mawbPoids: saved.mawbGrossWeight,
     });
 
-    acheminements.push({
+    return {
       id: entry.name,
       name: entry.name,
       folderPath: dirPath,
@@ -2270,7 +2403,22 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
       mawbMismatch: mawbCheck.blocking,
       mawbWarning: mawbCheck.warning,
       automationState: saved[CHECKPOINT_KEY] ?? null,
-    });
+    };
+}
+
+// ── Scan a whole folder into acheminement objects (folder:scan IPC + monitor). ──
+async function scanAcheminementsFolder(folderPath) {
+  if (!folderPath || !fs.existsSync(folderPath)) return [];
+
+  sendLog("info", "Scan", `Dossier acheminements: ${folderPath}`);
+
+  const entries = fs.readdirSync(folderPath, { withFileTypes: true });
+  const acheminements = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const ach = await scanSingleAcheminement(folderPath, entry.name);
+    if (ach) acheminements.push(ach);
   }
 
   // Sort by leading number in folder name (e.g. "7eme LTA" < "10eme LTA")
@@ -2281,6 +2429,11 @@ ipcMain.handle("folder:scan", async (_event, folderPath) => {
   });
 
   return acheminements;
+}
+
+// ── IPC: Scan folder for acheminements ────────────────────────────────────────
+ipcMain.handle("folder:scan", async (_event, folderPath) => {
+  return await scanAcheminementsFolder(folderPath);
 });
 
 // ── IPC: Persist user-input fields for one acheminement ──────────────────────

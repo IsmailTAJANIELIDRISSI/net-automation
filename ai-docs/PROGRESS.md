@@ -17,6 +17,17 @@ A first cut also added a manual **⏸ Pause** button, but it was removed — pau
 
 **Files changed:** `src/ui/App.jsx`
 
+### Follow-up — pick up new folders *during* Portnet monitoring (not just after the batch)
+
+**Gap found:** the drain loop only re-scans *after* `runAllAutomation` returns. But a batch is one long blocking call: submit all → then **monitor** (poll Portnet for "Acceptée", finalize on BADR), which can run a long time. So a folder dropped in while it's "refreshing BADR/Portnet, checking status" wasn't seen until the current LTAs finished.
+
+**Fix (`electron/main.js`):** the Portnet poll loop itself now re-scans each cycle.
+- Refactored the `folder:scan` IPC body into reusable `scanSingleAcheminement(root, name)` + `scanAcheminementsFolder(folder)` (IPC is now a thin wrapper).
+- Added `acheminementMissingRequiredFields(ach)` — a CommonJS mirror of `src/ui/requiredFields.js` (keep in sync).
+- Inside `monitorPendingPortnetRequests`, `injectNewlyAddedLtas()` runs at the top of each poll cycle (guarded by `badrBusy` so the keepalive timer doesn't collide): it lists subfolders, and for any not yet handled it scans just that one. If it's **fully complete** (all required fields, no refMismatch, no blocking mawbMismatch) it's submitted via `runAutomationTask(..., { stopAfterSubmit, sharedPortnetPage })` on the live sessions and added to the polling set; then the consultation page is reopened. **Incomplete** folders are logged once and left unhandled, so they're re-checked on later cycles and picked up the moment the operator finishes their fields. `handledIds`/`warnedIncompleteIds` sets prevent reprocessing and log spam. Matches the operator's ask: while monitoring the current LTAs, a new complete folder is handled automatically (as if they'd stopped + re-added it), an incomplete one is left until completed. NOTE: the new LTA's card only appears in the UI after the batch returns (the renderer re-scans then); progress is visible in the logs meanwhile.
+
+**Files changed:** `electron/main.js`
+
 ---
 
 ## 2026-07-03 — Manifest ↔ MAWB weight gap: warn instead of block
