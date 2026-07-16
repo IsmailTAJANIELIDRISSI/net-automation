@@ -5,6 +5,20 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-07-09 — Auto re-scan drain loop: pick up late-arriving LTAs automatically
+
+**Problem:** While a batch of N LTAs is running, a new LTA arrives by email. To add it the operator was closing the whole app, downloading the folder, and restarting — which re-triggers the BADR USB-certificate insertion and the Portnet CAPTCHA every time.
+
+**Key realization:** the BADR/Portnet sessions are already module-level and persistent (`sharedPortnetApp`, `sharedBadrConn`); `closeSharedSessions()` only runs on app-quit or the explicit "close sessions" IPC — never after a batch. So relaunching already reuses the live browsers, and the checkpoint system already skips done LTAs and resumes submitted-but-pending ones.
+
+**Fix — drain loop in `src/ui/App.jsx` (`handleRunAll`):** run all launchable LTAs → RE-SCAN the folder → if a new launchable LTA folder was dropped in during the run, process it too → repeat until a re-scan finds nothing new. So the operator just drops the 5th folder into the acheminements dir while 1–4 are running (which takes minutes); when 1–4 finish, the re-scan finds the 5th and processes it on the same open sessions — no restart, no code/CAPTCHA re-entry. Guards: `computeLaunchable()` (module helper) excludes done/waiting/error/missing-field LTAs via a `NON_LAUNCHABLE_PHASES` set; a per-pass launchable-ID signature stops the loop if nothing progresses (e.g. an LTA keeps erroring); hard cap of 100 passes. Delete-done runs once, after the loop fully drains.
+
+A first cut also added a manual **⏸ Pause** button, but it was removed — pause could only take effect at LTA/poll boundaries (a form mid-fill finishes first, by design), which felt like "it's still running". The drain loop covers the real need (inject a late LTA) without it.
+
+**Files changed:** `src/ui/App.jsx`
+
+---
+
 ## 2026-07-03 — Manifest ↔ MAWB weight gap: warn instead of block
 
 **Problem:** The manifest-vs-MAWB cross-check blocked the launch on ANY weight difference (e.g. manifest 2020 kg vs MAWB 2022 kg — a 2 kg rounding gap). Weight commonly differs by a few kg and is rectifiable in the poids input, plus the authoritative BADR weight is checked downstream. Blocking on it was too strict.

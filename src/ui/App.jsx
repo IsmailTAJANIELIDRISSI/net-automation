@@ -10,6 +10,29 @@ function preferNonEmptyPrev(prev, fromScan) {
   return fromScan ?? "";
 }
 
+/**
+ * Phases the drain loop must NOT re-launch: already finished, waiting on a human
+ * (signature / next vol), needs a manual fix (weight), or errored (don't auto-retry).
+ */
+const NON_LAUNCHABLE_PHASES = new Set([
+  "badr_done",
+  "partiel_done",
+  "partiel_skip",
+  "partiel_waiting_signature",
+  "partiel_waiting_lots",
+  "weight_mismatch",
+  "error",
+]);
+
+/** LTAs ready to be launched now: complete fields, no ref mismatch, not terminal/waiting. */
+function computeLaunchable(list) {
+  return (list || []).filter((a) => {
+    if (a.refMismatch) return false;
+    if (NON_LAUNCHABLE_PHASES.has(a.automationState?.phase)) return false;
+    return getMissingRequiredFields(a).length === 0;
+  });
+}
+
 export default function App() {
   // ── State ─────────────────────────────────────────────────────────────────
   const [folderPath, setFolderPath] = useState(null);
@@ -314,50 +337,116 @@ export default function App() {
     setIsRunning(true);
     addLog("info", "UI", "Lancement batch: soumission + suivi Portnet…");
     try {
-      // Skip LTAs missing obligatory info (scellés, nb contenant, poids/valeur).
-      const pending = [];
-      for (const a of acheminements) {
-        if (a.refMismatch) continue;
-        const missing = getMissingRequiredFields(a);
-        if (missing.length > 0) {
-          addLog(
-            "warn",
-            "UI",
-            `${a.name}: ignoré — champs obligatoires manquants : ${missing.join(", ")}`,
-          );
-          continue;
+      // ── Drain loop ──────────────────────────────────────────────────────────
+      // Process every launchable LTA, then RE-SCAN the folder and process again
+      // if a new LTA folder was dropped in while the batch was running. Repeats
+      // until a re-scan finds no new launchable LTA. The BADR/Portnet sessions
+      // stay open across passes (reused by the backend), so a late-arriving LTA
+      // is picked up automatically — no pause, no code/CAPTCHA re-entry.
+      let currentList = acheminements;
+      let prevSignature = "";
+      let pass = 0;
+
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        pass++;
+        const pending = computeLaunchable(currentList);
+
+        // Log which LTAs are skipped for missing fields — first pass only.
+        if (pass === 1) {
+          for (const a of currentList) {
+            if (a.refMismatch) continue;
+            const missing = getMissingRequiredFields(a);
+            if (missing.length > 0) {
+              addLog(
+                "warn",
+                "UI",
+                `${a.name}: ignoré — champs obligatoires manquants : ${missing.join(", ")}`,
+              );
+            }
+          }
         }
-        pending.push(a);
-      }
 
-      if (pending.length === 0) {
-        addLog(
-          "warn",
-          "UI",
-          "Aucun LTA complet à traiter (tous ignorés pour champs manquants).",
-        );
-        return;
-      }
-
-      const result = await window.api.runAllAutomation(pending);
-      if (!result.success) {
-        addLog("error", "UI", `Échec batch: ${result.error || "inconnu"}`);
-      }
-
-      // After batch completes, offer to delete done folders and re-scan.
-      if (result.doneFolders?.length > 0 && folderPath) {
-        const { deleted } = await window.api.deleteDoneFolders(
-          result.doneFolders,
-        );
-        if (deleted.length > 0) {
+        if (pending.length === 0) {
           addLog(
             "info",
             "UI",
-            `${deleted.length} dossier(s) supprimé(s) — actualisation…`,
+            pass === 1
+              ? "Aucun LTA complet à traiter (tous ignorés ou déjà traités)."
+              : "✓ Aucun nouveau LTA au re-scan — traitement terminé.",
           );
-          const scanned = await window.api.scanFolder(folderPath);
-          setAcheminements(scanned);
-          setStatuses(statusesFromScan(scanned));
+          break;
+        }
+
+        // No-progress guard: identical launchable set two passes running means
+        // nothing advanced (e.g. an LTA keeps erroring) — stop to avoid a loop.
+        const signature = pending
+          .map((a) => a.id)
+          .sort()
+          .join("|");
+        if (signature === prevSignature) {
+          addLog(
+            "warn",
+            "UI",
+            "Re-scan arrêté : les mêmes LTAs restent (aucune progression).",
+          );
+          break;
+        }
+        prevSignature = signature;
+
+        if (pass > 1) {
+          addLog(
+            "info",
+            "UI",
+            `🔄 ${pending.length} nouveau(x) LTA détecté(s) au re-scan — traitement…`,
+          );
+        }
+
+        const result = await window.api.runAllAutomation(pending);
+        if (!result.success) {
+          addLog("error", "UI", `Échec batch: ${result.error || "inconnu"}`);
+          break;
+        }
+
+        // Re-scan: reflects freshly-completed states AND surfaces new folders.
+        if (!folderPath) break;
+        const scanned = await window.api.scanFolder(folderPath);
+        setAcheminements(scanned);
+        setStatuses(statusesFromScan(scanned));
+        currentList = scanned;
+
+        if (pass >= 100) {
+          addLog(
+            "warn",
+            "UI",
+            "Re-scan interrompu (limite de passes atteinte).",
+          );
+          break;
+        }
+      }
+
+      // All caught up — offer to delete fully-done folders.
+      if (folderPath) {
+        const scanned = await window.api.scanFolder(folderPath);
+        const doneFolders = scanned
+          .filter((a) => {
+            const p = a.automationState?.phase;
+            return p === "badr_done" || p === "partiel_done";
+          })
+          .map((a) => a.folderPath)
+          .filter(Boolean);
+        if (doneFolders.length > 0) {
+          const { deleted } = await window.api.deleteDoneFolders(doneFolders);
+          if (deleted.length > 0) {
+            addLog(
+              "info",
+              "UI",
+              `${deleted.length} dossier(s) supprimé(s) — actualisation…`,
+            );
+            const rescanned = await window.api.scanFolder(folderPath);
+            setAcheminements(rescanned);
+            setStatuses(statusesFromScan(rescanned));
+          }
         }
       }
     } catch (err) {
