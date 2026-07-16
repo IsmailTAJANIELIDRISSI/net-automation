@@ -51,6 +51,13 @@ contextBridge.exposeInMainWorld("api", {
     return () => ipcRenderer.removeListener("progress", listener);
   },
 
+  /** Fired when the backend discovers a new LTA folder mid-run — renderer should re-scan. */
+  onAcheminementsChanged: (cb) => {
+    const listener = () => cb();
+    ipcRenderer.on("acheminements-changed", listener);
+    return () => ipcRenderer.removeListener("acheminements-changed", listener);
+  },
+
   // ── Utilities ──────────────────────────────────────────────────────────────
   platform: process.platform,
 });

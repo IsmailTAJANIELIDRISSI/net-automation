@@ -112,6 +112,14 @@ function sendProgress(acheminementId, status, extra = {}) {
   }
 }
 
+// Tell the renderer the acheminements list changed on disk (e.g. the monitor
+// discovered a newly-added LTA folder mid-run) so it re-scans and shows it.
+function notifyAcheminementsChanged() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("acheminements-changed");
+  }
+}
+
 let sharedPortnetApp = null;
 let sharedPortnetPage = null;
 let sharedBadrConn = null;
@@ -998,6 +1006,9 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
     .map((p) => path.dirname(p))[0];
   const handledIds = new Set(acheminements.map((a) => a.id));
   const warnedIncompleteIds = new Set();
+  // Folder names the UI already shows — used to fire ONE "acheminements-changed"
+  // event the first time a new folder appears, so its card shows up mid-run.
+  const uiKnownIds = new Set(acheminements.map((a) => a.id));
   const HANDLED_PHASES = [
     "badr_done",
     "partiel_done",
@@ -1021,6 +1032,7 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
     }
 
     let submitted = 0;
+    let changed = false;
     for (const name of dirNames) {
       if (handledIds.has(name)) continue;
 
@@ -1034,6 +1046,13 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
       if (!ach) {
         handledIds.add(name);
         continue;
+      }
+
+      // First time we see a folder the UI doesn't have → ask it to re-scan so
+      // the card appears (whether it's complete, incomplete, or already done).
+      if (!uiKnownIds.has(name)) {
+        uiKnownIds.add(name);
+        changed = true;
       }
 
       if (HANDLED_PHASES.includes(ach.automationState?.phase)) {
@@ -1084,6 +1103,7 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
         sendLog("error", "Automation", `Traitement du nouveau LTA "${name}" échoué: ${e.message}`);
       }
     }
+    if (changed) notifyAcheminementsChanged();
     return submitted;
   }
 

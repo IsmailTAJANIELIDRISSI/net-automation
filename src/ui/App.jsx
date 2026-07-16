@@ -192,6 +192,16 @@ export default function App() {
     });
   }, [folderPath]);
 
+  // Backend found a new LTA folder mid-run (during Portnet monitoring) → re-scan
+  // so its card shows up live, without waiting for the batch to finish.
+  useEffect(() => {
+    const unsub = window.api.onAcheminementsChanged(() => {
+      addLog("info", "UI", "Nouveau dossier détecté — actualisation de la liste…");
+      handleRefresh();
+    });
+    return () => unsub?.();
+  }, [handleRefresh]);
+
   // ── Field onChange (per-card) ──────────────────────────────────────────────
   const handleChange = useCallback((id, key, value) => {
     setAcheminements((prev) =>
