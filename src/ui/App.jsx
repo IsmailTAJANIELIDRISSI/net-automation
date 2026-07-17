@@ -11,7 +11,7 @@ function preferNonEmptyPrev(prev, fromScan) {
 }
 
 /**
- * Phases the drain loop must NOT re-launch: already finished, waiting on a human
+ * Phases "Tout lancer" must NOT (re)launch: already finished, waiting on a human
  * (signature / next vol), needs a manual fix (weight), or errored (don't auto-retry).
  */
 const NON_LAUNCHABLE_PHASES = new Set([
@@ -87,6 +87,10 @@ export default function App() {
 
   // Mirror of acheminements kept in a ref so handleChange can read latest without stale closure
   const achRef = useRef([]);
+  // True while a batch (submit → monitor) is running. A launch during this window
+  // is handed to the running monitor (backend queues it) instead of starting a
+  // second concurrent batch. A ref (not state) so handlers read it synchronously.
+  const runInProgressRef = useRef(false);
   useEffect(() => {
     achRef.current = acheminements;
   }, [acheminements]);
@@ -304,7 +308,24 @@ export default function App() {
 
   // ── Run one acheminement ───────────────────────────────────────────────────
   const handleRun = useCallback(async (ach) => {
+    // A batch is already running → hand this LTA to the running monitor instead
+    // of starting a concurrent one (backend queues it; browsers stay open).
+    if (runInProgressRef.current) {
+      const res = await window.api.runAutomation(ach);
+      if (res?.queued) {
+        addLog(
+          "info",
+          "UI",
+          `🔄 ${ach.name} ajouté au traitement en cours (sessions ouvertes).`,
+        );
+      } else if (res?.busy) {
+        addLog("warn", "UI", "Soumission en cours — réessayez dans un instant.");
+      }
+      return;
+    }
+
     setIsRunning(true);
+    runInProgressRef.current = true;
     setStatuses((prev) => ({
       ...prev,
       [ach.id]: { acheminementId: ach.id, status: "running" },
@@ -339,103 +360,64 @@ export default function App() {
       addLog("error", "UI", `Exception: ${err.message}`);
     } finally {
       setIsRunning(false);
+      runInProgressRef.current = false;
     }
   }, []);
 
   // ── Run all (sequential) ──────────────────────────────────────────────────
   const handleRunAll = useCallback(async () => {
+    // Launchable LTAs right now (complete fields, not done/waiting/error).
+    const pending = computeLaunchable(acheminements);
+
+    for (const a of acheminements) {
+      if (a.refMismatch) continue;
+      const missing = getMissingRequiredFields(a);
+      if (missing.length > 0) {
+        addLog(
+          "warn",
+          "UI",
+          `${a.name}: ignoré — champs obligatoires manquants : ${missing.join(", ")}`,
+        );
+      }
+    }
+
+    if (pending.length === 0) {
+      addLog(
+        "info",
+        "UI",
+        "Aucun LTA complet à traiter (tous ignorés ou déjà traités).",
+      );
+      return;
+    }
+
+    // A batch is already running (e.g. polling Portnet for Acceptée). Hand the
+    // launchable LTAs to the running monitor — it injects the ones not already
+    // submitted/done, so only newly-edited LTAs get processed, browsers stay open.
+    if (runInProgressRef.current) {
+      const res = await window.api.runAllAutomation(pending);
+      if (res?.queued) {
+        addLog(
+          "info",
+          "UI",
+          "🔄 LTA(s) ajouté(s) au traitement en cours — les LTAs déjà traités sont ignorés (sessions ouvertes).",
+        );
+      } else if (res?.busy) {
+        addLog("warn", "UI", "Soumission en cours — réessayez dans un instant.");
+      }
+      return;
+    }
+
     setIsRunning(true);
+    runInProgressRef.current = true;
     addLog("info", "UI", "Lancement batch: soumission + suivi Portnet…");
     try {
-      // ── Drain loop ──────────────────────────────────────────────────────────
-      // Process every launchable LTA, then RE-SCAN the folder and process again
-      // if a new LTA folder was dropped in while the batch was running. Repeats
-      // until a re-scan finds no new launchable LTA. The BADR/Portnet sessions
-      // stay open across passes (reused by the backend), so a late-arriving LTA
-      // is picked up automatically — no pause, no code/CAPTCHA re-entry.
-      let currentList = acheminements;
-      let prevSignature = "";
-      let pass = 0;
-
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
-        pass++;
-        const pending = computeLaunchable(currentList);
-
-        // Log which LTAs are skipped for missing fields — first pass only.
-        if (pass === 1) {
-          for (const a of currentList) {
-            if (a.refMismatch) continue;
-            const missing = getMissingRequiredFields(a);
-            if (missing.length > 0) {
-              addLog(
-                "warn",
-                "UI",
-                `${a.name}: ignoré — champs obligatoires manquants : ${missing.join(", ")}`,
-              );
-            }
-          }
-        }
-
-        if (pending.length === 0) {
-          addLog(
-            "info",
-            "UI",
-            pass === 1
-              ? "Aucun LTA complet à traiter (tous ignorés ou déjà traités)."
-              : "✓ Aucun nouveau LTA au re-scan — traitement terminé.",
-          );
-          break;
-        }
-
-        // No-progress guard: identical launchable set two passes running means
-        // nothing advanced (e.g. an LTA keeps erroring) — stop to avoid a loop.
-        const signature = pending
-          .map((a) => a.id)
-          .sort()
-          .join("|");
-        if (signature === prevSignature) {
-          addLog(
-            "warn",
-            "UI",
-            "Re-scan arrêté : les mêmes LTAs restent (aucune progression).",
-          );
-          break;
-        }
-        prevSignature = signature;
-
-        if (pass > 1) {
-          addLog(
-            "info",
-            "UI",
-            `🔄 ${pending.length} nouveau(x) LTA détecté(s) au re-scan — traitement…`,
-          );
-        }
-
-        const result = await window.api.runAllAutomation(pending);
-        if (!result.success) {
-          addLog("error", "UI", `Échec batch: ${result.error || "inconnu"}`);
-          break;
-        }
-
-        // Re-scan: reflects freshly-completed states AND surfaces new folders.
-        if (!folderPath) break;
-        const scanned = await window.api.scanFolder(folderPath);
-        setAcheminements(scanned);
-        setStatuses(statusesFromScan(scanned));
-        currentList = scanned;
-
-        if (pass >= 100) {
-          addLog(
-            "warn",
-            "UI",
-            "Re-scan interrompu (limite de passes atteinte).",
-          );
-          break;
-        }
+      const result = await window.api.runAllAutomation(pending);
+      if (!result.success) {
+        addLog("error", "UI", `Échec batch: ${result.error || "inconnu"}`);
       }
 
-      // All caught up — offer to delete fully-done folders.
+      // Batch done — offer to delete fully-done folders. Any folder added during
+      // the run stays as an editable, un-launched card for the operator.
       if (folderPath) {
         const scanned = await window.api.scanFolder(folderPath);
         const doneFolders = scanned
@@ -463,6 +445,7 @@ export default function App() {
       addLog("error", "UI", `Exception batch: ${err.message}`);
     } finally {
       setIsRunning(false);
+      runInProgressRef.current = false;
     }
   }, [acheminements, folderPath]);
 
@@ -528,12 +511,17 @@ export default function App() {
             </button>
             <button
               onClick={handleRunAll}
-              disabled={isRunning || acheminements.length === 0}
+              disabled={acheminements.length === 0}
+              title={
+                isRunning
+                  ? "Ajoute les nouveaux LTA complets au traitement en cours (sessions ouvertes ; les LTAs déjà traités sont ignorés)"
+                  : undefined
+              }
               className="text-xs px-4 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600
                          text-white font-semibold shadow-md
                          disabled:opacity-50 disabled:cursor-not-allowed transition-all"
             >
-              {isRunning ? "En cours…" : "▶ Tout lancer"}
+              {isRunning ? "➕ Ajouter au traitement" : "▶ Tout lancer"}
             </button>
             <button
               onClick={() => setLogPanelOpen((v) => !v)}

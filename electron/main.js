@@ -162,6 +162,16 @@ let sharedPortnetApp = null;
 let sharedPortnetPage = null;
 let sharedBadrConn = null;
 
+// A batch is running (submit → monitor). While it is, a "Tout lancer" / "Lancer"
+// from the UI must NOT start a second concurrent batch (that would race on the
+// shared browser pages). Instead, if a Portnet monitor is actively polling
+// (monitorActive), the request is queued and the running monitor injects it on
+// its next poll cycle — checkpoints skip LTAs already submitted/done, so only
+// genuinely new LTAs get processed, and the browsers stay open.
+let batchRunning = false;
+let monitorActive = false;
+const injectionQueue = []; // [{ id, folderPath }] awaiting the running monitor
+
 async function ensurePortnetSession() {
   const PortnetLogin = require("../src/portnet/portnetLogin");
 
@@ -971,26 +981,6 @@ async function finalizeAcceptedOnBadr(acheminement, badrRef) {
   }
 }
 
-// Mirror of src/ui/requiredFields.js (keep in sync): an LTA is launchable only
-// when every obligatory field is filled. Duplicated because that module is ESM
-// (renderer) while this runs in the CommonJS main process. Returns missing labels.
-function acheminementMissingRequiredFields(ach) {
-  const fields = [
-    ["scelle1", "Scellé #1"],
-    ["scelle2", "Scellé #2"],
-    ["nombreContenant", "Nb. contenant"],
-    ["poidTotal", "Poids total"],
-    ["totalValue", "Valeur totale"],
-  ];
-  if (ach?.partiel) fields.push(["fretValue", "Valeur fret MAWB"]);
-  return fields
-    .filter(([key]) => {
-      const v = ach?.[key];
-      return v === undefined || v === null || String(v).trim() === "";
-    })
-    .map(([, label]) => label);
-}
-
 async function monitorPendingPortnetRequests(acheminements, portnetPage) {
   const PortnetDsCombine = require("../src/portnet/portnetDsCombine");
   const dsCombine = new PortnetDsCombine(portnetPage);
@@ -1031,117 +1021,57 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
 
   if (pending.size === 0) return;
 
-  // ── Mid-run pickup of newly-added LTA folders ──────────────────────────────
-  // While we poll Portnet for acceptance, the operator may drop a new LTA folder
-  // into the same acheminements directory. Each poll cycle we re-scan for folders
-  // we haven't handled yet; any one that is FULLY COMPLETE (all required fields)
-  // is submitted on the live sessions and added to this polling set — no app
-  // restart, no code/CAPTCHA re-entry. Incomplete ones are left alone (logged
-  // once) and re-checked on later cycles, so they get picked up once completed.
-  const rootFolder = acheminements
-    .map((a) => a.folderPath)
-    .filter(Boolean)
-    .map((p) => path.dirname(p))[0];
-  const handledIds = new Set(acheminements.map((a) => a.id));
-  const warnedIncompleteIds = new Set();
-  // Folder names the UI already shows — used to fire ONE "acheminements-changed"
-  // event the first time a new folder appears, so its card shows up mid-run.
-  const uiKnownIds = new Set(acheminements.map((a) => a.id));
-  const HANDLED_PHASES = [
-    "badr_done",
-    "partiel_done",
-    "partiel_skip",
-    "error",
-    "weight_mismatch",
-    "partiel_waiting_signature",
-    "partiel_waiting_lots",
-  ];
-
-  async function injectNewlyAddedLtas() {
-    if (!rootFolder || !fs.existsSync(rootFolder)) return 0;
-    let dirNames;
-    try {
-      dirNames = fs
-        .readdirSync(rootFolder, { withFileTypes: true })
-        .filter((d) => d.isDirectory())
-        .map((d) => d.name);
-    } catch {
-      return 0;
-    }
-
+  // ── User-triggered injection while this monitor polls ──────────────────────
+  // The operator can edit a newly-added LTA's card during the (long) "waiting for
+  // Acceptée" phase and press Lancer / Tout lancer. That request is queued (see
+  // injectionQueue / the automation:run* IPCs); here we submit those LTAs on the
+  // live sessions and add them to this polling set. Already-submitted or done
+  // LTAs are skipped via `pending`/checkpoint, so only genuinely new ones run.
+  async function drainInjectionQueue() {
+    if (injectionQueue.length === 0) return 0;
+    const reqs = injectionQueue.splice(0);
     let submitted = 0;
-    let changed = false;
-    for (const name of dirNames) {
-      if (handledIds.has(name)) continue;
-
-      let ach;
-      try {
-        ach = await scanSingleAcheminement(rootFolder, name);
-      } catch (e) {
-        sendLog("warn", "Scan", `Rescan du dossier "${name}" échoué: ${e.message}`);
-        continue;
-      }
-      if (!ach) {
-        handledIds.add(name);
-        continue;
-      }
-
-      // First time we see a folder the UI doesn't have → ask it to re-scan so
-      // the card appears (whether it's complete, incomplete, or already done).
-      if (!uiKnownIds.has(name)) {
-        uiKnownIds.add(name);
-        changed = true;
-      }
-
-      if (HANDLED_PHASES.includes(ach.automationState?.phase)) {
-        handledIds.add(name); // already done / waiting / errored — not our job
-        continue;
+    for (const ach of reqs) {
+      // Use the ach exactly as the UI sent it — it carries the operator's edits
+      // (e.g. a corrected totalValue). Re-scanning would let PDF extraction
+      // overwrite those edits, which is the whole thing they came here to fix.
+      if (!ach?.folderPath) continue;
+      const id = ach.id || path.basename(ach.folderPath);
+      if (pending.has(id)) continue; // already being polled
+      const st = getAutomationState(ach.folderPath);
+      if (
+        st?.badrRef ||
+        st?.phase === "badr_done" ||
+        st?.phase === "partiel_done"
+      ) {
+        continue; // already finished
       }
       if (ach.refMismatch && !ach.manifestRef) {
-        if (!warnedIncompleteIds.has(name)) {
-          sendLog("warn", "Automation", `Nouveau dossier "${name}" détecté mais référence manifeste/MAWB incohérente — à corriger dans l'UI.`);
-          warnedIncompleteIds.add(name);
-        }
+        sendLog("warn", "Automation", `"${id}": référence manifeste/MAWB incohérente — ignoré.`);
         continue;
       }
       if (ach.mawbMismatch) {
-        if (!warnedIncompleteIds.has(name)) {
-          sendLog("warn", "Automation", `Nouveau dossier "${name}" détecté mais ${ach.mawbMismatch}`);
-          warnedIncompleteIds.add(name);
-        }
+        sendLog("warn", "Automation", `"${id}": ${ach.mawbMismatch} — ignoré.`);
         continue;
       }
-      const missing = acheminementMissingRequiredFields(ach);
-      if (missing.length > 0) {
-        if (!warnedIncompleteIds.has(name)) {
-          sendLog("info", "Automation", `Nouveau dossier "${name}" détecté — champs obligatoires manquants (${missing.join(", ")}). Il sera traité une fois complété.`);
-          warnedIncompleteIds.add(name);
-        }
-        continue; // leave unhandled → re-checked next cycle once completed
-      }
-
-      // Complete & launchable → process now on the live BADR/Portnet sessions.
-      sendLog("info", "Automation", `🔄 Nouveau LTA complet "${name}" détecté pendant le suivi — traitement…`);
-      warnedIncompleteIds.delete(name);
-      handledIds.add(name);
+      sendLog("info", "Automation", `Traitement du LTA "${id}" ajouté au suivi en cours…`);
       try {
         const res = await runAutomationTask(ach, {
           stopAfterSubmit: true,
           sharedPortnetPage: portnetPage,
         });
         if (!ach.partiel && res?.success) {
-          const st = getAutomationState(ach.folderPath);
-          if (st?.portnetRef && !st.badrRef) {
-            pending.set(ach.id, ach);
+          const s2 = getAutomationState(ach.folderPath);
+          if (s2?.portnetRef && !s2.badrRef) {
+            pending.set(id, ach);
             submitted++;
-            sendLog("info", "Automation", `"${name}" soumis à Portnet — ajouté au suivi.`);
+            sendLog("info", "Automation", `"${id}" soumis à Portnet — ajouté au suivi.`);
           }
         }
       } catch (e) {
-        sendLog("error", "Automation", `Traitement du nouveau LTA "${name}" échoué: ${e.message}`);
+        sendLog("error", "Automation", `Traitement de "${id}" échoué: ${e.message}`);
       }
     }
-    if (changed) notifyAcheminementsChanged();
     return submitted;
   }
 
@@ -1188,22 +1118,20 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
   }, 45000); // 45 seconds — frequent enough to keep BADR session alive
 
   const maxAttempts = 240;
+  monitorActive = true;
   try {
     while (pending.size > 0) {
-      // Pick up any newly-added, fully-complete LTA folder without stopping the
-      // app. Guard with badrBusy so the keepalive timer doesn't touch BADR while
-      // the new LTA's lot-lookup/pré-apurement runs.
+      // Inject any LTAs the operator launched while this monitor is polling.
+      // Guard with badrBusy so the keepalive timer doesn't touch BADR mid-submit.
       badrBusy = true;
       let injected = 0;
       try {
-        injected = await injectNewlyAddedLtas();
+        injected = await drainInjectionQueue();
       } finally {
         badrBusy = false;
       }
       if (injected > 0) {
-        // Submitting a new LTA navigated the Portnet page off the consultation
-        // view — reopen it (openConsultationPage re-applies the sort) before
-        // polling statuses again.
+        // Submitting navigated the Portnet page off consultation — reopen it.
         await dsCombine.openConsultationPage();
       }
       if (pending.size === 0) break;
@@ -1530,6 +1458,7 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
       }
     }
   } finally {
+    monitorActive = false;
     clearInterval(badrRefreshInterval);
     sendLog("info", "BADR", "BADR session refresh timer stopped.");
   }
@@ -1859,6 +1788,7 @@ async function runAutomationTask(
 
 async function runAllAutomationTasks(acheminements) {
   let portnetPage = null;
+  batchRunning = true;
 
   try {
     const toProcess = acheminements
@@ -1985,6 +1915,9 @@ async function runAllAutomationTasks(acheminements) {
   } catch (err) {
     sendLog("error", "Automation", `Batch run failed: ${err.message}`);
     return { success: false, error: err.message };
+  } finally {
+    batchRunning = false;
+    injectionQueue.length = 0; // drop anything not picked up by the monitor
   }
 }
 
@@ -2628,12 +2561,39 @@ ipcMain.handle("shell:openPath", async (_event, filePath) => {
   await shell.openPath(filePath);
 });
 
+// Queue a launch into the running monitor if one is polling; refuse if a batch
+// is mid-submission (browsers busy). Returns null when no batch is active so the
+// caller can start one normally.
+function tryQueueDuringActiveBatch(items) {
+  if (monitorActive) {
+    // Queue the FULL ach objects (with the operator's edited fields) — the monitor
+    // uses them as-is, skipping any already submitted/done.
+    for (const a of items) {
+      if (a?.folderPath) injectionQueue.push(a);
+    }
+    sendLog(
+      "info",
+      "Automation",
+      `${items.length} LTA(s) ajouté(s) à la file du suivi en cours (déjà traités ignorés).`,
+    );
+    return { success: true, queued: true };
+  }
+  if (batchRunning) {
+    return { success: false, busy: true };
+  }
+  return null;
+}
+
 // ── IPC: Run automation for one acheminement ──────────────────────────────────
 ipcMain.handle("automation:run", async (_event, acheminement) => {
+  const queued = tryQueueDuringActiveBatch([acheminement]);
+  if (queued) return queued;
   return await runAutomationTask(acheminement);
 });
 
 ipcMain.handle("automation:run-all", async (_event, acheminements) => {
+  const queued = tryQueueDuringActiveBatch(acheminements || []);
+  if (queued) return queued;
   return await runAllAutomationTasks(acheminements || []);
 });
 

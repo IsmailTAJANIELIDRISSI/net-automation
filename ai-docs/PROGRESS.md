@@ -5,6 +5,39 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-07-17 — Manual launch of a new LTA *during* the monitoring wait (edit + inject, no concurrent batch)
+
+**Refines the reversal below.** The operator wanted: while the batch sits in the long "waiting for Acceptée" polling phase, be able to **edit** a newly-added LTA's card (fix a wrong extracted value) and **launch it** — reusing the open sessions, with checkpoints skipping the already-done LTAs — without a second concurrent batch and without closing browsers.
+
+**Problem:** clicking "Tout lancer"/"Lancer" during an active run would start a **second `runAllAutomationTasks`** racing on the shared Playwright pages. And the UI locked all inputs while running, so the value couldn't be corrected.
+
+**Fix:**
+- `electron/main.js`: `batchRunning`/`monitorActive` flags + a module-level `injectionQueue`. `tryQueueDuringActiveBatch()` (used by both `automation:run` and `automation:run-all`): if a monitor is polling → push the **full ach objects** (with the operator's edits) to the queue and return `{ queued: true }`; if mid-submit → `{ busy: true }`; else run normally. `monitorPendingPortnetRequests` sets `monitorActive` and, at the top of each poll cycle (badrBusy-guarded), `drainInjectionQueue()` submits each queued LTA on the live sessions and adds it to `pending` — **skipping any already in `pending` or checkpoint-done**, so only new LTAs run. It uses the queued object as-is (no re-scan — re-scanning would let PDF extraction overwrite the very value the operator fixed).
+- `src/ui/App.jsx`: `runInProgressRef`; `handleRunAll`/`handleRun` detect an in-progress run and call the IPC to **queue** (no `isRunning` toggle, no concurrent batch). "Tout lancer" stays enabled during a run (label → "➕ Ajouter au traitement").
+- `src/ui/components/AcheminementCard.jsx`: card fields/checkbox/selects now disable on the card's **own** `isRunning || isDone` (not the global run flag), so a not-yet-running card stays editable while other LTAs process; its "Lancer" is likewise enabled. The declare-scellés (BADR) controls and delete stay globally gated to avoid BADR concurrency.
+
+Flow: run 3 → they reach polling → drop + edit a 4th card → "Tout lancer" → 4th injected on next poll cycle, 3 skipped, browsers never closed.
+
+**Files changed:** `electron/main.js`, `src/ui/App.jsx`, `src/ui/components/AcheminementCard.jsx`
+
+---
+
+## 2026-07-17 — Reversal: do NOT auto-process late-added LTAs (manual launch instead)
+
+**Change of direction** (supersedes the 2026-07-09 mid-monitor auto-injection + drain loop below). Auto-submitting a newly-dropped folder was wrong for the operator's workflow: extracted values are sometimes wrong, and while a batch runs the UI is locked, so they couldn't fix a value before the app pushed the new LTA to customs.
+
+**New behavior:** a folder added while a batch is running is left **untouched**. The current batch finishes and marks its LTAs done, the **browsers stay open** (only closed on quit, as always), and the new LTA sits as an editable, un-launched card. The operator fixes any wrong values on it and clicks **Lancer** — which reuses the live BADR/Portnet sessions (no code/CAPTCHA re-entry).
+
+**Removed:**
+- `electron/main.js`: `injectNewlyAddedLtas()` + its per-poll-cycle call in `monitorPendingPortnetRequests`, and the now-unused `acheminementMissingRequiredFields` mirror. The monitor no longer submits anything new mid-run.
+- `src/ui/App.jsx`: the `handleRunAll` drain loop → back to a **single pass** over `computeLaunchable(acheminements)` (a snapshot at click time; folders added later aren't in it and aren't sent to the backend).
+
+**Kept (still wanted):** the live folder watcher (`fs.watch` → `acheminements-changed` → `handleRefresh`) so a dropped-in folder's card appears within ~1 s — the operator just can't edit it until the batch finishes (global run-lock), which is fine because it's never auto-processed. `computeLaunchable`/`NON_LAUNCHABLE_PHASES` still gate the single pass.
+
+**Files changed:** `electron/main.js`, `src/ui/App.jsx`
+
+---
+
 ## 2026-07-09 — Auto re-scan drain loop: pick up late-arriving LTAs automatically
 
 **Problem:** While a batch of N LTAs is running, a new LTA arrives by email. To add it the operator was closing the whole app, downloading the folder, and restarting — which re-triggers the BADR USB-certificate insertion and the Portnet CAPTCHA every time.

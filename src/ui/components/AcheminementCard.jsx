@@ -27,7 +27,9 @@ export default function AcheminementCard({
         type={type}
         value={ach[key] ?? ""}
         placeholder={placeholder}
-        disabled={isGlobalRunning}
+        // Editable unless THIS card is itself running or already done — so a new
+        // card added while other LTAs are being processed can still be corrected.
+        disabled={isRunning || isDone}
         onChange={(e) => onChange(id, key, e.target.value)}
         className="bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-sm
                    text-slate-100 placeholder-slate-600
@@ -166,7 +168,7 @@ export default function AcheminementCard({
               type="text"
               value={ach.manifestRef ?? ach.manifestPdfExtract?.refNumber ?? ""}
               placeholder="ex: 157-53609710"
-              disabled={isGlobalRunning}
+              disabled={isRunning || isDone}
               onChange={(e) => onChange(id, "manifestRef", e.target.value)}
               className="bg-slate-900 border border-amber-600/60 rounded px-2.5 py-1.5 text-sm
                          text-slate-100 placeholder-slate-600
@@ -207,7 +209,7 @@ export default function AcheminementCard({
           <div className="flex gap-2">
             <select
               value={ach.currency ?? "MAD"}
-              disabled={isGlobalRunning}
+              disabled={isRunning || isDone}
               onChange={(e) => onChange(id, "currency", e.target.value)}
               className="bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-sm
                          text-slate-100 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/50
@@ -221,7 +223,7 @@ export default function AcheminementCard({
               type="number"
               value={ach.totalValue ?? ""}
               placeholder="ex: 15000.00"
-              disabled={isGlobalRunning}
+              disabled={isRunning || isDone}
               onChange={(e) => onChange(id, "totalValue", e.target.value)}
               className="flex-1 bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-sm
                          text-slate-100 placeholder-slate-600
@@ -237,7 +239,7 @@ export default function AcheminementCard({
         <input
           type="checkbox"
           checked={ach.partiel ?? false}
-          disabled={isGlobalRunning}
+          disabled={isRunning || isDone}
           onChange={(e) => onChange(id, "partiel", e.target.checked)}
           className="w-4 h-4 rounded border-slate-600 bg-slate-900
                      text-yellow-500 focus:ring-yellow-500/50
@@ -291,7 +293,7 @@ export default function AcheminementCard({
             <input
               type="text"
               value={ach.mawbCurrency ?? ""}
-              disabled={isGlobalRunning}
+              disabled={isRunning || isDone}
               maxLength={3}
               placeholder="USD"
               onChange={(e) =>
@@ -395,7 +397,11 @@ export default function AcheminementCard({
           <button
             onClick={() => onRun(ach)}
             disabled={
-              isGlobalRunning ||
+              // Only THIS card's own running/done state blocks it — an idle card
+              // can be launched while other LTAs process; the backend queues it
+              // into the running monitor (no concurrent batch).
+              isRunning ||
+              isDone ||
               (!!ach.refMismatch && !ach.manifestRef) ||
               !!ach.mawbMismatch ||
               (hasMissingRequired && !isRunning)
