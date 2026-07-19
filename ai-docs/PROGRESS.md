@@ -5,6 +5,24 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-07-19 — Portnet: persistent Edge profile → skip login/CAPTCHA when the session is still valid
+
+**Problem:** every app launch forced a full Portnet login + CAPTCHA, and reCAPTCHA was flaky (correct answers rejected, ~2 min to pass). Cause: `portnetLogin.js` used `chromium.launch()` + `newContext()` — a throwaway profile each launch, so no session cookie was ever kept, and an empty automated profile makes reCAPTCHA harder.
+
+**Fix (legitimate — never solves/bypasses the CAPTCHA, just stops discarding the session):** Portnet now uses a **persistent Edge profile** like BADR already does.
+- `config.js`: new `portnet.userDataDir` (env `PORTNET_PROFILE_DIR`, default `C:\Temp\portnet-edge-profile`).
+- `portnetLogin.js`: `chromium.launchPersistentContext(userDataDir, { channel:"msedge", … })`; reuses the context's existing page; `close()` closes the context (flushes the profile/session cookie to disk). After navigating to the site it **races the login field vs the `/home` URL** (30 s) — if the saved session is still valid Portnet redirects to `/home`, so login + CAPTCHA are **skipped entirely**; otherwise it logs in normally (manual CAPTCHA). A real profile (cookies/history) also lowers reCAPTCHA difficulty when a login *is* needed.
+
+Net: CAPTCHA only when the server-side session has actually expired, not on every launch. First launch on an empty profile still needs one.
+
+Also ticks **"Se souvenir de moi"** (`.auth-remember-me input[checkbox]`, idempotent `.check()`, non-fatal if absent) right after filling credentials → longer server-side session, so the persisted profile stays valid longer between launches.
+
+**Explicitly not done:** automated CAPTCHA solving / bypass — it's an anti-automation control on a government system.
+
+**Files changed:** `src/portnet/portnetLogin.js`, `src/config/config.js`
+
+---
+
 ## 2026-07-19 — Injection queue: accept during any phase, responsive drain, skip errored
 
 Three fixes on top of the 2026-07-17 injection queue (confirmed working in the field — queued LTAs process one at a time, skipping submitted/done):

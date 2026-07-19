@@ -33,6 +33,12 @@ const config = {
     cargoUrl: "https://cargo.portnet.ma",
     username: process.env.PORTNET_USERNAME || "",
     password: process.env.PORTNET_PASSWORD || "",
+    // Persistent Edge profile (like BADR's). Keeping the profile between launches
+    // means Portnet's login session cookie survives an app restart — so if the
+    // session is still valid we land on /home directly and skip login + CAPTCHA.
+    // A real profile (cookies/history) also lowers reCAPTCHA challenge difficulty.
+    userDataDir:
+      process.env.PORTNET_PROFILE_DIR || "C:\\Temp\\portnet-edge-profile",
     // Fixed form values
     agrement: {
       searchDescription: "MED AFRICA LOGISTICS",

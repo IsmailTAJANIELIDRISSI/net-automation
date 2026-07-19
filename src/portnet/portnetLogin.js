@@ -28,21 +28,26 @@ class PortnetLogin {
    * @returns {import('playwright').Page} the authenticated Portnet page
    */
   async login() {
-    log.info("Launching Chromium for Portnet…");
+    log.info("Launching Edge (persistent profile) for Portnet…");
 
-    this.browser = await chromium.launch({
-      // Use the installed Microsoft Edge (BADR runs in Chrome — see badrConnection.js).
-      channel: "msedge",
-      headless: config.headless,
-      slowMo: config.slowMo,
-      // Open the window maximized so the page can use the full screen.
-      args: ["--start-maximized"],
-    });
-
-    // viewport: null → the page fills the actual (maximized) window instead of
-    // Playwright's default 1280×720 emulated viewport, which otherwise leaves
-    // empty white space at the right/bottom and clips Portnet's content.
-    this.context = await this.browser.newContext({ viewport: null });
+    // Persistent context (like BADR): reuses a real on-disk Edge profile so the
+    // Portnet session cookie survives app restarts. viewport: null → the page
+    // fills the actual (maximized) window instead of Playwright's 1280×720
+    // emulated viewport, which otherwise clips Portnet's content.
+    this.context = await chromium.launchPersistentContext(
+      config.portnet.userDataDir,
+      {
+        // Use the installed Microsoft Edge (BADR runs in Chrome — see badrConnection.js).
+        channel: "msedge",
+        headless: config.headless,
+        slowMo: config.slowMo,
+        viewport: null,
+        // Open the window maximized so the page can use the full screen.
+        args: ["--start-maximized"],
+      },
+    );
+    // browser() is null for a persistent context; keep the field for close().
+    this.browser = this.context.browser();
 
     // Apply a 90% zoom on every page Portnet loads (re-runs on each navigation,
     // top frame only to avoid double-zooming the cross-origin DS form iframe).
@@ -84,7 +89,8 @@ class PortnetLogin {
       }
     });
 
-    this.page = await this.context.newPage();
+    // A persistent context opens with one blank page — reuse it.
+    this.page = this.context.pages()[0] || (await this.context.newPage());
     this.page.setDefaultTimeout(config.timeout);
 
     log.info("Navigating to Portnet…");
@@ -92,23 +98,55 @@ class PortnetLogin {
       waitUntil: "domcontentloaded",
     });
 
-    // Fill credentials
-    const { username, password } = config.portnet;
-    await this.page.locator("#auth-username").fill(username);
-    await this.page.locator("#auth-password").fill(password);
-    log.info("Credentials filled");
+    // ── Already authenticated from the persisted profile? ─────────────────────
+    // If the saved session cookie is still valid, Portnet redirects to /home and
+    // no login (hence no CAPTCHA) is needed. Wait for whichever settles first —
+    // the login field (→ log in) or the /home URL (→ already in) — so a slow
+    // redirect isn't mistaken for the login page. Then decide from the URL.
+    const loginField = this.page.locator("#auth-username");
+    await Promise.race([
+      loginField.waitFor({ state: "visible", timeout: 30_000 }).catch(() => {}),
+      this.page
+        .waitForURL((url) => url.toString().includes("cargo.portnet.ma/home"), {
+          timeout: 30_000,
+        })
+        .catch(() => {}),
+    ]);
+    const alreadyLoggedIn = this.page.url().includes("cargo.portnet.ma/home");
 
-    // ── Manual CAPTCHA ───────────────────────────────────────────────────────
-    console.log("\n========================================");
-    console.log("  Solve the CAPTCHA and click 'Se connecter'.");
-    console.log("  Automation will continue automatically.");
-    console.log("========================================\n");
+    if (alreadyLoggedIn) {
+      log.info("Portnet: session réutilisée — déjà connecté, CAPTCHA ignoré.");
+    } else {
+      // Fill credentials
+      const { username, password } = config.portnet;
+      await this.page.locator("#auth-username").fill(username);
+      await this.page.locator("#auth-password").fill(password);
+      log.info("Credentials filled");
 
-    // Wait up to 3 minutes for the authenticated URL (slow networks need more time).
-    await this.page.waitForURL(
-      (url) => url.toString().includes("cargo.portnet.ma/home"),
-      { timeout: 180_000 },
-    );
+      // Ensure "Se souvenir de moi" is ticked → longer server-side session, so the
+      // persisted profile stays valid across launches (fewer CAPTCHAs). .check()
+      // is a no-op if it's already checked; non-fatal if the control isn't found.
+      try {
+        await this.page
+          .locator('.auth-remember-me input[type="checkbox"]')
+          .check({ timeout: 5000 });
+        log.info('"Se souvenir de moi" coché');
+      } catch {
+        log.warn('"Se souvenir de moi" introuvable — connexion sans.');
+      }
+
+      // ── Manual CAPTCHA ──────────────────────────────────────────────────────
+      console.log("\n========================================");
+      console.log("  Solve the CAPTCHA and click 'Se connecter'.");
+      console.log("  Automation will continue automatically.");
+      console.log("========================================\n");
+
+      // Wait up to 3 minutes for the authenticated URL (slow networks need more time).
+      await this.page.waitForURL(
+        (url) => url.toString().includes("cargo.portnet.ma/home"),
+        { timeout: 180_000 },
+      );
+    }
 
     // Extra safety: wait for the page to fully settle before handing it back.
     // On bad connections the DOM can still be loading after the URL change.
@@ -126,8 +164,11 @@ class PortnetLogin {
    * Close the browser session.
    */
   async close() {
-    if (this.browser) {
-      await this.browser.close();
+    // Close the persistent context (flushes the profile — incl. the session
+    // cookie — to disk so the next launch can reuse it and skip the CAPTCHA).
+    if (this.context) {
+      await this.context.close();
+      this.context = null;
       this.browser = null;
       log.info("Portnet browser closed");
     }
