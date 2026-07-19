@@ -1046,6 +1046,14 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
       ) {
         continue; // already finished
       }
+      if (st?.phase === "error") {
+        // Already rejected/failed — the checkpoint keeps its portnetRef, so
+        // re-running would only re-confirm the rejection (no re-submit). Skip it;
+        // a real retry needs the checkpoint reset. (Avoids the stale-phase re-queue
+        // seen when the UI list hadn't caught the rejection yet.)
+        sendLog("info", "Automation", `"${id}": déjà en erreur/rejeté — ignoré (relance manuelle requise).`);
+        continue;
+      }
       if (ach.refMismatch && !ach.manifestRef) {
         sendLog("warn", "Automation", `"${id}": référence manifeste/MAWB incohérente — ignoré.`);
         continue;
@@ -1435,7 +1443,23 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
         "Portnet",
         `Pending requests remain (${pending.size}). Waiting ${Math.round(waitMs / 60000)} minute(s) before refreshing consultation...`,
       );
-      await portnetPage.waitForTimeout(waitMs);
+      // Interruptible wait: poll the injection queue every 2 s so an LTA the
+      // operator just launched starts within seconds instead of at the end of
+      // the full poll interval. The next loop iteration then drains it.
+      const waitDeadline = Date.now() + waitMs;
+      while (Date.now() < waitDeadline) {
+        if (injectionQueue.length > 0) {
+          sendLog(
+            "info",
+            "Automation",
+            "Nouveau LTA en file — reprise immédiate du cycle.",
+          );
+          break;
+        }
+        await portnetPage.waitForTimeout(
+          Math.max(250, Math.min(2000, waitDeadline - Date.now())),
+        );
+      }
       try {
         // Use domcontentloaded to avoid timing out on slow networks;
         // non-fatal networkidle wait follows as a best-effort.
@@ -2561,25 +2585,24 @@ ipcMain.handle("shell:openPath", async (_event, filePath) => {
   await shell.openPath(filePath);
 });
 
-// Queue a launch into the running monitor if one is polling; refuse if a batch
-// is mid-submission (browsers busy). Returns null when no batch is active so the
-// caller can start one normally.
+// If a batch is running (ANY phase — form-fill/submit OR monitoring), queue the
+// launch instead of starting a concurrent batch. Enqueuing is just an array push
+// (never touches the browser), so it's safe even mid-submission; the running
+// monitor drains the queue once it reaches the polling phase. Returns null only
+// when no batch is active, so the caller starts one normally.
 function tryQueueDuringActiveBatch(items) {
-  if (monitorActive) {
+  if (batchRunning || monitorActive) {
     // Queue the FULL ach objects (with the operator's edited fields) — the monitor
-    // uses them as-is, skipping any already submitted/done.
+    // uses them as-is, skipping any already submitted/done/errored.
     for (const a of items) {
       if (a?.folderPath) injectionQueue.push(a);
     }
     sendLog(
       "info",
       "Automation",
-      `${items.length} LTA(s) ajouté(s) à la file du suivi en cours (déjà traités ignorés).`,
+      `${items.length} LTA(s) ajouté(s) à la file — seront traités par le lot en cours (déjà traités ignorés).`,
     );
     return { success: true, queued: true };
-  }
-  if (batchRunning) {
-    return { success: false, busy: true };
   }
   return null;
 }

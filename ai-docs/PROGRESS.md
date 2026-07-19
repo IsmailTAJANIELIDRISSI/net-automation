@@ -5,6 +5,19 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-07-19 — Injection queue: accept during any phase, responsive drain, skip errored
+
+Three fixes on top of the 2026-07-17 injection queue (confirmed working in the field — queued LTAs process one at a time, skipping submitted/done):
+
+0. **Queue during the form-fill/submit phase too.** `tryQueueDuringActiveBatch` used to queue only when `monitorActive`; during the submit/form-fill phase (`batchRunning` but not yet polling) it returned `{ busy: true }` → the UI spammed "Soumission en cours — réessayez". Now it queues whenever `batchRunning || monitorActive` — enqueuing is just an array push (never touches the browser), so it's safe mid-submission, and the monitor drains the queue once it reaches polling. So the operator can click "Ajouter au traitement" at ANY time during the run. (Edge: an all-partiel batch or one where every LTA fails during submit never opens a Portnet monitor, so those queued items aren't drained and are cleared when the batch ends — the card stays un-launched and editable, so a re-click after the batch handles it. Common non-partiel batches always monitor and drain.)
+
+1. **Responsive drain.** `drainInjectionQueue()` only runs at the top of each poll cycle, and each cycle ended with a single `waitForTimeout(waitMs)` (1–2 min), so an LTA launched mid-wait sat idle until the wait elapsed (~1 min gap observed). The wait is now **interruptible**: it polls `injectionQueue.length` every ≤2 s and breaks early, so a just-launched LTA starts within a couple of seconds.
+2. **Skip already-errored LTAs in the drain.** A `Rejetée` LTA was re-queued and re-checked because the UI's cached `automationState.phase` was still stale at click time, so `computeLaunchable` included it. `drainInjectionQueue` now reads the on-disk checkpoint and skips `phase === "error"` (checkpoint keeps its portnetRef → re-running only re-confirms the rejection, never re-submits; a real retry needs a checkpoint reset).
+
+**Files changed:** `electron/main.js`
+
+---
+
 ## 2026-07-17 — Manual launch of a new LTA *during* the monitoring wait (edit + inject, no concurrent batch)
 
 **Refines the reversal below.** The operator wanted: while the batch sits in the long "waiting for Acceptée" polling phase, be able to **edit** a newly-added LTA's card (fix a wrong extracted value) and **launch it** — reusing the open sessions, with checkpoints skipping the already-done LTAs — without a second concurrent batch and without closing browsers.
