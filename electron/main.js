@@ -1267,13 +1267,19 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
             ? Date.parse(state.submittedAt)
             : null;
           if (submittedAtMs && Date.now() - submittedAtMs >= 30 * 60 * 1000) {
-            const ref = state.portnetRef || ach.refNumber || "";
+            const portnetRef = state.portnetRef || "";
+            // Subject uses the same acheminement format as the other mails (LTA
+            // reference, not the Portnet ref), plus the pending-validation marker.
+            const ltaRef = ach.refNumber || portnetRef || "";
             await sendNotification({
-              subject: `${ach.id} — ${ref} — En cours validation Portnet`,
+              subject: `${buildAcheminementSubject(ach.id, "DS Combinée", ltaRef)} — En cours validation Portnet`,
               text:
-                `En cours validation portnet\n\n` +
-                `LTA : ${ach.id}\nRéférence : ${ref}\n\n` +
-                `-- MedAfrica --`,
+                `En cours validation Portnet\n\n` +
+                `LTA : ${ach.id}\nRéférence : ${ltaRef}` +
+                (portnetRef && portnetRef !== ltaRef
+                  ? `\nRéférence Portnet : ${portnetRef}`
+                  : "") +
+                `\n\n-- MedAfrica --`,
             }).catch(() => {});
             updateAutomationState(ach.folderPath, { pendingEmailSent: true });
             sendLog(

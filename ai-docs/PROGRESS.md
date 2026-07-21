@@ -5,6 +5,16 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-07-19 — "En cours validation Portnet" email: use the standard acheminement subject
+
+**Problem:** the 30-min "still pending" email had a raw subject `<folder> — <portnetRef> — En cours validation Portnet`, unlike the other mails.
+
+**Fix (`electron/main.js`, monitor's pending-email):** subject now uses `buildAcheminementSubject(ach.id, "DS Combinée", ltaRef)` (LTA reference, like the success mail) plus the marker → e.g. `1er acheminement DS Combinée LTA N° 235-96332110 — En cours validation Portnet`. Body shows the LTA ref and, when different, the Portnet ref.
+
+**Files changed:** `electron/main.js`
+
+---
+
 ## 2026-07-19 — Delete a finished (badr_done) LTA's folder while other LTAs still process
 
 **Ask:** in a batch, once an LTA reaches `badr_done` ("Terminé"), let the operator delete its card/folder immediately — without waiting for the whole batch to finish.
