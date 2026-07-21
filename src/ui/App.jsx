@@ -264,7 +264,9 @@ export default function App() {
         if (folderPath) {
           const scanned = await window.api.scanFolder(folderPath);
           setAcheminements(scanned);
-          setStatuses(statusesFromScan(scanned));
+          // Merge so the LIVE statuses of LTAs still processing aren't reset by
+          // the scan-derived ones (a done card can be deleted mid-run).
+          setStatuses((prev) => ({ ...statusesFromScan(scanned), ...prev }));
         }
       }
     },

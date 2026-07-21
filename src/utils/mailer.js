@@ -7,6 +7,7 @@
  */
 
 const fs = require("fs");
+const path = require("path");
 const nodemailer = require("nodemailer");
 const config = require("../config/config");
 const { createLogger } = require("./logger");
@@ -30,9 +31,12 @@ async function sendNotification({ subject, text, attachments = [] }) {
     return false;
   }
 
-  const validAttachments = (attachments || []).filter(
-    (a) => a && a.path && fs.existsSync(a.path),
-  );
+  const validAttachments = (attachments || [])
+    .filter((a) => a && a.path && fs.existsSync(a.path))
+    // Always set a clean filename = the file's basename. Otherwise nodemailer
+    // derives it by splitting the path on "/", which on a Windows path (no "/")
+    // keeps the whole path and sanitizes ":"/"\" to "_" → "C__Users_…_DS_1ER_….pdf".
+    .map((a) => ({ ...a, filename: a.filename || path.basename(a.path) }));
 
   try {
     const transporter = nodemailer.createTransport({

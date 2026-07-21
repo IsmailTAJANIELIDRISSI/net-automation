@@ -319,10 +319,11 @@ export default function AcheminementCard({
           >
             ✓ Terminé
           </div>
-          {/* 20% — delete button */}
+          {/* 20% — delete button. Always enabled: this only shows for a DONE
+              LTA, whose folder isn't part of the active monitoring set, so it's
+              safe to delete even while other LTAs are still processing. */}
           <button
             onClick={() => onDelete?.(ach)}
-            disabled={isGlobalRunning}
             title="Supprimer ce dossier"
             className="w-[20%] py-2 rounded-lg text-sm font-semibold transition-all duration-200
                        bg-red-900/40 hover:bg-red-700/60 text-red-400 hover:text-red-200

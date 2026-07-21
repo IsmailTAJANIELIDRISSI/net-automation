@@ -5,6 +5,28 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-07-19 — Delete a finished (badr_done) LTA's folder while other LTAs still process
+
+**Ask:** in a batch, once an LTA reaches `badr_done` ("Terminé"), let the operator delete its card/folder immediately — without waiting for the whole batch to finish.
+
+**Fix:**
+- `AcheminementCard.jsx`: the 🗑 delete button (only rendered in the `isDone` branch) no longer disables on `isGlobalRunning`. Safe because a done LTA's folder isn't in the monitor's active `pending` set.
+- `App.jsx` `handleDelete`: after deleting + re-scanning, statuses now **merge** (`{ ...statusesFromScan(scanned), ...prev }`) instead of replacing, so deleting a done card mid-run doesn't reset the live in-progress statuses of the other LTAs. `deleteDoneFolders` uses `fs.rmSync(force)`, so it's safe alongside the batch's own end-of-run delete-done (double-delete is a no-op).
+
+**Files changed:** `src/ui/components/AcheminementCard.jsx`, `src/ui/App.jsx`
+
+---
+
+## 2026-07-19 — Email attachments: use the file's basename, not the mangled full path
+
+**Problem:** attached PDFs arrived named `C__Users_Medafrica_Desktop_portnet-app_temp_DS_1ER_….pdf` instead of `DS_1ER_….pdf`. Attachment sites pass only `{ path }` (no `filename`); nodemailer then derives the filename by splitting on `/`, so a Windows path (no `/`) is kept whole and its `:`/`\` sanitized to `_`.
+
+**Fix (`src/utils/mailer.js`, one place — covers all callers):** map each valid attachment to `{ ...a, filename: a.filename || path.basename(a.path) }`. `path.basename` (→ `path.win32` on Windows) returns the clean basename.
+
+**Files changed:** `src/utils/mailer.js`
+
+---
+
 ## 2026-07-19 — Portnet: persistent Edge profile → skip login/CAPTCHA when the session is still valid
 
 **Problem:** every app launch forced a full Portnet login + CAPTCHA, and reCAPTCHA was flaky (correct answers rejected, ~2 min to pass). Cause: `portnetLogin.js` used `chromium.launch()` + `newContext()` — a throwaway profile each launch, so no session cookie was ever kept, and an empty automated profile makes reCAPTCHA harder.
