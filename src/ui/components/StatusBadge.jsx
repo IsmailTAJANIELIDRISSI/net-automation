@@ -21,6 +21,7 @@ export default function StatusBadge({ status, nextVol }) {
     "partiel-skip": "bg-yellow-900/60 text-yellow-300",
     "partiel-waiting-signature": "bg-amber-900/60 text-amber-300 animate-pulse",
     "partiel-waiting-lots": "bg-amber-900/60 text-amber-300 animate-pulse",
+    "waiting-manifest": "bg-amber-900/60 text-amber-300 animate-pulse",
   };
 
   const labels = {
@@ -41,6 +42,7 @@ export default function StatusBadge({ status, nextVol }) {
     "partiel-waiting-lots": nextVol
       ? `En attente ${nextVol}ème vol`
       : "En attente prochain vol",
+    "waiting-manifest": "En attente manifeste",
   };
 
   const cls = variants[status] ?? variants.idle;

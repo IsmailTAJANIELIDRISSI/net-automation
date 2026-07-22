@@ -5,6 +5,20 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-07-22 — "Pas encore manifest" is now retryable, not a hard error
+
+**Problem:** when BADR lot lookup found no manifest yet, the LTA was set to `phase: "error"` and abandoned — it blocked nothing else, but it was never retried (even on restart, because `computeLaunchable` excludes `error`). The operator wanted: process the LTAs whose manifest IS ready, and meanwhile keep re-checking the manifest-less ones until their manifest appears.
+
+**Fix:**
+- Both lot-lookup `isEmpty` sites (`prepareLotAndWeightCheck` + `runPartielDumFlow`) now set `phase: "waiting_manifest"` (error cleared), `sendProgress(id, "waiting-manifest")`, and return `{ success: false, waitingManifest: true }` — **not** an error. Since `waiting_manifest` isn't in the UI's non-launchable set, a re-run re-attempts it.
+- `runAllAutomationTasks` collects the batch's waiting-manifest LTAs and passes them to `monitorPendingPortnetRequests(toProcess, portnetPage, waitingManifest)`.
+- The monitor loops while `pending.size > 0 || manifestRetry.length > 0`. Each poll cycle (badrBusy-guarded, alongside the injection drain) `retryWaitingManifest()` re-runs the lot lookup+submit for each: manifest ready → submitted on the live sessions and added to the polling set; still empty → kept for next cycle. When only waiting-manifest LTAs remain (nothing to poll), it waits ~1 min and re-checks, bounded by `maxAttempts` (240 ≈ 4 h) so the batch can't hang forever — leftovers stay `waiting_manifest` (re-launchable), never error.
+- UI: new `waiting-manifest` status → amber "En attente manifeste" badge (StatusBadge), phase mapping in `checkpointToStatus`, and an amber card banner ("Manifeste pas encore disponible dans BADR — revérification automatique…"). Not treated as an error, so fields stay editable and the card offers a normal "Lancer".
+
+**Files changed:** `electron/main.js`, `src/ui/App.jsx`, `src/ui/components/StatusBadge.jsx`, `src/ui/components/AcheminementCard.jsx`
+
+---
+
 ## 2026-07-19 — "En cours validation Portnet" email: use the standard acheminement subject
 
 **Problem:** the 30-min "still pending" email had a raw subject `<folder> — <portnetRef> — En cours validation Portnet`, unlike the other mails.
@@ -20,6 +34,7 @@ _Format: `## YYYY-MM-DD — <title>`_
 **Ask:** in a batch, once an LTA reaches `badr_done` ("Terminé"), let the operator delete its card/folder immediately — without waiting for the whole batch to finish.
 
 **Fix:**
+
 - `AcheminementCard.jsx`: the 🗑 delete button (only rendered in the `isDone` branch) no longer disables on `isGlobalRunning`. Safe because a done LTA's folder isn't in the monitor's active `pending` set.
 - `App.jsx` `handleDelete`: after deleting + re-scanning, statuses now **merge** (`{ ...statusesFromScan(scanned), ...prev }`) instead of replacing, so deleting a done card mid-run doesn't reset the live in-progress statuses of the other LTAs. `deleteDoneFolders` uses `fs.rmSync(force)`, so it's safe alongside the batch's own end-of-run delete-done (double-delete is a no-op).
 
@@ -42,8 +57,9 @@ _Format: `## YYYY-MM-DD — <title>`_
 **Problem:** every app launch forced a full Portnet login + CAPTCHA, and reCAPTCHA was flaky (correct answers rejected, ~2 min to pass). Cause: `portnetLogin.js` used `chromium.launch()` + `newContext()` — a throwaway profile each launch, so no session cookie was ever kept, and an empty automated profile makes reCAPTCHA harder.
 
 **Fix (legitimate — never solves/bypasses the CAPTCHA, just stops discarding the session):** Portnet now uses a **persistent Edge profile** like BADR already does.
+
 - `config.js`: new `portnet.userDataDir` (env `PORTNET_PROFILE_DIR`, default `C:\Temp\portnet-edge-profile`).
-- `portnetLogin.js`: `chromium.launchPersistentContext(userDataDir, { channel:"msedge", … })`; reuses the context's existing page; `close()` closes the context (flushes the profile/session cookie to disk). After navigating to the site it **races the login field vs the `/home` URL** (30 s) — if the saved session is still valid Portnet redirects to `/home`, so login + CAPTCHA are **skipped entirely**; otherwise it logs in normally (manual CAPTCHA). A real profile (cookies/history) also lowers reCAPTCHA difficulty when a login *is* needed.
+- `portnetLogin.js`: `chromium.launchPersistentContext(userDataDir, { channel:"msedge", … })`; reuses the context's existing page; `close()` closes the context (flushes the profile/session cookie to disk). After navigating to the site it **races the login field vs the `/home` URL** (30 s) — if the saved session is still valid Portnet redirects to `/home`, so login + CAPTCHA are **skipped entirely**; otherwise it logs in normally (manual CAPTCHA). A real profile (cookies/history) also lowers reCAPTCHA difficulty when a login _is_ needed.
 
 Net: CAPTCHA only when the server-side session has actually expired, not on every launch. First launch on an empty profile still needs one.
 
@@ -68,13 +84,14 @@ Three fixes on top of the 2026-07-17 injection queue (confirmed working in the f
 
 ---
 
-## 2026-07-17 — Manual launch of a new LTA *during* the monitoring wait (edit + inject, no concurrent batch)
+## 2026-07-17 — Manual launch of a new LTA _during_ the monitoring wait (edit + inject, no concurrent batch)
 
 **Refines the reversal below.** The operator wanted: while the batch sits in the long "waiting for Acceptée" polling phase, be able to **edit** a newly-added LTA's card (fix a wrong extracted value) and **launch it** — reusing the open sessions, with checkpoints skipping the already-done LTAs — without a second concurrent batch and without closing browsers.
 
 **Problem:** clicking "Tout lancer"/"Lancer" during an active run would start a **second `runAllAutomationTasks`** racing on the shared Playwright pages. And the UI locked all inputs while running, so the value couldn't be corrected.
 
 **Fix:**
+
 - `electron/main.js`: `batchRunning`/`monitorActive` flags + a module-level `injectionQueue`. `tryQueueDuringActiveBatch()` (used by both `automation:run` and `automation:run-all`): if a monitor is polling → push the **full ach objects** (with the operator's edits) to the queue and return `{ queued: true }`; if mid-submit → `{ busy: true }`; else run normally. `monitorPendingPortnetRequests` sets `monitorActive` and, at the top of each poll cycle (badrBusy-guarded), `drainInjectionQueue()` submits each queued LTA on the live sessions and adds it to `pending` — **skipping any already in `pending` or checkpoint-done**, so only new LTAs run. It uses the queued object as-is (no re-scan — re-scanning would let PDF extraction overwrite the very value the operator fixed).
 - `src/ui/App.jsx`: `runInProgressRef`; `handleRunAll`/`handleRun` detect an in-progress run and call the IPC to **queue** (no `isRunning` toggle, no concurrent batch). "Tout lancer" stays enabled during a run (label → "➕ Ajouter au traitement").
 - `src/ui/components/AcheminementCard.jsx`: card fields/checkbox/selects now disable on the card's **own** `isRunning || isDone` (not the global run flag), so a not-yet-running card stays editable while other LTAs process; its "Lancer" is likewise enabled. The declare-scellés (BADR) controls and delete stay globally gated to avoid BADR concurrency.
@@ -92,6 +109,7 @@ Flow: run 3 → they reach polling → drop + edit a 4th card → "Tout lancer" 
 **New behavior:** a folder added while a batch is running is left **untouched**. The current batch finishes and marks its LTAs done, the **browsers stay open** (only closed on quit, as always), and the new LTA sits as an editable, un-launched card. The operator fixes any wrong values on it and clicks **Lancer** — which reuses the live BADR/Portnet sessions (no code/CAPTCHA re-entry).
 
 **Removed:**
+
 - `electron/main.js`: `injectNewlyAddedLtas()` + its per-poll-cycle call in `monitorPendingPortnetRequests`, and the now-unused `acheminementMissingRequiredFields` mirror. The monitor no longer submits anything new mid-run.
 - `src/ui/App.jsx`: the `handleRunAll` drain loop → back to a **single pass** over `computeLaunchable(acheminements)` (a snapshot at click time; folders added later aren't in it and aren't sent to the backend).
 
@@ -113,11 +131,12 @@ A first cut also added a manual **⏸ Pause** button, but it was removed — pau
 
 **Files changed:** `src/ui/App.jsx`
 
-### Follow-up — pick up new folders *during* Portnet monitoring (not just after the batch)
+### Follow-up — pick up new folders _during_ Portnet monitoring (not just after the batch)
 
-**Gap found:** the drain loop only re-scans *after* `runAllAutomation` returns. But a batch is one long blocking call: submit all → then **monitor** (poll Portnet for "Acceptée", finalize on BADR), which can run a long time. So a folder dropped in while it's "refreshing BADR/Portnet, checking status" wasn't seen until the current LTAs finished.
+**Gap found:** the drain loop only re-scans _after_ `runAllAutomation` returns. But a batch is one long blocking call: submit all → then **monitor** (poll Portnet for "Acceptée", finalize on BADR), which can run a long time. So a folder dropped in while it's "refreshing BADR/Portnet, checking status" wasn't seen until the current LTAs finished.
 
 **Fix (`electron/main.js`):** the Portnet poll loop itself now re-scans each cycle.
+
 - Refactored the `folder:scan` IPC body into reusable `scanSingleAcheminement(root, name)` + `scanAcheminementsFolder(folder)` (IPC is now a thin wrapper).
 - Added `acheminementMissingRequiredFields(ach)` — a CommonJS mirror of `src/ui/requiredFields.js` (keep in sync).
 - Inside `monitorPendingPortnetRequests`, `injectNewlyAddedLtas()` runs at the top of each poll cycle (guarded by `badrBusy` so the keepalive timer doesn't collide): it lists subfolders, and for any not yet handled it scans just that one. If it's **fully complete** (all required fields, no refMismatch, no blocking mawbMismatch) it's submitted via `runAutomationTask(..., { stopAfterSubmit, sharedPortnetPage })` on the live sessions and added to the polling set; then the consultation page is reopened. **Incomplete** folders are logged once and left unhandled, so they're re-checked on later cycles and picked up the moment the operator finishes their fields. `handledIds`/`warnedIncompleteIds` sets prevent reprocessing and log spam. Matches the operator's ask: while monitoring the current LTAs, a new complete folder is handled automatically (as if they'd stopped + re-added it), an incomplete one is left until completed.
@@ -135,6 +154,7 @@ A first cut also added a manual **⏸ Pause** button, but it was removed — pau
 **Problem:** The manifest-vs-MAWB cross-check blocked the launch on ANY weight difference (e.g. manifest 2020 kg vs MAWB 2022 kg — a 2 kg rounding gap). Weight commonly differs by a few kg and is rectifiable in the poids input, plus the authoritative BADR weight is checked downstream. Blocking on it was too strict.
 
 **Fix:** `computeMawbVsManifestMismatch` now returns `{ blocking, warning }`:
+
 - **colis (package count)** mismatch → `blocking` (unchanged: red banner, Lancer disabled, run stops).
 - **poids (weight)** mismatch → `warning` only (never blocks).
 
@@ -149,6 +169,7 @@ A first cut also added a manual **⏸ Pause** button, but it was removed — pau
 **Problem:** In the Portnet "Rechercher d'une DS de référence" dialog, the same séquence (e.g. `0009557`) returns one row per year (2022 H, 2023 J, 2024 K, 2025 L, 2026 M). The code paginated to the last page and clicked the **last-visible row** — positional. On a slow network the current-year (2026 M) row could render a beat after the older ones, so the grid's "lastVisible" was still 2025 L → wrong DS de référence selected → invalid declaration.
 
 **Fix:**
+
 - `electron/main.js` (fillEntete call): now passes `cle: lotInfo.cle` and `annee: lotInfo.annee` (both already produced by BADR lot lookup / manual-sequence path).
 - `src/portnet/portnetDsCombine.js`: `searchAndSelectDSReference(sequenceNum, expectedCle, expectedYear)` → new `_selectDsReferenceRow` scans **every page** and clicks the row whose `refSequence` **and** `refAnnee` (== current year) **and** `refcle` all match. Never a positional pick. Retries up to ~20 s (re-scans from page 1) so a late-rendering current-year row is still found. If no exact match ever appears, it **throws** a clear French error instead of selecting the wrong row (`année` defaults to `new Date().getFullYear()`; `clé` is a safety double-check since séquence+année already identify a unique row).
 
@@ -171,6 +192,7 @@ A first cut also added a manual **⏸ Pause** button, but it was removed — pau
 **Need:** Some lots aren't filed under RAM ("CIE NATIONALE ROYAL AIR MAROC") — when RAM returns no lot, retry the search under "SWIFTAIR MAROC(81/125361)".
 
 **Implementation (`src/badr/badrLotLookup.js`, `searchLot`):**
+
 - Moved the static, opérateur-independent fields (Référence, Bureau 301, Type DS(01), Mode AERIEN(02)) to a one-time fill before the search loops.
 - Extracted `_selectOperateur(query, label)` (clears the autocomplete, types, selects first item).
 - Wrapped the existing date-window retry loop in an outer loop over `[RAM, SWIFTAIR]`: RAM is tried across all date windows first; only if it's empty everywhere does SWIFTAIR get tried. First non-empty result returns immediately.
@@ -192,18 +214,20 @@ A first cut also added a manual **⏸ Pause** button, but it was removed — pau
 
 ## 2026-06-28 — Weight/colis mismatch: screenshot the lots + email (partiel & DS)
 
-**Need:** When BADR's weight/colis differs from the manifest and the app stops, screenshot the lots section, email it to the recipients with subject *"Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° …"*, and (for partiels) distinguish a real weight problem from "still waiting for another flight".
+**Need:** When BADR's weight/colis differs from the manifest and the app stops, screenshot the lots section, email it to the recipients with subject _"Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° …"_, and (for partiels) distinguish a real weight problem from "still waiting for another flight".
 
 **Partiel (`src/badr/badrDumNormalPartiel.js` + `electron/main.js`):**
+
 - `_step5_preapurement` now decides **colis-first**: if the lots' total `Nbre contenant` ≠ the manifest → `kind: "waiting_vol"` (more flights to come; `nextVol = lots.length + 1`); else if poids differs > 1 kg → `kind: "poids"`. Either way it takes a cropped screenshot of the lots table (`_screenshotLots` → `#mainTab:form3` panel → Downloads) and returns it.
 - `run()` persists `poidsMismatch { kind, nextVol, totals, screenshotPath }` + the right phase (`partiel_waiting_lots` / `partiel_poids_mismatch`) before throwing.
-- `runPartielDumFlow` catch reads `poidsMismatch` and emails once via `notifyPartielPoidsMismatch`: *"En attente du Nème vol — LTA N° …"* (waiting) or *"…Merci de régler le poids…"* (poids), screenshot attached, with the correct card status.
+- `runPartielDumFlow` catch reads `poidsMismatch` and emails once via `notifyPartielPoidsMismatch`: _"En attente du Nème vol — LTA N° …"_ (waiting) or _"…Merci de régler le poids…"_ (poids), screenshot attached, with the correct card status.
 
 **DS Combiné (non-partiel, `prepareLotAndWeightCheck`):** the weight-mismatch and colis-mismatch emails now use `captureBadrPreapShot()` (crops `#iframeMenu` → `#mainTab:form3` panel, full-page fallback) and the new subject. Colis email → "Merci de rectifier le nombre de colis…"; weight email → "Merci de régler le poids…", both with the lots screenshot.
 
 **Screenshot fix (same day):** cropping to the inner `#mainTab:form3` panel clipped ~30 % of the left (N° column, Retour button, title). Both `_screenshotLots` and `captureBadrPreapShot` now screenshot the **iframe element** (`#iframeMenu`) instead — it captures the full BADR content area (whole lots table from its left edge) while still excluding the top-page menu.
 
 **Follow-up (same day):**
+
 - Screenshot is now also saved in the **LTA folder** as `screenshot-LTA-<ref>-Probleme-Poid.png` (plus the Downloads copy). `captureBadrPreapShot` gained a `folderPath` arg.
 - UI status `partiel-waiting-lots` was showing the raw English-ish key. `StatusBadge` now renders **"En attente du Nème vol"** (French) using a `nextVol` prop. `nextVol` flows live via `sendProgress(id, "partiel-waiting-lots", { nextVol })` and after a re-scan via `automationState.nextVol` (persisted at lot-lookup waiting = 2, and at the `_step5` waiting-vol = lots + 1) → `statusesFromScan` → card → badge.
 
@@ -224,6 +248,7 @@ Hardened the `automation:declare-scelles-partiel` serie parse: instead of `trim(
 **Need:** Success emails used `"<FOLDER> — <ds-series>"` (e.g. `3EME 13458333-13458334 — 3526 M`), leaking scellés + DS series. Wanted: `"<N>éme acheminement DS Combinée LTA N° <ref>"` (non-partiel) / `"… Dum Normale LTA N° <ref>"` (partiel) — only the acheminement rank, type, and LTA reference.
 
 **Implementation (`electron/main.js`):**
+
 - `buildAcheminementSubject(folderName, typeLabel, ref)` → `"<N>éme acheminement <type> LTA N° <ref>"` (1 → "1er"); the rank comes from the folder name's leading number.
 - DS success email (`finalizeAcceptedOnBadr`) → type "DS Combinée". DUM partiel email (`declare-scelles-partiel`) → type "Dum Normale".
 
@@ -246,12 +271,13 @@ The manifest-vs-BADR **nombre de colis** check already existed (`prepareLotAndWe
 **Problem:** On hand-filled/scanned MAWBs the "Total Prepaid" is often misplaced or misread, so the extractor grabbed a partial figure (e.g. 130860.89 instead of 142083.09 = 130860.89 + 11222.20). A wrong freight value feeds a Moroccan customs declaration — unacceptable to guess.
 
 **Solution — arithmetic reconciliation, not blind trust:**
+
 - `src/utils/mawbShipperExtract.js`: both Vision prompts (`extractVisionMeta` scanned + `supplementCurrencyFretViaVision` text) now return **`total_prepaid`** (printed) AND **`charges_sum`** (sum of the prepaid charge lines). New `reconcileFret()` trusts the freight only when the two agree (≈ within 0.5 %), returning `{ fretValue, fretConfident }` — `fretValue` is **null** (→ manual entry) on any mismatch/unreadable case. The unverified regex Total-Prepaid is no longer used as the freight.
 - `electron/main.js`: scan persists `fretValue` only when `fretConfident`, and sets `fretUncertain = !fretConfident`. `runPartielDumFlow` **blocks** (phase `error`) when a partiel LTA has no freight value typed.
 - `src/ui/requiredFields.js`: partiel LTAs now require `fretValue` (empty → "Lancer" disabled, batch skips).
 - `src/ui/components/AcheminementCard.jsx`: amber banner on partiel LTAs when the freight is uncertain and still empty — prompting manual entry.
 
-**Net:** clean MAWBs auto-fill; the common "displaced total" case auto-fills *only* if the printed total still reconciles with the charge sum; genuinely ambiguous ones stop and require the operator to type the freight rather than submitting a wrong value.
+**Net:** clean MAWBs auto-fill; the common "displaced total" case auto-fills _only_ if the printed total still reconciles with the charge sum; genuinely ambiguous ones stop and require the operator to type the freight rather than submitting a wrong value.
 
 **Files changed:** `src/utils/mawbShipperExtract.js`, `electron/main.js`, `src/ui/requiredFields.js`, `src/ui/components/AcheminementCard.jsx`
 
@@ -262,10 +288,11 @@ The manifest-vs-BADR **nombre de colis** check already existed (`prepareLotAndWe
 **Need:** Catch data discrepancies before processing — the manifest's piece count / gross weight must match the MAWB's "No of Pieces RCP" / "Gross Weight". Applies to **every** LTA (not only partiels).
 
 **Implementation:**
+
 - `src/utils/mawbShipperExtract.js`: the Gemini Vision MAWB extraction now also returns `nbrPieces` (No of Pieces RCP) and `grossWeight` (Gross Weight). Both the **scanned** path (`extractVisionMeta`) and the **text** path (`supplementCurrencyFretViaVision`) extract them — the supplement now runs for virtually every text-based MAWB (pieces/weight aren't reliably in the flattened text), so the cross-check works for text MAWBs too, not just scanned ones.
 - `electron/main.js`:
   - Scan extracts + persists `mawbNbrPieces` / `mawbGrossWeight` for **any** LTA that has a MAWB (one Vision call returns shipper/currency/fret too — those are still only used by partiels).
-  - New `computeMawbVsManifestMismatch()` compares manifest `nombreContenant`/`poidTotal` vs MAWB pieces/weight (colis exact, poids rounded), returning a clear French message (e.g. *"Incohérence manifeste / MAWB sur le nombre de colis (manifeste 121 ≠ MAWB 120). Vérifiez les documents avant de lancer."*); only when MAWB values are known.
+  - New `computeMawbVsManifestMismatch()` compares manifest `nombreContenant`/`poidTotal` vs MAWB pieces/weight (colis exact, poids rounded), returning a clear French message (e.g. _"Incohérence manifeste / MAWB sur le nombre de colis (manifeste 121 ≠ MAWB 120). Vérifiez les documents avant de lancer."_); only when MAWB values are known.
   - Each scanned ach carries `mawbMismatch` (+ `mawbNbrPieces`/`mawbGrossWeight`). Blocked (phase `error`) before any BADR/Portnet work in **both** flows: `runPartielDumFlow` (partiels) and `prepareLotAndWeightCheck` (non-partiels).
 - `src/ui/components/AcheminementCard.jsx`: red banner shows `ach.mawbMismatch`, and "Lancer" is disabled while a mismatch exists (not partiel-gated).
 
@@ -275,7 +302,7 @@ The manifest-vs-BADR **nombre de colis** check already existed (`prepareLotAndWe
 
 ## 2026-06-24 — MAWB: fix Total Prepaid (fret) extraction returning null
 
-**Problem:** On a scanned MAWB whose prepaid total (155068.89 = weight 143258.89 + other charges due carrier 11810.00) is printed just below/outside the literal "Total Prepaid" cell, Gemini Vision returned `fret=null`. Cause: the prompt said *"the value in the 'Total Prepaid' box … if the box is blank or zero, return null"* — so the model saw the cell as blank and returned null.
+**Problem:** On a scanned MAWB whose prepaid total (155068.89 = weight 143258.89 + other charges due carrier 11810.00) is printed just below/outside the literal "Total Prepaid" cell, Gemini Vision returned `fret=null`. Cause: the prompt said _"the value in the 'Total Prepaid' box … if the box is blank or zero, return null"_ — so the model saw the cell as blank and returned null.
 
 **Fix (`src/utils/mawbShipperExtract.js`):** Reworded the TOTAL PREPAID instruction in both `extractVisionMeta` (scanned-PDF path) and `supplementCurrencyFretViaVision` (text-PDF path): describe it as the prepaid total at the bottom-left of the charges grid (= Weight Charge + Valuation + Tax + Other Charges Due Agent/Carrier), tell the model to read the printed figure even if it sits slightly outside the cell, and return null ONLY for a fully collect shipment.
 
@@ -296,14 +323,16 @@ The manifest-vs-BADR **nombre de colis** check already existed (`prepareLotAndWe
 
 **Files changed:** `src/badr/badrDumNormalPartiel.js`
 
-**Follow-up (2026-06-25):** the new upload used `setInputFiles(path)`, which sends the temp file's name (`manifest_resaved_<ts>_Manifeste ….pdf`, 57 chars) → BADR rejected it (*"le nom du fichier ne doit pas dépasser 50 caractères"*). Fixed `_uploadPreparedDoc` to upload from a **buffer** with the clean original-based name (`displayName`, e.g. `Manifeste 235-98082924.pdf`), clamped to 50 chars — same buffer+name approach the Portnet annexe uses.
+**Follow-up (2026-06-25):** the new upload used `setInputFiles(path)`, which sends the temp file's name (`manifest_resaved_<ts>_Manifeste ….pdf`, 57 chars) → BADR rejected it (_"le nom du fichier ne doit pas dépasser 50 caractères"_). Fixed `_uploadPreparedDoc` to upload from a **buffer** with the clean original-based name (`displayName`, e.g. `Manifeste 235-98082924.pdf`), clamped to 50 chars — same buffer+name approach the Portnet annexe uses.
 
 **Follow-up 2 (2026-06-25):** three more fixes in `badrDumNormalPartiel.js`:
-- **Référence not committed** → BADR error *"Veuillez saisir la référence du document annexe."* Two layered causes: (a) the hardcoded JSF id (`j_id_3p_25r…`) was stale (live `j_id_3p_26c…`) and an unscoped label XPath matched a "Référence" field in another tab → now **scoped to the annexe form** (`//*[@id="mainTab:form7"]//tr[td//label[="Référence"]]//input`, fallback `#mainTab:form7 input[maxlength="10"]:not([id*="date"])`); (b) even once the right field was filled (read-back confirmed `"fac"`), the auto-upload re-rendered the panel from the server bean and wiped it — because `.fill()` fires only `input`, never `change`, so PrimeFaces' on-change AJAX never committed the value. A programmatic `.blur()` doesn't fire `change` either. Fix: **dispatch a real `change` event** (+ blur) and wait ~1.2 s for the commit AJAX before selecting the file. Fills `"fac"` (FACTURE) / `"LTA"` (TITRE).
+
+- **Référence not committed** → BADR error _"Veuillez saisir la référence du document annexe."_ Two layered causes: (a) the hardcoded JSF id (`j_id_3p_25r…`) was stale (live `j_id_3p_26c…`) and an unscoped label XPath matched a "Référence" field in another tab → now **scoped to the annexe form** (`//*[@id="mainTab:form7"]//tr[td//label[="Référence"]]//input`, fallback `#mainTab:form7 input[maxlength="10"]:not([id*="date"])`); (b) even once the right field was filled (read-back confirmed `"fac"`), the auto-upload re-rendered the panel from the server bean and wiped it — because `.fill()` fires only `input`, never `change`, so PrimeFaces' on-change AJAX never committed the value. A programmatic `.blur()` doesn't fire `change` either. Fix: **dispatch a real `change` event** (+ blur) and wait ~1.2 s for the commit AJAX before selecting the file. Fills `"fac"` (FACTURE) / `"LTA"` (TITRE).
 
 **Follow-up 3 (2026-06-25):** that change accidentally added `await refInput.click()` before the fill, which scroll-looped for the full 120 s action timeout (BADR's huge layout made the input an unstable click target).
 
 **Follow-up 4 (2026-06-25):** reworked the Référence step to mirror a proven Selenium implementation of this exact BADR form — a **retry loop (×3)** that re-locates the field across 3 scoped selectors (form7 label-row → label→sibling-cell → `mainTab:form7:j_id…[maxlength=10]:not([disabled])`), **types with real keystrokes** (`pressSequentially`, PrimeFaces-friendly) instead of `.fill()`, dispatches `change`+blur, and **verifies the value stuck** (`inputValue() === reference`) before moving on — throwing if all attempts fail. No `.click()` (avoids the scroll-loop).
+
 - **Upload timeout** → waits for the `ui-blockui` "Traitement en cours…" spinner to clear (≤45 s) and extends the row-appears check to 30 s (a 2 MB upload exceeded the old 15 s).
 - **Manifest caching** → `_addManifestFacture` now caches prepared parts in `<LTA>/compress/` and reuses them when fresh (≤2 MB, valid, newer than source), mirroring the DS Combiné non-partiel flow — a retry no longer re-saves/re-compresses (saves ~28 s + API quota).
 
@@ -314,11 +343,13 @@ The manifest-vs-BADR **nombre de colis** check already existed (`prepareLotAndWe
 **Need:** Notify operators by email at key points instead of the old `[TODO MAIL]` log placeholders.
 
 **Infra:**
+
 - New `src/utils/mailer.js` — `sendNotification({ subject, text, attachments })` via nodemailer + `config.email`; sends to `EMAIL_TO` with `EMAIL_CC` in copy; no-op when disabled; drops attachment entries whose path doesn't exist.
 - `src/config/config.js`: added `email.cc` (`EMAIL_CC`).
 - `.env`: enabled email + set sender/recipient/CC (`EMAIL_ENABLED=true`, sender `tajanielidrissi.ismail@gmail.com` with app password, `EMAIL_TO` same, `EMAIL_CC=cursorcompte06@gmail.com`).
 
 **Notifications wired in `electron/main.js`:**
+
 1. **DS success** (`finalizeAcceptedOnBadr`): after `badr_done`, emails the downloaded DS PDF (`processFinalization` now captured as `dsPdfPath`). Subject `"<folder> — <ref>"`.
 2. **DUM partiel success** (`automation:declare-scelles-partiel`): after `partiel_done`, emails the DUM PDF (`state.pdfPath`). Subject `"<folder> — <ref>"`.
 3. **Pending > 30 min** (monitor loop): one-time email (guarded by `state.pendingEmailSent`) when an LTA is submitted but not accepted ≥ 30 min after `submittedAt`; body `"En cours validation portnet"`.
@@ -355,7 +386,7 @@ The manifest-vs-BADR **nombre de colis** check already existed (`prepareLotAndWe
   - Added `_resaveWholePdf` — lossless, free pdf-lib re-save that strips incremental-update/unused-object bloat (a 15 MB digital manifest dropped to ~3.3 MB this way).
   - Added `_splitInHalves(inputPath, log)` — splits a PDF into two page-halves (e.g. 101 → 51 + 50) via `pdf-lib` (each half is auto de-bloated by pdf-lib's save). If a half is still > 2 MB it's compressed; if compression still can't, that half is halved again (recursion = safety net so huge manifests never block).
   - Added `prepareManifestPartsForAnnex(inputPath, log)` with **compress-first ordering**: (1) ≤ 2 MB → whole; (2) re-save whole → if ≤ 2 MB → whole (no split); (3) still too big → split in half (compress an oversized half). Parts named `<base>-part-<k>.pdf`.
-  - **Fix history:** the first cut split the *bloated original* (69 KB/page estimate) → 9 tiny parts. Switched to: re-save first (15 MB → ~3.3 MB), then split in half → 2 parts (~1.65 MB each, no compression needed). `SAFE_BYTES` removed (halving uses `MAX_BYTES`).
+  - **Fix history:** the first cut split the _bloated original_ (69 KB/page estimate) → 9 tiny parts. Switched to: re-save first (15 MB → ~3.3 MB), then split in half → 2 parts (~1.65 MB each, no compression needed). `SAFE_BYTES` removed (halving uses `MAX_BYTES`).
 - `src/portnet/portnetDsCombine.js` (`fillAnnexe`): manifest is prepared via `prepareManifestPartsForAnnex` and **each part uploaded as its own A0006-FACTURE row** (grid row count incremented per part); MAWB uploaded after as A0004-TITRE (Ghostscript, unchanged). Extracted `uploadOnePart` for the physical upload+grid-verify. Manifest parts cached in `<LTA>/compress/` and reused only when all are fresh/valid/≤2 MB (else re-split); `PORTNET_IGNORE_COMPRESS_CACHE=true` forces re-split.
 - `src/badr/badrDumNormalPartiel.js`: see the 2026-06-24 follow-up below — the original "graceful fallback to the original file" turned out to upload an **oversized** manifest to BADR and fail.
 
@@ -387,7 +418,7 @@ The manifest-vs-BADR **nombre de colis** check already existed (`prepareLotAndWe
 
 ## 2026-06-15 — "Lancer tous": open BADR + Portnet sessions up-front in parallel
 
-**Problem:** On "Lancer tous", the batch opened only the Portnet session, polled until an LTA was accepted, and *then* opened BADR (USB-certificate prompt) for the final step. The user had to stay at the PC waiting for the first acceptance to insert the certificate — no unattended runs.
+**Problem:** On "Lancer tous", the batch opened only the Portnet session, polled until an LTA was accepted, and _then_ opened BADR (USB-certificate prompt) for the final step. The user had to stay at the PC waiting for the first acceptance to insert the certificate — no unattended runs.
 
 **Solution (`electron/main.js`, `runAllAutomationTasks`):** When the batch has active work (`hasActiveWork` — any LTA not in a terminal/no-session phase), open **both** sessions up-front and **in parallel** via `Promise.all([ensurePortnetSession(), ensureBadrSession()])`. The user solves the Portnet CAPTCHA and inserts the BADR USB certificate once at the start; the batch then runs unattended. BADR opening up-front is non-fatal on failure (logged warn) since every later BADR step already goes through `ensureBadrSession()`, which reuses the shared session (no second prompt) or lazily retries.
 
@@ -464,12 +495,12 @@ The manifest-vs-BADR **nombre de colis** check already existed (`prepareLotAndWe
 
 ## 2026-06-15 — Scellés: fix intermittent "nombre de scellés ne correspond pas" (race on 2nd add)
 
-**Problem:** In `_fillScellesForm` (shared by `declarerScelles` + `declarerScellesPartiel`), scellés were added with fixed `waitForTimeout(1000)` between the two "+" clicks. BADR re-renders the whole scellés panel via partial AJAX after each add, so the 2nd clear+fill+click could race the refresh and land on a stale/empty field — the 2nd scellé silently failed to register. The list ended with 1 item while "Nombre de Scellés" was hardcoded to "2", so BADR rejected at confirm: *"Le nombre de scellés saisis ne correspond pas à la valeur du champ 'nombre de scéllés'."* Intermittent (timing-dependent), not a data problem — both numbers were read correctly.
+**Problem:** In `_fillScellesForm` (shared by `declarerScelles` + `declarerScellesPartiel`), scellés were added with fixed `waitForTimeout(1000)` between the two "+" clicks. BADR re-renders the whole scellés panel via partial AJAX after each add, so the 2nd clear+fill+click could race the refresh and land on a stale/empty field — the 2nd scellé silently failed to register. The list ended with 1 item while "Nombre de Scellés" was hardcoded to "2", so BADR rejected at confirm: _"Le nombre de scellés saisis ne correspond pas à la valeur du champ 'nombre de scéllés'."_ Intermittent (timing-dependent), not a data problem — both numbers were read correctly.
 
 **Fix (`src/badr/badrDsCombineFinalize.js`):**
 
 - Added an `addScelle(value, expectedCount)` helper that fills the field, clicks "+", then **polls the list option count** (up to 8 s) until it reaches the expected size; retries the add up to 3× and throws if it never registers. Replaces the blind timeouts.
-- "Nombre de Scellés" is now set to the **actual** list size *after* both adds (instead of hardcoded "2" re-applied mid-flow), so the validated count always matches the list.
+- "Nombre de Scellés" is now set to the **actual** list size _after_ both adds (instead of hardcoded "2" re-applied mid-flow), so the validated count always matches the list.
 
 **Files changed:** `src/badr/badrDsCombineFinalize.js`
 

@@ -59,6 +59,8 @@ export default function App() {
         return "weight-mismatch";
       case "partiel_skip":
         return "partiel-skip";
+      case "waiting_manifest":
+        return "waiting-manifest";
       case "error":
         return "error";
       default:

@@ -133,6 +133,16 @@ export default function AcheminementCard({
         </div>
       )}
 
+      {/* ── Manifest not in BADR yet — auto-retried, not an error (amber) ──── */}
+      {status === "waiting-manifest" && (
+        <div className="flex items-start gap-2 bg-amber-900/30 border border-amber-700/50 rounded-lg px-3 py-2">
+          <span className="text-amber-300 text-xs font-semibold leading-snug">
+            ⏳ Manifeste pas encore disponible dans BADR — revérification
+            automatique pendant le suivi ; sera traité dès qu'il apparaît.
+          </span>
+        </div>
+      )}
+
       {/* ── Manifest ↔ MAWB weight gap — WARNING only, not blocking (amber) ── */}
       {ach.mawbWarning && (
         <div className="flex items-start gap-2 bg-amber-900/30 border border-amber-700/50 rounded-lg px-3 py-2">

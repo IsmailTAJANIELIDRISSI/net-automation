@@ -504,17 +504,21 @@ async function prepareLotAndWeightCheck(acheminement) {
       await lotLookup.close();
 
       if (lotInfo.isEmpty) {
+        // NOT a hard error — the manifest just isn't in BADR yet. Mark it as a
+        // retryable "waiting_manifest" state; the monitor re-checks it each poll
+        // cycle while the other LTAs are being submitted/polled, and picks it up
+        // as soon as the manifest appears.
         updateAutomationState(folderPath, {
-          phase: "error",
-          error: "Pas encore manifest",
+          phase: "waiting_manifest",
+          error: null,
         });
         sendLog(
           "warn",
           "BADR",
-          `Pas encore manifest pour ${resolvedRef} – email envoyé`,
+          `Pas encore manifest pour ${resolvedRef} — sera revérifié pendant le suivi.`,
         );
-        sendProgress(id, "error", { error: "Pas encore manifest" });
-        return { success: false, error: "Pas encore manifest" };
+        sendProgress(id, "waiting-manifest");
+        return { success: false, waitingManifest: true };
       }
 
       if (lotInfo.isPartiel) {
@@ -981,9 +985,15 @@ async function finalizeAcceptedOnBadr(acheminement, badrRef) {
   }
 }
 
-async function monitorPendingPortnetRequests(acheminements, portnetPage) {
+async function monitorPendingPortnetRequests(
+  acheminements,
+  portnetPage,
+  waitingManifestAchs = [],
+) {
   const PortnetDsCombine = require("../src/portnet/portnetDsCombine");
   const dsCombine = new PortnetDsCombine(portnetPage);
+  // LTAs whose manifest wasn't in BADR yet — re-checked each poll cycle.
+  const manifestRetry = [...(waitingManifestAchs || [])];
 
   const pending = new Map();
   const claimedAcceptedRefs = new Set();
@@ -1019,7 +1029,56 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
     }
   }
 
-  if (pending.size === 0) return;
+  if (pending.size === 0 && manifestRetry.length === 0) return;
+
+  // ── Re-check "pas encore manifest" LTAs each cycle ─────────────────────────
+  // Their manifest wasn't in BADR yet. Re-run the lot lookup (+ submit) on the
+  // live sessions; as soon as the manifest appears the LTA is submitted and added
+  // to the polling set. Still-empty ones stay in the retry list for next cycle.
+  async function retryWaitingManifest() {
+    if (manifestRetry.length === 0) return 0;
+    let submitted = 0;
+    const stillWaiting = [];
+    for (const ach of manifestRetry) {
+      const st = getAutomationState(ach.folderPath);
+      // Progressed already (e.g. picked up elsewhere) → don't retry.
+      if (st?.badrRef || st?.phase === "badr_done" || st?.phase === "partiel_done") {
+        continue;
+      }
+      if (st?.portnetRef) {
+        if (!pending.has(ach.id)) pending.set(ach.id, ach);
+        continue;
+      }
+      sendLog("info", "BADR", `Vérification manifeste pour "${ach.id}"…`);
+      let r;
+      try {
+        r = await runAutomationTask(ach, {
+          stopAfterSubmit: true,
+          sharedPortnetPage: portnetPage,
+        });
+      } catch (e) {
+        sendLog("error", "Automation", `Nouvelle tentative "${ach.id}" échouée: ${e.message}`);
+        stillWaiting.push(ach); // transient — keep retrying
+        continue;
+      }
+      if (r?.waitingManifest) {
+        stillWaiting.push(ach); // manifest still not there
+        continue;
+      }
+      if (r?.success && !ach.partiel) {
+        const s2 = getAutomationState(ach.folderPath);
+        if (s2?.portnetRef && !s2.badrRef) {
+          pending.set(ach.id, ach);
+          submitted++;
+          sendLog("info", "Automation", `Manifeste prêt — "${ach.id}" soumis à Portnet, ajouté au suivi.`);
+        }
+      }
+      // else: partiel handled, or a genuine error → drop from the retry list.
+    }
+    manifestRetry.length = 0;
+    manifestRetry.push(...stillWaiting);
+    return submitted;
+  }
 
   // ── User-triggered injection while this monitor polls ──────────────────────
   // The operator can edit a newly-added LTA's card during the (long) "waiting for
@@ -1126,23 +1185,52 @@ async function monitorPendingPortnetRequests(acheminements, portnetPage) {
   }, 45000); // 45 seconds — frequent enough to keep BADR session alive
 
   const maxAttempts = 240;
+  let manifestOnlyCycles = 0;
   monitorActive = true;
   try {
-    while (pending.size > 0) {
-      // Inject any LTAs the operator launched while this monitor is polling.
+    while (pending.size > 0 || manifestRetry.length > 0) {
+      // Inject operator-launched LTAs AND re-check waiting-manifest LTAs.
       // Guard with badrBusy so the keepalive timer doesn't touch BADR mid-submit.
       badrBusy = true;
-      let injected = 0;
+      let changed = 0;
       try {
-        injected = await drainInjectionQueue();
+        changed += await drainInjectionQueue();
+        changed += await retryWaitingManifest();
       } finally {
         badrBusy = false;
       }
-      if (injected > 0) {
+      if (changed > 0) {
         // Submitting navigated the Portnet page off consultation — reopen it.
         await dsCombine.openConsultationPage();
       }
-      if (pending.size === 0) break;
+      if (pending.size === 0 && manifestRetry.length === 0) break;
+
+      if (pending.size === 0) {
+        // Nothing submitted to poll yet — only waiting-manifest LTAs remain. Wait,
+        // then re-check the manifest next cycle. Bounded so the batch can't hang
+        // forever if a manifest never arrives (the LTAs stay retryable via re-run).
+        if (++manifestOnlyCycles > maxAttempts) {
+          sendLog(
+            "warn",
+            "BADR",
+            `Manifeste toujours absent pour ${manifestRetry.length} LTA(s) après ${maxAttempts} vérifications — arrêt du suivi (relançable).`,
+          );
+          break;
+        }
+        sendLog(
+          "info",
+          "BADR",
+          `En attente du manifeste pour ${manifestRetry.length} LTA(s) — nouvelle vérification dans 1 min…`,
+        );
+        const d = Date.now() + 60_000;
+        while (Date.now() < d) {
+          if (injectionQueue.length > 0) break;
+          await portnetPage.waitForTimeout(
+            Math.max(250, Math.min(2000, d - Date.now())),
+          );
+        }
+        continue;
+      }
 
       let highestAttempts = 0;
 
@@ -1574,12 +1662,18 @@ async function runPartielDumFlow(acheminement) {
     await lotLookup.close();
 
     if (lotResult.isEmpty) {
+      // Retryable — the manifest isn't in BADR yet (see prepareLotAndWeightCheck).
       updateAutomationState(folderPath, {
-        phase: "error",
-        error: "Pas encore manifest",
+        phase: "waiting_manifest",
+        error: null,
       });
-      sendProgress(id, "error", { error: "Pas encore manifest" });
-      return { success: false, error: "Pas encore manifest" };
+      sendProgress(id, "waiting-manifest");
+      sendLog(
+        "warn",
+        "BADR",
+        `Pas encore manifest pour ${resolvedRef} — sera revérifié pendant le suivi.`,
+      );
+      return { success: false, waitingManifest: true };
     }
 
     if (lotResult.isPartiel && !lotResult.partiels) {
@@ -1873,6 +1967,9 @@ async function runAllAutomationTasks(acheminements) {
     }
     await Promise.all(sessionTasks);
 
+    // LTAs whose BADR lot lookup found no manifest yet — retried in the monitor.
+    const waitingManifest = [];
+
     for (const ach of toProcess) {
       const checkpoint = getAutomationState(ach.folderPath);
       const hasSubmittedPortnet = !!checkpoint?.portnetRef;
@@ -1895,7 +1992,8 @@ async function runAllAutomationTasks(acheminements) {
         continue;
       }
       if (ach.partiel === true) {
-        await runPartielDumFlow(ach);
+        const pr = await runPartielDumFlow(ach);
+        if (pr?.waitingManifest) waitingManifest.push(ach);
         continue;
       }
       if (hasSubmittedPortnet && !hasAcceptedPortnet) {
@@ -1921,15 +2019,20 @@ async function runAllAutomationTasks(acheminements) {
         continue;
       }
 
-      await runAutomationTask(ach, {
+      const r = await runAutomationTask(ach, {
         stopAfterSubmit: true,
         sharedPortnetPage: portnetPage,
       });
+      if (r?.waitingManifest) waitingManifest.push(ach);
       await new Promise((r) => setTimeout(r, 1500));
     }
 
     if (portnetPage) {
-      await monitorPendingPortnetRequests(toProcess, portnetPage);
+      await monitorPendingPortnetRequests(
+        toProcess,
+        portnetPage,
+        waitingManifest,
+      );
     }
 
     // Collect folders of LTAs that are now fully done so the UI can offer to delete them.
