@@ -78,8 +78,9 @@ export default function AcheminementCard({
 
   return (
     <div
-      className={`bg-slate-800/70 border ${cardBorder} rounded-xl p-4 flex flex-col gap-3
-                     transition-all duration-300 shadow-lg`}
+      className={`bg-slate-800/60 border ${cardBorder} rounded-2xl p-4 flex flex-col gap-3
+                     transition-all duration-200 shadow-lg shadow-black/20
+                     hover:border-slate-600/70 hover:bg-slate-800/80`}
     >
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <div className="flex items-start justify-between gap-2">

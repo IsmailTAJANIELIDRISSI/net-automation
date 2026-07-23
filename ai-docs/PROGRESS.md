@@ -5,6 +5,23 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-07-23 — Manifest re-check: throttle to 15 min / 3 tries + email once (stop the spam)
+
+**Problem:** after making "Pas encore manifest" retryable (2026-07-22), the monitor re-checked BADR every ~1 min, and `badrLotLookup._sendNoResultEmail` fired on every empty result → an email a minute when the only LTA had no manifest yet.
+
+**Fix — idempotent, persisted throttle (`electron/main.js` + `src/badr/badrLotLookup.js`):**
+- `searchLot(ref, { emailOnEmpty })` — new option threaded into `_parseResults`'s `sendNoResultEmail`. Callers pass `emailOnEmpty: !checkpoint.manifestNotified`, so the "Pas encore manifest" email is sent **once**, not on retries.
+- Both `isEmpty` sites persist on the checkpoint: `manifestCheckCount` (+1), `manifestLastCheckAt` (now), `manifestNotified` (true).
+- `manifestCheckThrottled(checkpoint)` → true if `< 15 min` since `manifestLastCheckAt`. `MANIFEST_CHECK_INTERVAL_MS = 15 min`, `MAX_MANIFEST_CHECKS = 3`.
+- `runAutomationTask`: if phase is `waiting_manifest` and throttled → returns `{ waitingManifest, throttled }` immediately (no BADR, no email) — this also guards the **restart** path (a relaunch < 15 min after the last check doesn't re-hit BADR).
+- Monitor `retryWaitingManifest`: skips throttled LTAs (no work), and once `manifestCheckCount >= 3` **drops** the LTA from the retry list so the batch ends (it stays `waiting_manifest`, re-launchable). Persisted `manifestLastCheckAt` means a **relaunch next day re-checks** (≥ 15 min elapsed) and picks up a manifest that appeared overnight.
+
+Net: at most one BADR check + one email per 15 min per LTA, across restarts; ~3 checks then the monitor lets go.
+
+**Files changed:** `electron/main.js`, `src/badr/badrLotLookup.js`
+
+---
+
 ## 2026-07-22 — "Pas encore manifest" is now retryable, not a hard error
 
 **Problem:** when BADR lot lookup found no manifest yet, the LTA was set to `phase: "error"` and abandoned — it blocked nothing else, but it was never retried (even on restart, because `computeLaunchable` excludes `error`). The operator wanted: process the LTAs whose manifest IS ready, and meanwhile keep re-checking the manifest-less ones until their manifest appears.

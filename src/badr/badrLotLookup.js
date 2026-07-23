@@ -143,7 +143,7 @@ class BADRLotLookup {
    * Fill all required fields and submit.
    * @param {string} lotReference – MAWB number, e.g. "607-52839835"
    */
-  async searchLot(lotReference) {
+  async searchLot(lotReference, { emailOnEmpty = true } = {}) {
     const p = this.popupPage;
     const normalizedLotReference = this._normalizeLotReference(lotReference);
 
@@ -256,7 +256,7 @@ class BADRLotLookup {
         // Only send the "no result" email on the very last try (last window of
         // the last opérateur) — otherwise we'd email before trying SWIFTAIR.
         lastResult = await this._parseResults(normalizedLotReference, {
-          sendNoResultEmail: isFinalAttempt && isLastOperateur,
+          sendNoResultEmail: emailOnEmpty && isFinalAttempt && isLastOperateur,
         });
 
         if (!lastResult?.isEmpty) return lastResult;

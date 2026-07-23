@@ -33,6 +33,88 @@ function computeLaunchable(list) {
   });
 }
 
+// Live statuses that mean "actively processing".
+const RUNNING_STATUSES = new Set([
+  "running",
+  "captcha-waiting",
+  "filling-form",
+  "submitting-portnet",
+  "portnet-submitted",
+  "monitoring-portnet",
+  "portnet-accepted",
+  "badr-downloading",
+]);
+
+/** Bucket a card status into one of the filter categories. */
+function categoryOf(status) {
+  if (status === "done") return "done";
+  if (status === "error" || status === "weight-mismatch") return "error";
+  if (RUNNING_STATUSES.has(status)) return "running";
+  return "pending"; // idle, waiting-manifest, partiel-waiting-*, partiel-skip
+}
+
+/** Tab with an active underline + optional count pill. */
+function TabButton({ active, onClick, label, count }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`relative px-4 py-3 text-sm font-medium transition-colors outline-none ${
+        active ? "text-white" : "text-slate-400 hover:text-slate-200"
+      }`}
+    >
+      <span className="inline-flex items-center gap-2">
+        {label}
+        {count > 0 && (
+          <span
+            className={`text-[10px] leading-none px-1.5 py-0.5 rounded-full ${
+              active
+                ? "bg-emerald-500/20 text-emerald-300"
+                : "bg-slate-700/70 text-slate-400"
+            }`}
+          >
+            {count}
+          </span>
+        )}
+      </span>
+      {active && (
+        <span className="absolute inset-x-2 -bottom-px h-0.5 bg-emerald-500 rounded-full" />
+      )}
+    </button>
+  );
+}
+
+/** Clickable stat tile used as a filter chip on the Acheminements tab. */
+function StatCard({ label, value, tone, active, onClick, pulse }) {
+  const tones = {
+    slate: "text-slate-200",
+    emerald: "text-emerald-400",
+    blue: "text-blue-400",
+    amber: "text-amber-400",
+    red: "text-red-400",
+  };
+  return (
+    <button
+      onClick={onClick}
+      className={`flex-1 min-w-[104px] text-left px-4 py-2.5 rounded-xl border transition-all ${
+        active
+          ? "bg-slate-800 border-slate-600 ring-1 ring-emerald-500/40"
+          : "bg-slate-900/60 border-slate-800/80 hover:border-slate-700 hover:bg-slate-900"
+      }`}
+    >
+      <div
+        className={`text-2xl font-bold tabular-nums leading-none ${tones[tone] || tones.slate} ${
+          pulse ? "animate-pulse" : ""
+        }`}
+      >
+        {value}
+      </div>
+      <div className="text-[11px] uppercase tracking-wide text-slate-500 mt-1.5">
+        {label}
+      </div>
+    </button>
+  );
+}
+
 export default function App() {
   // ── State ─────────────────────────────────────────────────────────────────
   const [folderPath, setFolderPath] = useState(null);
@@ -40,7 +122,8 @@ export default function App() {
   const [statuses, setStatuses] = useState({});
   const [logs, setLogs] = useState([]);
   const [isRunning, setIsRunning] = useState(false);
-  const [logPanelOpen, setLogPanelOpen] = useState(true);
+  const [activeTab, setActiveTab] = useState("acheminements"); // "acheminements" | "journal"
+  const [cardFilter, setCardFilter] = useState("all"); // all | pending | running | done | error
   // Set of card ids currently running a shipper MAWB extraction
   const [shipperLoadingIds, setShipperLoadingIds] = useState(new Set());
 
@@ -462,13 +545,16 @@ export default function App() {
   };
 
   // ── Layout ────────────────────────────────────────────────────────────────
-  const doneCount = Object.values(statuses).filter(
-    (s) => s.status === "done",
-  ).length;
-  const errorCount = Object.values(statuses).filter(
-    (s) => s.status === "error" || s.status === "weight-mismatch",
-  ).length;
-  const pendingCount = acheminements.length - doneCount - errorCount;
+  const catCounts = { pending: 0, running: 0, done: 0, error: 0 };
+  for (const a of acheminements) {
+    catCounts[categoryOf(statuses[a.id]?.status ?? "idle")]++;
+  }
+  const visibleAch =
+    cardFilter === "all"
+      ? acheminements
+      : acheminements.filter(
+          (a) => categoryOf(statuses[a.id]?.status ?? "idle") === cardFilter,
+        );
 
   return (
     <div className="h-screen flex flex-col overflow-hidden bg-slate-950">
@@ -480,35 +566,36 @@ export default function App() {
         isRunning={isRunning}
       />
 
-      {/* ── Toolbar strip ─────────────────────────────────────────────────── */}
-      {acheminements.length > 0 && (
-        <div
-          className="flex items-center justify-between px-5 py-2 bg-slate-900/50
-                        border-b border-slate-800 flex-shrink-0"
-        >
-          {/* Stats */}
-          <div className="flex items-center gap-4 text-xs text-slate-500">
-            <span>{acheminements.length} acheminements</span>
-            {doneCount > 0 && (
-              <span className="text-emerald-500">✓ {doneCount} terminés</span>
-            )}
-            {errorCount > 0 && (
-              <span className="text-red-500">✗ {errorCount} erreurs</span>
-            )}
-            {pendingCount > 0 && isRunning && (
-              <span className="text-blue-400 animate-pulse">
-                {pendingCount} en attente…
+      {/* ── Tab bar + primary actions ─────────────────────────────────────── */}
+      <div className="flex items-center justify-between px-4 bg-slate-900/40 border-b border-slate-800 flex-shrink-0">
+        <div className="flex items-center">
+          <TabButton
+            active={activeTab === "acheminements"}
+            onClick={() => setActiveTab("acheminements")}
+            label="Acheminements"
+            count={acheminements.length}
+          />
+          <TabButton
+            active={activeTab === "journal"}
+            onClick={() => setActiveTab("journal")}
+            label="Journal"
+            count={logs.length}
+          />
+        </div>
+
+        {acheminements.length > 0 && (
+          <div className="flex items-center gap-2">
+            {isRunning && (
+              <span className="hidden sm:inline-flex items-center gap-1.5 text-xs text-blue-300 mr-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+                En cours
               </span>
             )}
-          </div>
-
-          {/* Action buttons */}
-          <div className="flex items-center gap-2">
             <button
               onClick={handleRefresh}
               disabled={isRunning}
               className="text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700
-                         text-slate-400 hover:text-slate-200 border border-slate-700
+                         text-slate-300 hover:text-white border border-slate-700
                          disabled:opacity-50 disabled:cursor-not-allowed transition-all"
             >
               ↺ Actualiser
@@ -521,90 +608,130 @@ export default function App() {
                   ? "Ajoute les nouveaux LTA complets au traitement en cours (sessions ouvertes ; les LTAs déjà traités sont ignorés)"
                   : undefined
               }
-              className="text-xs px-4 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600
-                         text-white font-semibold shadow-md
+              className="text-xs px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500
+                         text-white font-semibold shadow-md shadow-emerald-900/30
                          disabled:opacity-50 disabled:cursor-not-allowed transition-all"
             >
               {isRunning ? "➕ Ajouter au traitement" : "▶ Tout lancer"}
             </button>
-            <button
-              onClick={() => setLogPanelOpen((v) => !v)}
-              className="text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700
-                         text-slate-400 hover:text-slate-200 border border-slate-700 transition-all"
-            >
-              {logPanelOpen ? "Masquer logs" : "Afficher logs"}
-              {logs.length > 0 && (
-                <span className="ml-1.5 bg-slate-700 text-slate-300 rounded-full px-1.5 py-0.5 text-xs">
-                  {logs.length}
-                </span>
-              )}
-            </button>
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* ── Body ──────────────────────────────────────────────────────────── */}
-      <div className="flex-1 flex min-h-0">
-        {/* Left: cards grid */}
-        <div
-          className={`flex-1 overflow-y-auto p-4 ${logPanelOpen ? "pr-2" : ""}`}
-        >
-          {acheminements.length === 0 ? (
-            /* Empty state */
-            <div className="flex flex-col items-center justify-center h-full text-center gap-4">
-              <div
-                className="w-16 h-16 rounded-2xl bg-slate-800 border border-slate-700
-                              flex items-center justify-center text-3xl"
-              >
-                📂
+      <div className="flex-1 min-h-0 overflow-hidden">
+        {activeTab === "acheminements" ? (
+          <div className="h-full overflow-y-auto px-5 py-4">
+            {acheminements.length === 0 ? (
+              /* Empty state */
+              <div className="flex flex-col items-center justify-center h-full text-center gap-4">
+                <div className="w-16 h-16 rounded-2xl bg-slate-800 border border-slate-700 flex items-center justify-center text-3xl">
+                  📂
+                </div>
+                <div>
+                  <p className="text-slate-200 font-semibold mb-1">
+                    Aucun acheminement trouvé
+                  </p>
+                  <p className="text-slate-500 text-sm max-w-xs">
+                    Sélectionnez un dossier contenant des sous-dossiers
+                    d'acheminements, chacun avec un Manifeste et un MAWB/LTA en
+                    PDF.
+                  </p>
+                </div>
+                <button
+                  onClick={handleSelectFolder}
+                  className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white
+                             rounded-xl font-medium text-sm shadow-lg transition-all"
+                >
+                  Choisir un dossier
+                </button>
               </div>
-              <div>
-                <p className="text-slate-300 font-semibold mb-1">
-                  Aucun acheminement trouvé
-                </p>
-                <p className="text-slate-500 text-sm max-w-xs">
-                  Sélectionnez un dossier contenant des sous-dossiers
-                  d'acheminements, chacun avec un Manifeste et un MAWB/LTA en
-                  PDF.
-                </p>
-              </div>
-              <button
-                onClick={handleSelectFolder}
-                className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white
-                           rounded-xl font-medium text-sm shadow-lg transition-all"
-              >
-                Choisir un dossier
-              </button>
-            </div>
-          ) : (
-            <div
-              className="grid gap-4"
-              style={{
-                gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))",
-              }}
-            >
-              {acheminements.map((ach) => (
-                <AcheminementCard
-                  key={ach.id}
-                  ach={ach}
-                  status={statuses[ach.id]?.status ?? "idle"}
-                  error={statuses[ach.id]?.error}
-                  nextVol={statuses[ach.id]?.nextVol}
-                  isGlobalRunning={isRunning}
-                  shipperLoading={shipperLoadingIds.has(ach.id)}
-                  onChange={handleChange}
-                  onRun={handleRun}
-                  onDelete={handleDelete}
-                  onDeclareScelles={handleDeclareScelles}
-                />
-              ))}
-            </div>
-          )}
-        </div>
+            ) : (
+              <>
+                {/* Stat filters */}
+                <div className="flex flex-wrap gap-2.5 mb-5">
+                  <StatCard
+                    label="Total"
+                    value={acheminements.length}
+                    tone="slate"
+                    active={cardFilter === "all"}
+                    onClick={() => setCardFilter("all")}
+                  />
+                  <StatCard
+                    label="En cours"
+                    value={catCounts.running}
+                    tone="blue"
+                    pulse={catCounts.running > 0}
+                    active={cardFilter === "running"}
+                    onClick={() =>
+                      setCardFilter(cardFilter === "running" ? "all" : "running")
+                    }
+                  />
+                  <StatCard
+                    label="En attente"
+                    value={catCounts.pending}
+                    tone="amber"
+                    active={cardFilter === "pending"}
+                    onClick={() =>
+                      setCardFilter(cardFilter === "pending" ? "all" : "pending")
+                    }
+                  />
+                  <StatCard
+                    label="Terminés"
+                    value={catCounts.done}
+                    tone="emerald"
+                    active={cardFilter === "done"}
+                    onClick={() =>
+                      setCardFilter(cardFilter === "done" ? "all" : "done")
+                    }
+                  />
+                  <StatCard
+                    label="Erreurs"
+                    value={catCounts.error}
+                    tone="red"
+                    active={cardFilter === "error"}
+                    onClick={() =>
+                      setCardFilter(cardFilter === "error" ? "all" : "error")
+                    }
+                  />
+                </div>
 
-        {/* Right: log panel */}
-        {logPanelOpen && (
-          <div className="w-[420px] flex-shrink-0 p-4 pl-2 flex flex-col min-h-0">
+                {/* Card grid */}
+                {visibleAch.length === 0 ? (
+                  <div className="text-center text-slate-500 text-sm py-16">
+                    Aucun acheminement dans ce filtre.
+                  </div>
+                ) : (
+                  <div
+                    className="grid gap-4"
+                    style={{
+                      gridTemplateColumns:
+                        "repeat(auto-fill, minmax(320px, 1fr))",
+                    }}
+                  >
+                    {visibleAch.map((ach) => (
+                      <AcheminementCard
+                        key={ach.id}
+                        ach={ach}
+                        status={statuses[ach.id]?.status ?? "idle"}
+                        error={statuses[ach.id]?.error}
+                        nextVol={statuses[ach.id]?.nextVol}
+                        isGlobalRunning={isRunning}
+                        shipperLoading={shipperLoadingIds.has(ach.id)}
+                        onChange={handleChange}
+                        onRun={handleRun}
+                        onDelete={handleDelete}
+                        onDeclareScelles={handleDeclareScelles}
+                      />
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        ) : (
+          /* Journal tab */
+          <div className="h-full p-4">
             <LogPanel logs={logs} onClear={() => setLogs([])} />
           </div>
         )}
