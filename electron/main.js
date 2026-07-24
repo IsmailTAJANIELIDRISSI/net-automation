@@ -179,6 +179,28 @@ function manifestCheckThrottled(checkpoint) {
   return !!lastAt && Date.now() - lastAt < MANIFEST_CHECK_INTERVAL_MS;
 }
 
+// Sanity bounds for the declared "Valeur totale", by currency. Mirror of
+// VALUE_RANGE_LIMITS in src/ui/requiredFields.js — keep the two in sync. A value
+// outside the range must be confirmed by the operator (ach.valueRangeAck) before
+// the LTA is processed; this is a backend safety net behind the UI gate.
+const VALUE_RANGE_LIMITS = {
+  MAD: { min: 150000, max: 450000 },
+  USD: { min: 4000, max: 40000 },
+};
+
+/** Returns an error message if Valeur totale is out of range, else null. */
+function valueRangeError(ach) {
+  const currency = String(ach?.currency || "MAD").toUpperCase();
+  const limits = VALUE_RANGE_LIMITS[currency];
+  if (!limits) return null;
+  const raw = ach?.totalValue;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return null;
+  const value = Number(String(raw).replace(/\s/g, "").replace(",", "."));
+  if (!Number.isFinite(value)) return null;
+  if (value >= limits.min && value <= limits.max) return null;
+  return `Valeur totale ${value} ${currency} hors de la plage attendue (${limits.min} – ${limits.max} ${currency}) — à confirmer par l'opérateur.`;
+}
+
 // A batch is running (submit → monitor). While it is, a "Tout lancer" / "Lancer"
 // from the UI must NOT start a second concurrent batch (that would race on the
 // shared browser pages). Instead, if a Portnet monitor is actively polling
@@ -449,6 +471,17 @@ async function prepareLotAndWeightCheck(acheminement) {
     sendLog("warn", "MAWB", `[${id}] ${mawbMismatch} — traitement bloqué`);
     sendProgress(id, "error", { error: mawbMismatch });
     return { success: false, error: mawbMismatch };
+  }
+
+  // Value-range safety net (UI already blocks this; guards edge cases).
+  if (!acheminement.valueRangeAck) {
+    const vErr = valueRangeError(acheminement);
+    if (vErr) {
+      updateAutomationState(folderPath, { phase: "error", error: vErr });
+      sendLog("warn", "Value", `[${id}] ${vErr} — traitement bloqué`);
+      sendProgress(id, "error", { error: vErr });
+      return { success: false, error: vErr };
+    }
   }
 
   const folderLotReference = extractLotReferenceFromFolder(folderPath);
@@ -1396,14 +1429,13 @@ async function monitorPendingPortnetRequests(
             // Subject uses the same acheminement format as the other mails (LTA
             // reference, not the Portnet ref), plus the pending-validation marker.
             const ltaRef = ach.refNumber || portnetRef || "";
+            const ordinal = acheminementOrdinal(ach.id);
             await sendNotification({
               subject: `${buildAcheminementSubject(ach.id, "DS Combinée", ltaRef)} — En cours validation Portnet`,
               text:
                 `En cours validation Portnet\n\n` +
-                `LTA : ${ach.id}\nRéférence : ${ltaRef}` +
-                (portnetRef && portnetRef !== ltaRef
-                  ? `\nRéférence Portnet : ${portnetRef}`
-                  : "") +
+                (ordinal ? `${ordinal}\n` : "") +
+                `Référence LTA : ${ltaRef}` +
                 `\n\n-- MedAfrica --`,
             }).catch(() => {});
             updateAutomationState(ach.folderPath, { pendingEmailSent: true });
@@ -1671,6 +1703,17 @@ async function runPartielDumFlow(acheminement) {
     sendLog("warn", "MAWB", `[${id}] ${mawbMismatch} — traitement bloqué`);
     sendProgress(id, "error", { error: mawbMismatch });
     return { success: false, error: mawbMismatch };
+  }
+
+  // Value-range safety net (UI already blocks this; guards edge cases).
+  if (!acheminement.valueRangeAck) {
+    const vErr = valueRangeError(acheminement);
+    if (vErr) {
+      updateAutomationState(folderPath, { phase: "error", error: vErr });
+      sendLog("warn", "Value", `[${id}] ${vErr} — traitement bloqué`);
+      sendProgress(id, "error", { error: vErr });
+      return { success: false, error: vErr };
+    }
   }
 
   // Block if the MAWB freight wasn't confidently extracted and the operator
@@ -2175,13 +2218,18 @@ function parseScellesFromFolderName(name) {
 // Build an email subject from the folder name + declaration type, e.g.
 // "2éme acheminement DS Combinée LTA N° 72-74340954". Uses only the acheminement
 // rank and the LTA reference — never scellés or DS series.
-function buildAcheminementSubject(folderName, typeLabel, ref) {
+// "2EME 13460565-…" (folder name) → "2éme acheminement". Returns null when the
+// folder name has no leading number, so callers can avoid leaking the raw name.
+function acheminementOrdinal(folderName) {
   const m = String(folderName || "").match(/^\s*(\d+)/);
-  const n = m ? parseInt(m[1], 10) : null;
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return `${n}${n === 1 ? "er" : "éme"} acheminement`;
+}
+
+function buildAcheminementSubject(folderName, typeLabel, ref) {
   const ordinal =
-    n != null
-      ? `${n}${n === 1 ? "er" : "éme"} acheminement`
-      : String(folderName || "").trim();
+    acheminementOrdinal(folderName) || String(folderName || "").trim();
   return `${ordinal} ${typeLabel} LTA N° ${ref}`;
 }
 

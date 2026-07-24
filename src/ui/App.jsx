@@ -2,7 +2,10 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import Header from "./components/Header.jsx";
 import AcheminementCard from "./components/AcheminementCard.jsx";
 import LogPanel from "./components/LogPanel.jsx";
-import { getMissingRequiredFields } from "./requiredFields.js";
+import {
+  getMissingRequiredFields,
+  getValueRangeIssue,
+} from "./requiredFields.js";
 
 /** Keep user input unless blank — otherwise new scan values apply (acheminement.json can store ""). */
 function preferNonEmptyPrev(prev, fromScan) {
@@ -29,6 +32,8 @@ function computeLaunchable(list) {
   return (list || []).filter((a) => {
     if (a.refMismatch) return false;
     if (NON_LAUNCHABLE_PHASES.has(a.automationState?.phase)) return false;
+    // Out-of-range Valeur totale must be confirmed by the operator first.
+    if (getValueRangeIssue(a) && !a.valueRangeAck) return false;
     return getMissingRequiredFields(a).length === 0;
   });
 }
@@ -111,6 +116,64 @@ function StatCard({ label, value, tone, active, onClick, pulse }) {
       <div className="text-[11px] uppercase tracking-wide text-slate-500 mt-1.5">
         {label}
       </div>
+    </button>
+  );
+}
+
+const LOG_LEVEL_TEXT = {
+  info: "text-slate-300",
+  warn: "text-amber-400",
+  error: "text-red-400",
+  debug: "text-slate-500",
+  success: "text-emerald-400",
+};
+
+/** Slim always-visible footer showing the latest log line live. Click → Journal. */
+function LiveLogBar({ logs, onOpen }) {
+  const last = logs[logs.length - 1];
+  const time = last
+    ? new Date(last.ts).toLocaleTimeString("fr-FR", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      })
+    : "";
+  return (
+    <button
+      onClick={onOpen}
+      title="Ouvrir le journal complet"
+      className="group flex-shrink-0 flex items-center gap-2.5 w-full h-8 px-4 text-left
+                 bg-slate-900/80 border-t border-slate-800 hover:bg-slate-900 transition-colors"
+    >
+      <span
+        className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+          last ? "bg-emerald-500 animate-pulse" : "bg-slate-600"
+        }`}
+      />
+      {last ? (
+        <>
+          <span className="text-[11px] font-mono text-slate-600 flex-shrink-0">
+            {time}
+          </span>
+          <span className="hidden sm:inline text-[11px] font-mono text-slate-600 uppercase flex-shrink-0">
+            [{last.context}]
+          </span>
+          <span
+            className={`flex-1 text-xs truncate ${
+              LOG_LEVEL_TEXT[last.level] || "text-slate-300"
+            }`}
+          >
+            {last.message}
+          </span>
+        </>
+      ) : (
+        <span className="flex-1 text-xs text-slate-600 italic">
+          En attente d'activité…
+        </span>
+      )}
+      <span className="hidden sm:inline text-[10px] text-slate-600 group-hover:text-slate-400 flex-shrink-0">
+        Journal ↗
+      </span>
     </button>
   );
 }
@@ -293,8 +356,12 @@ export default function App() {
 
   // ── Field onChange (per-card) ──────────────────────────────────────────────
   const handleChange = useCallback((id, key, value) => {
+    // Changing the value or its currency invalidates any prior "accept" of an
+    // out-of-range value — it must be re-validated (and re-confirmed if needed).
+    const reval = key === "totalValue" || key === "currency";
+    const extra = reval ? { valueRangeAck: false } : {};
     setAcheminements((prev) =>
-      prev.map((a) => (a.id === id ? { ...a, [key]: value } : a)),
+      prev.map((a) => (a.id === id ? { ...a, [key]: value, ...extra } : a)),
     );
     // Persist to acheminement.json inside the folder so data survives restarts
     const ach = achRef.current.find((a) => a.id === id);
@@ -306,7 +373,7 @@ export default function App() {
         setShipperLoadingIds((prev) => new Set([...prev, id]));
       }
       window.api
-        .saveAcheminement(ach.folderPath, { ...ach, [key]: value })
+        .saveAcheminement(ach.folderPath, { ...ach, [key]: value, ...extra })
         .then((result) => {
           // If saving partiel=true triggered extraction, update the fields
           if (
@@ -464,6 +531,14 @@ export default function App() {
           "warn",
           "UI",
           `${a.name}: ignoré — champs obligatoires manquants : ${missing.join(", ")}`,
+        );
+      }
+      const vIssue = getValueRangeIssue(a);
+      if (vIssue && !a.valueRangeAck) {
+        addLog(
+          "warn",
+          "UI",
+          `${a.name}: ignoré — ${vIssue.message} À confirmer sur la carte avant lancement.`,
         );
       }
     }
@@ -736,6 +811,11 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {/* ── Live log bar — always-on real-time footer (redundant on Journal) ── */}
+      {activeTab !== "journal" && (
+        <LiveLogBar logs={logs} onOpen={() => setActiveTab("journal")} />
+      )}
     </div>
   );
 }

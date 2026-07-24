@@ -25,3 +25,44 @@ export function getMissingRequiredFields(ach) {
     return v === undefined || v === null || String(v).trim() === "";
   }).map(([, label]) => label);
 }
+
+// Sanity bounds for the declared "Valeur totale", by currency. A value outside
+// the range (often a bad manifest read) must be confirmed by the operator before
+// the LTA is processed — for both DS Combinée and Partiel LTAs. No bounds for
+// other currencies (e.g. EUR) → no check.
+export const VALUE_RANGE_LIMITS = {
+  MAD: { min: 150000, max: 450000 },
+  USD: { min: 4000, max: 40000 },
+};
+
+function parseAmount(raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === "") return NaN;
+  return Number(String(raw).replace(/\s/g, "").replace(",", "."));
+}
+
+/**
+ * Returns an issue descriptor when the acheminement's Valeur totale is outside
+ * the expected range for its currency, or null when it's fine / uncheckable.
+ * The operator can override it (see `valueRangeAck`).
+ */
+export function getValueRangeIssue(ach) {
+  const currency = String(ach?.currency || "MAD").toUpperCase();
+  const limits = VALUE_RANGE_LIMITS[currency];
+  if (!limits) return null; // currency without defined bounds → skip
+  const value = parseAmount(ach?.totalValue);
+  if (!Number.isFinite(value)) return null;
+  if (value >= limits.min && value <= limits.max) return null;
+
+  const fmt = (n) => n.toLocaleString("fr-FR");
+  const tooLow = value < limits.min;
+  return {
+    currency,
+    value,
+    min: limits.min,
+    max: limits.max,
+    tooLow,
+    message: `Valeur totale ${fmt(value)} ${currency} ${
+      tooLow ? "inférieure au minimum" : "supérieure au maximum"
+    } attendu (plage ${fmt(limits.min)} – ${fmt(limits.max)} ${currency}).`,
+  };
+}

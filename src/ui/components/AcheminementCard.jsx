@@ -1,6 +1,9 @@
-import React, { useState } from "react";
+import React, { useState, useRef } from "react";
 import StatusBadge from "./StatusBadge.jsx";
-import { getMissingRequiredFields } from "../requiredFields.js";
+import {
+  getMissingRequiredFields,
+  getValueRangeIssue,
+} from "../requiredFields.js";
 
 /**
  * Card representing one acheminement folder.
@@ -67,6 +70,17 @@ export default function AcheminementCard({
   const [signedSerie, setSignedSerie] = useState(
     ach.automationState?.dumSerie ?? "",
   );
+
+  // ── Valeur totale sanity-range guard ───────────────────────────────────────
+  // A value outside the expected range for its currency (usually a bad manifest
+  // read) blocks processing until the operator corrects or explicitly accepts it.
+  const valueInputRef = useRef(null);
+  const valueIssue = getValueRangeIssue(ach);
+  const valueBlocked = !!valueIssue && !ach.valueRangeAck;
+  const focusValue = () => {
+    valueInputRef.current?.scrollIntoView({ block: "center", behavior: "smooth" });
+    valueInputRef.current?.focus();
+  };
 
   const cardBorder = isDone
     ? "border-emerald-700/50"
@@ -231,19 +245,77 @@ export default function AcheminementCard({
               <option value="EUR">EUR</option>
             </select>
             <input
+              ref={valueInputRef}
               type="number"
               value={ach.totalValue ?? ""}
               placeholder="ex: 15000.00"
               disabled={isRunning || isDone}
               onChange={(e) => onChange(id, "totalValue", e.target.value)}
-              className="flex-1 bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-sm
-                         text-slate-100 placeholder-slate-600
-                         focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/50
-                         disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              className={`flex-1 bg-slate-900 border rounded px-2.5 py-1.5 text-sm
+                         text-slate-100 placeholder-slate-600 focus:ring-1
+                         disabled:opacity-50 disabled:cursor-not-allowed transition-colors ${
+                           valueIssue
+                             ? "border-red-600/70 focus:border-red-400 focus:ring-red-400/50"
+                             : "border-slate-700 focus:border-emerald-500 focus:ring-emerald-500/50"
+                         }`}
             />
           </div>
         </div>
       </div>
+
+      {/* ── Valeur totale hors plage — must be confirmed/corrected (red) ────── */}
+      {valueIssue && (
+        <div
+          className={`flex flex-col gap-2 rounded-lg px-3 py-2 border ${
+            ach.valueRangeAck
+              ? "bg-amber-900/20 border-amber-700/50"
+              : "bg-red-900/40 border-red-700/60"
+          }`}
+        >
+          {ach.valueRangeAck ? (
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-amber-300 text-xs font-semibold leading-snug">
+                ✓ Valeur hors plage acceptée manuellement — traitement autorisé.
+              </span>
+              <button
+                onClick={() => onChange(id, "valueRangeAck", false)}
+                disabled={isRunning || isDone}
+                className="flex-shrink-0 text-[11px] text-amber-400 hover:text-amber-200
+                           underline underline-offset-2 disabled:opacity-50"
+              >
+                Annuler
+              </button>
+            </div>
+          ) : (
+            <>
+              <span className="text-red-300 text-xs font-semibold leading-snug">
+                ⚠️ {valueIssue.message} Vérifiez le manifeste : corrigez la valeur,
+                ou acceptez-la pour lancer malgré tout.
+              </span>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => onChange(id, "valueRangeAck", true)}
+                  disabled={isRunning || isDone}
+                  className="text-xs px-3 py-1.5 rounded-lg bg-amber-700 hover:bg-amber-600
+                             text-white font-semibold border border-amber-600
+                             disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                >
+                  Accepter la valeur
+                </button>
+                <button
+                  onClick={focusValue}
+                  disabled={isRunning || isDone}
+                  className="text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700
+                             text-slate-300 hover:text-white border border-slate-700
+                             disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                >
+                  Corriger
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       {/* ── Partiel LTA checkbox ──────────────────────────────────────────── */}
       <label className="flex items-center gap-2 cursor-pointer select-none mt-1">
@@ -416,14 +488,17 @@ export default function AcheminementCard({
               isDone ||
               (!!ach.refMismatch && !ach.manifestRef) ||
               !!ach.mawbMismatch ||
-              (hasMissingRequired && !isRunning)
+              (hasMissingRequired && !isRunning) ||
+              valueBlocked
             }
             title={
               ach.mawbMismatch
                 ? ach.mawbMismatch
-                : hasMissingRequired
-                  ? `Champs obligatoires manquants : ${missingRequired.join(", ")}`
-                  : undefined
+                : valueBlocked
+                  ? valueIssue.message
+                  : hasMissingRequired
+                    ? `Champs obligatoires manquants : ${missingRequired.join(", ")}`
+                    : undefined
             }
             className={`mt-1 w-full py-2 rounded-lg text-sm font-semibold transition-all duration-200
             ${
