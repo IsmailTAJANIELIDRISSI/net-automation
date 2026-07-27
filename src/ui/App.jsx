@@ -7,12 +7,6 @@ import {
   getValueRangeIssue,
 } from "./requiredFields.js";
 
-/** Keep user input unless blank — otherwise new scan values apply (acheminement.json can store ""). */
-function preferNonEmptyPrev(prev, fromScan) {
-  if (prev != null && String(prev).trim() !== "") return prev;
-  return fromScan ?? "";
-}
-
 /**
  * Phases "Tout lancer" must NOT (re)launch: already finished, waiting on a human
  * (signature / next vol), needs a manual fix (weight), or errored (don't auto-retry).
@@ -320,27 +314,41 @@ export default function App() {
     if (!folderPath) return;
     const scanned = await window.api.scanFolder(folderPath);
     setStatuses((prev) => ({ ...statusesFromScan(scanned), ...prev }));
-    // Preserve user-edited field values
+    // Merge fresh scan over prior UI state. Fields the operator edited are kept;
+    // every other field takes the fresh (re-extracted) value — so a corrected
+    // manifest read (e.g. currency MAD→USD once the PDF is fully parsed) shows up
+    // live instead of being frozen at a stale earlier value.
     setAcheminements((prev) => {
       const prevMap = Object.fromEntries(prev.map((a) => [a.id, a]));
-      return scanned.map((a) => ({
-        ...a,
-        scelle1: prevMap[a.id]?.scelle1 ?? a.scelle1,
-        scelle2: prevMap[a.id]?.scelle2 ?? a.scelle2,
-        nombreContenant: preferNonEmptyPrev(
-          prevMap[a.id]?.nombreContenant,
-          a.nombreContenant,
-        ),
-        poidTotal: preferNonEmptyPrev(prevMap[a.id]?.poidTotal, a.poidTotal),
-        sequenceNumber: prevMap[a.id]?.sequenceNumber ?? a.sequenceNumber,
-        lieuChargement: prevMap[a.id]?.lieuChargement ?? a.lieuChargement,
-        currency:
-          preferNonEmptyPrev(prevMap[a.id]?.currency, a.currency) || "MAD",
-        totalValue: preferNonEmptyPrev(prevMap[a.id]?.totalValue, a.totalValue),
-        manifestPdfExtract:
-          a.manifestPdfExtract ?? prevMap[a.id]?.manifestPdfExtract,
-        automationState: a.automationState ?? prevMap[a.id]?.automationState,
-      }));
+      return scanned.map((a) => {
+        const p = prevMap[a.id];
+        const edited = new Set(p?._editedFields || a._editedFields || []);
+        // Edited → keep operator value; not edited → fresh scan value.
+        const pick = (key) => (edited.has(key) ? p?.[key] ?? a[key] : a[key]);
+        const currency = pick("currency") || "MAD";
+        const totalValue = pick("totalValue");
+        // Prior "accept" of an out-of-range value is void if the value/currency
+        // actually changed under it.
+        const changed =
+          p &&
+          (String(p.currency ?? "") !== String(currency) ||
+            String(p.totalValue ?? "") !== String(totalValue ?? ""));
+        return {
+          ...a,
+          scelle1: pick("scelle1"),
+          scelle2: pick("scelle2"),
+          nombreContenant: pick("nombreContenant"),
+          poidTotal: pick("poidTotal"),
+          sequenceNumber: pick("sequenceNumber"),
+          lieuChargement: pick("lieuChargement"),
+          currency,
+          totalValue,
+          valueRangeAck: changed ? false : p?.valueRangeAck ?? a.valueRangeAck,
+          _editedFields: [...edited],
+          manifestPdfExtract: a.manifestPdfExtract ?? p?.manifestPdfExtract,
+          automationState: a.automationState ?? p?.automationState,
+        };
+      });
     });
   }, [folderPath]);
 
@@ -360,8 +368,16 @@ export default function App() {
     // out-of-range value — it must be re-validated (and re-confirmed if needed).
     const reval = key === "totalValue" || key === "currency";
     const extra = reval ? { valueRangeAck: false } : {};
+    // Track which fields the operator has explicitly edited so a later re-scan
+    // (or the backend at launch) doesn't overwrite them with re-extracted data —
+    // and, conversely, doesn't keep a stale auto value for fields never edited.
+    const withEdit = (a) => {
+      const edited = new Set(a._editedFields || []);
+      edited.add(key);
+      return { ...a, [key]: value, ...extra, _editedFields: [...edited] };
+    };
     setAcheminements((prev) =>
-      prev.map((a) => (a.id === id ? { ...a, [key]: value, ...extra } : a)),
+      prev.map((a) => (a.id === id ? withEdit(a) : a)),
     );
     // Persist to acheminement.json inside the folder so data survives restarts
     const ach = achRef.current.find((a) => a.id === id);
@@ -373,7 +389,7 @@ export default function App() {
         setShipperLoadingIds((prev) => new Set([...prev, id]));
       }
       window.api
-        .saveAcheminement(ach.folderPath, { ...ach, [key]: value, ...extra })
+        .saveAcheminement(ach.folderPath, withEdit(ach))
         .then((result) => {
           // If saving partiel=true triggered extraction, update the fields
           if (

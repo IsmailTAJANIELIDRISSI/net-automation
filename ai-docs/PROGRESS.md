@@ -5,6 +5,29 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-07-24 — CRITICAL: manifest currency (USD) frozen at stale default (MAD)
+
+**Bug (Portnet penalty risk):** an LTA added live had manifest currency **USD** (correctly extracted + logged), yet the card and `acheminement.json` kept `currency: "MAD"` — the default. Submitting the wrong devise to Portnet risks penalties.
+
+**Root cause — the same "stale value shadows fresh extraction" in 3 layers:**
+1. Scan build (`pickSavedOrExtracted`) — extracted wins → returned USD ✓ (fine).
+2. UI re-scan merge (`preferNonEmptyPrev`, `handleRefresh`) — kept the non-empty prior `MAD`, discarding the fresh USD ✗.
+3. Backend launch (`currencyMerged`) — preferred `acheminement.currency` (MAD) over freshly re-extracted `manifestPdfMetrics.currency` (USD) ✗.
+
+The first live scan (PDF still parsing) produced `MAD`; once it became the "previous" UI value / persisted default, every later corrected scan was shadowed.
+
+**Fix — manifest PDF is source of truth; only an explicit operator edit overrides it.** Added lightweight edit-tracking (`_editedFields`, persisted):
+- `App.jsx handleChange`: records the edited key into `_editedFields`.
+- `App.jsx handleRefresh`: fresh scan value wins per field unless it's in `_editedFields`; voids `valueRangeAck` if currency/value actually changed. Removed `preferNonEmptyPrev`.
+- `main.js` scan build: honors `_editedFields` for currency/total; passes `_editedFields` + `valueRangeAck` through so they survive scans/restarts.
+- `main.js` launch: `currencyMerged`/`totalMerged` prefer the re-extracted manifest value unless edited; logs a warning when overriding a stale saved currency. Value-range safety-net now evaluated on the **merged** currency/value.
+
+Existing broken `acheminement.json` self-heals on the next scan/launch (empty `_editedFields` → manifest wins).
+
+**Files changed:** `src/ui/App.jsx`, `electron/main.js`
+
+---
+
 ## 2026-07-23 — Manifest re-check: throttle to 15 min / 3 tries + email once (stop the spam)
 
 **Problem:** after making "Pas encore manifest" retryable (2026-07-22), the monitor re-checked BADR every ~1 min, and `badrLotLookup._sendNoResultEmail` fired on every empty result → an email a minute when the only LTA had no manifest yet.

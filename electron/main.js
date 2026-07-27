@@ -188,6 +188,12 @@ const VALUE_RANGE_LIMITS = {
   USD: { min: 4000, max: 40000 },
 };
 
+/** True if the operator explicitly edited `key` (tracked by the UI). When false,
+ *  re-extracted manifest data is authoritative for that field. */
+function userEdited(ach, key) {
+  return Array.isArray(ach?._editedFields) && ach._editedFields.includes(key);
+}
+
 /** Returns an error message if Valeur totale is out of range, else null. */
 function valueRangeError(ach) {
   const currency = String(ach?.currency || "MAD").toUpperCase();
@@ -473,17 +479,6 @@ async function prepareLotAndWeightCheck(acheminement) {
     return { success: false, error: mawbMismatch };
   }
 
-  // Value-range safety net (UI already blocks this; guards edge cases).
-  if (!acheminement.valueRangeAck) {
-    const vErr = valueRangeError(acheminement);
-    if (vErr) {
-      updateAutomationState(folderPath, { phase: "error", error: vErr });
-      sendLog("warn", "Value", `[${id}] ${vErr} — traitement bloqué`);
-      sendProgress(id, "error", { error: vErr });
-      return { success: false, error: vErr };
-    }
-  }
-
   const folderLotReference = extractLotReferenceFromFolder(folderPath);
 
   let manifestPdfMetrics = null;
@@ -529,13 +524,47 @@ async function prepareLotAndWeightCheck(acheminement) {
   const poidMerged =
     String(poidFromInput || "").trim() ||
     String(manifestPdfMetrics?.poidTotal || "").trim();
+  // Currency & total: the manifest PDF is the source of truth. Use the freshly
+  // re-extracted value unless the operator explicitly edited the field — this
+  // prevents a stale default (e.g. "MAD" persisted before the PDF was fully
+  // parsed) from being submitted to Portnet when the manifest actually says USD.
+  const extractedCurrency = String(manifestPdfMetrics?.currency || "").trim();
+  const savedCurrency = String(acheminement.currency || "").trim();
+  if (
+    !userEdited(acheminement, "currency") &&
+    extractedCurrency &&
+    extractedCurrency.toUpperCase() !== savedCurrency.toUpperCase()
+  ) {
+    sendLog(
+      "warn",
+      "Manifeste",
+      `[${id}] Devise manifeste "${extractedCurrency}" ≠ valeur enregistrée "${savedCurrency || "—"}" — utilisation de la devise du manifeste (source de vérité).`,
+    );
+  }
   const currencyMerged =
-    String(acheminement.currency || "").trim() ||
-    String(manifestPdfMetrics?.currency || "").trim() ||
-    "MAD";
-  const totalMerged =
-    String(acheminement.totalValue || "").trim() ||
-    String(manifestPdfMetrics?.totalValue || "").trim();
+    (userEdited(acheminement, "currency")
+      ? savedCurrency
+      : extractedCurrency || savedCurrency) || "MAD";
+  const totalMerged = userEdited(acheminement, "totalValue")
+    ? String(acheminement.totalValue || "").trim()
+    : String(manifestPdfMetrics?.totalValue || "").trim() ||
+      String(acheminement.totalValue || "").trim();
+
+  // Value-range safety net — evaluated on the MERGED (source-of-truth) currency
+  // and value, not the possibly-stale saved ones. UI already blocks this; this
+  // guards edge cases (e.g. a corrected currency the UI hadn't re-validated).
+  if (!acheminement.valueRangeAck) {
+    const vErr = valueRangeError({
+      currency: currencyMerged,
+      totalValue: totalMerged,
+    });
+    if (vErr) {
+      updateAutomationState(folderPath, { phase: "error", error: vErr });
+      sendLog("warn", "Value", `[${id}] ${vErr} — traitement bloqué`);
+      sendProgress(id, "error", { error: vErr });
+      return { success: false, error: vErr };
+    }
+  }
 
   const BADRLotLookup = require("../src/badr/badrLotLookup");
   const BADRPreapurement = require("../src/badr/badrPreapurement");
@@ -2572,17 +2601,23 @@ async function scanSingleAcheminement(rootFolderPath, entryName) {
       manifestPdfExtract?.ok ? manifestPdfExtract.poidTotal : null,
       "",
     );
-    // Currency & totalValue: PDF extraction wins over saved (PDF is source of truth)
-    const mergedCurrency = pickSavedOrExtracted(
-      manifestPdfExtract?.ok ? manifestPdfExtract.currency : null,
-      saved.currency,
-      "MAD",
-    );
-    const mergedTotalValue = pickSavedOrExtracted(
-      manifestPdfExtract?.ok ? manifestPdfExtract.totalValue : null,
-      saved.totalValue,
-      "",
-    );
+    // Currency & totalValue: the PDF extraction is the source of truth and wins
+    // over the saved value — UNLESS the operator explicitly edited the field, in
+    // which case their value is preserved (survives a folder re-open).
+    const mergedCurrency = userEdited(saved, "currency")
+      ? String(saved.currency || "").trim() || "MAD"
+      : pickSavedOrExtracted(
+          manifestPdfExtract?.ok ? manifestPdfExtract.currency : null,
+          saved.currency,
+          "MAD",
+        );
+    const mergedTotalValue = userEdited(saved, "totalValue")
+      ? String(saved.totalValue ?? "")
+      : pickSavedOrExtracted(
+          manifestPdfExtract?.ok ? manifestPdfExtract.totalValue : null,
+          saved.totalValue,
+          "",
+        );
     const mawbCheck = computeMawbVsManifestMismatch({
       manifestNbr: mergedNombre,
       manifestPoids: mergedPoids,
@@ -2608,6 +2643,10 @@ async function scanSingleAcheminement(rootFolderPath, entryName) {
       lieuChargement: saved.lieuChargement ?? "",
       currency: mergedCurrency,
       totalValue: mergedTotalValue,
+      valueRangeAck: saved.valueRangeAck ?? false,
+      _editedFields: Array.isArray(saved._editedFields)
+        ? saved._editedFields
+        : [],
       partiel: saved.partiel ?? false,
       manifestRef: saved.manifestRef ?? "",
       shipperName: saved.shipperName ?? "",
