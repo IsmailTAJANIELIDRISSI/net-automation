@@ -268,19 +268,21 @@ export default function AcheminementCard({
         <div
           className={`flex flex-col gap-2 rounded-lg px-3 py-2 border ${
             ach.valueRangeAck
-              ? "bg-amber-900/20 border-amber-700/50"
+              ? "bg-emerald-900/20 border-emerald-700/40"
               : "bg-red-900/40 border-red-700/60"
           }`}
         >
           {ach.valueRangeAck ? (
             <div className="flex items-center justify-between gap-2">
-              <span className="text-amber-300 text-xs font-semibold leading-snug">
-                ✓ Valeur hors plage acceptée manuellement — traitement autorisé.
+              <span className="text-emerald-300 text-xs font-semibold leading-snug">
+                ✓ Valeur {valueIssue.value.toLocaleString("fr-FR")}{" "}
+                {valueIssue.currency} acceptée par l'opérateur — traitement
+                autorisé.
               </span>
               <button
                 onClick={() => onChange(id, "valueRangeAck", false)}
                 disabled={isRunning || isDone}
-                className="flex-shrink-0 text-[11px] text-amber-400 hover:text-amber-200
+                className="flex-shrink-0 text-[11px] text-slate-400 hover:text-slate-200
                            underline underline-offset-2 disabled:opacity-50"
               >
                 Annuler

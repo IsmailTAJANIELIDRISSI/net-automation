@@ -2722,6 +2722,11 @@ const SAVED_FIELDS = [
   "mawbCurrency",
   "qteFacturee",
   "partiels",
+  // Operator's acceptance of an out-of-range Valeur totale, and the set of fields
+  // they've explicitly edited — both must persist so the acceptance sticks across
+  // re-scans/restarts and edits aren't overwritten by re-extraction.
+  "valueRangeAck",
+  "_editedFields",
 ];
 ipcMain.handle(
   "acheminement:save",
