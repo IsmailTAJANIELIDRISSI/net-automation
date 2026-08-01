@@ -8,8 +8,12 @@ import {
 } from "./requiredFields.js";
 
 /**
- * Phases "Tout lancer" must NOT (re)launch: already finished, waiting on a human
- * (signature / next vol), needs a manual fix (weight), or errored (don't auto-retry).
+ * Phases "Tout lancer" / "Ajouter au traitement" must NOT (re)launch: already
+ * finished, waiting on a human (signature / next vol), or needs a manual fix
+ * (weight). NOTE: "error" is intentionally NOT here — an errored LTA (e.g. a BADR
+ * timeout or a partiel that failed mid-flow) IS re-launchable in a batch, exactly
+ * like the per-card "Réessayer". The backend still guards Portnet-rejected LTAs
+ * (those that already have a portnetRef) from a pointless re-confirm.
  */
 const NON_LAUNCHABLE_PHASES = new Set([
   "badr_done",
@@ -18,7 +22,6 @@ const NON_LAUNCHABLE_PHASES = new Set([
   "partiel_waiting_signature",
   "partiel_waiting_lots",
   "weight_mismatch",
-  "error",
 ]);
 
 /** LTAs ready to be launched now: complete fields, no ref mismatch, not terminal/waiting. */

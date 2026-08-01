@@ -1179,12 +1179,13 @@ class BADRDumNormalPartiel {
       .first();
     await articleLink.click();
 
-    // Wait for article detail panel
+    // Wait for the article detail panel to open. Key off a STABLE, named field
+    // (the first one we fill) rather than a PrimeFaces auto-generated id — those
+    // "j_id_*" ids change per session/DUM version, so the old wait matched nothing
+    // and timed out. nbrContenantsId only exists once the detail panel is open.
     await iframe
-      .locator(
-        "#mainTab\\:form1\\:j_id_3p_10n, [id*='articleDetail'], [id*='article_panel']",
-      )
-      .waitFor({ timeout: 15000 });
+      .locator("#mainTab\\:form1\\:nbrContenantsId")
+      .waitFor({ state: "visible", timeout: 15000 });
     await this.page.waitForTimeout(500);
 
     // Nombre contenants

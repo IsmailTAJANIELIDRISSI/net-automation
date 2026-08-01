@@ -303,8 +303,12 @@ function pickSavedOrExtracted(savedVal, extractedVal, fallback = "") {
 }
 
 function writeAcheminementFile(folderPath, data) {
+  // The operator can delete an acheminement folder from disk mid-run. Don't crash
+  // (ENOENT) trying to persist into a directory that no longer exists — just skip.
+  if (!folderPath || !fs.existsSync(folderPath)) return false;
   const savePath = path.join(folderPath, "acheminement.json");
   fs.writeFileSync(savePath, JSON.stringify(data, null, 2), "utf8");
+  return true;
 }
 
 function normalizeLotReference(value) {
@@ -1127,6 +1131,12 @@ async function monitorPendingPortnetRequests(
     let submitted = 0;
     const stillWaiting = [];
     for (const ach of manifestRetry) {
+      // Folder deleted from disk → stop re-checking it (no BADR lookup, no email).
+      if (!fs.existsSync(ach.folderPath)) {
+        sendLog("info", "BADR", `"${ach.id}": dossier supprimé — retiré du suivi.`);
+        sendProgress(ach.id, "deleted");
+        continue; // drop from the retry list
+      }
       const st = getAutomationState(ach.folderPath);
       // Progressed already (e.g. picked up elsewhere) → don't retry.
       if (st?.badrRef || st?.phase === "badr_done" || st?.phase === "partiel_done") {
@@ -1204,14 +1214,17 @@ async function monitorPendingPortnetRequests(
       ) {
         continue; // already finished
       }
-      if (st?.phase === "error") {
-        // Already rejected/failed — the checkpoint keeps its portnetRef, so
-        // re-running would only re-confirm the rejection (no re-submit). Skip it;
-        // a real retry needs the checkpoint reset. (Avoids the stale-phase re-queue
-        // seen when the UI list hadn't caught the rejection yet.)
-        sendLog("info", "Automation", `"${id}": déjà en erreur/rejeté — ignoré (relance manuelle requise).`);
+      if (st?.phase === "error" && st?.portnetRef && !st?.badrRef) {
+        // Errored AFTER Portnet submission — the checkpoint keeps its portnetRef,
+        // so re-running would only re-confirm the rejection (no re-submit). Don't
+        // retry the submit; just resume monitoring its Portnet status.
+        if (!pending.has(id)) pending.set(id, ach);
+        sendProgress(id, "monitoring-portnet", { portnetRef: st.portnetRef });
+        sendLog("info", "Automation", `"${id}": déjà soumis puis en erreur — reprise du suivi Portnet.`);
         continue;
       }
+      // Any other error (BADR/partiel failure before submission) falls through and
+      // is retried below, exactly like the per-card "Réessayer".
       if (ach.refMismatch && !ach.manifestRef) {
         sendLog("warn", "Automation", `"${id}": référence manifeste/MAWB incohérente — ignoré.`);
         continue;
@@ -1334,6 +1347,13 @@ async function monitorPendingPortnetRequests(
       let highestAttempts = 0;
 
       for (const ach of pending.values()) {
+        // Folder deleted from disk → stop polling it.
+        if (!fs.existsSync(ach.folderPath)) {
+          sendLog("info", "Portnet", `"${ach.id}": dossier supprimé — suivi arrêté.`);
+          sendProgress(ach.id, "deleted");
+          pending.delete(ach.id);
+          continue;
+        }
         const state = getAutomationState(ach.folderPath);
         if (!state?.portnetRef) {
           pending.delete(ach.id);
@@ -1684,6 +1704,13 @@ async function monitorPendingPortnetRequests(
 
 async function runPartielDumFlow(acheminement) {
   const { id, folderPath } = acheminement;
+
+  // Folder deleted from disk → bail before any BADR work or email.
+  if (!folderPath || !fs.existsSync(folderPath)) {
+    sendLog("info", "Automation", `"${id}": dossier supprimé — ignoré.`);
+    return { success: false, deleted: true };
+  }
+
   sendLog("info", "Automation", `Partiel DUM Normale flow for: ${id}`);
   sendProgress(id, "running");
 
@@ -1937,6 +1964,13 @@ async function runAutomationTask(
   { stopAfterSubmit = false, sharedPortnetPage = null } = {},
 ) {
   const { id, folderPath } = acheminement;
+
+  // Folder deleted by the operator (from disk) before/while we got here → bail
+  // before any BADR work or email; the UI drops the card on its next re-scan.
+  if (!folderPath || !fs.existsSync(folderPath)) {
+    sendLog("info", "Automation", `"${id}": dossier supprimé — ignoré.`);
+    return { success: false, deleted: true };
+  }
 
   sendLog("info", "Automation", `Starting automation for: ${id}`);
   sendProgress(id, "running");
@@ -2849,7 +2883,8 @@ ipcMain.handle("shell:openPath", async (_event, filePath) => {
 function tryQueueDuringActiveBatch(items) {
   if (batchRunning || monitorActive) {
     // Queue the FULL ach objects (with the operator's edited fields) — the monitor
-    // uses them as-is, skipping any already submitted/done/errored.
+    // uses them as-is, skipping already submitted/done ones and retrying errored
+    // LTAs (except Portnet-rejected ones, which resume monitoring). See drainInjectionQueue.
     for (const a of items) {
       if (a?.folderPath) injectionQueue.push(a);
     }
