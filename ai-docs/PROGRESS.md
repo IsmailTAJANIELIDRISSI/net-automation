@@ -5,6 +5,20 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-08-03 — AliExpress (AE) detection from the MAWB "Issuing Carrier's Agent"
+
+New MAWB field **`issuingAgent`** = the "Issuing Carrier's Agent Name and City" box (a distinct field, **not** the shipper — shipper/company extraction untouched). When that agent matches a known AliExpress marker (e.g. **"TRIMANSON EXPRESS LIMITED"**), the LTA is flagged **AE** so the operator verifies the declared value before submitting to customs.
+
+- `src/utils/mawbShipperExtract.js`: `ALIEXPRESS_AGENT_MARKERS` + `detectAliExpressAgent()`. The Vision supplement (`supplementCurrencyFretViaVision`, runs for every text MAWB) now also reads `issuing_agent`. `extractMawbMeta` returns `issuingAgent` + `aliexpress`/`aliexpressAgent`, **detecting AE from the agent field only** (raw-text scan kept solely as a fallback when the agent field is unreadable). **Add markers to that array.**
+- `electron/main.js`: both extraction sites persist `issuingAgent` + `isAliExpress` + `aliexpressAgent` (added to `SAVED_FIELDS` and scan output) and log a warning; runs for all LTAs with a MAWB.
+- `src/ui/components/AcheminementCard.jsx`: AE cards get an orange **ring**, an **"AE"** pill by the name, and a bold banner naming the agent — *"⚠️ AE — ALIEXPRESS détecté. Vérifiez impérativement la valeur totale…"*.
+
+Limitation: relies on Gemini Vision reading the agent box; if Vision is unavailable it falls back to a raw-text marker scan.
+
+**Files changed:** `src/utils/mawbShipperExtract.js`, `electron/main.js`, `src/ui/components/AcheminementCard.jsx`
+
+---
+
 ## 2026-07-24 — CRITICAL: manifest currency (USD) frozen at stale default (MAD)
 
 **Bug (Portnet penalty risk):** an LTA added live had manifest currency **USD** (correctly extracted + logged), yet the card and `acheminement.json` kept `currency: "MAD"` — the default. Submitting the wrong devise to Portnet risks penalties.

@@ -13,6 +13,32 @@ const GEMINI_MODEL_FALLBACKS = [
 // ── Retry helper (handles 503 back-off + 429 quota wait) ─────────────────────
 const { geminiCallWithRetry } = require("./geminiRetry");
 
+// ── AliExpress (AE) detection ────────────────────────────────────────────────
+// Certain issuing-carrier agents / shippers on the MAWB indicate the shipment is
+// an AliExpress ("AE") consignment, whose declared value must be double-checked
+// before it is submitted to customs. Add markers here (case/space-insensitive
+// substring match against the MAWB text + resolved shipper name).
+const ALIEXPRESS_AGENT_MARKERS = [
+  "TRIMANSON EXPRESS", // TRIMANSON EXPRESS LIMITED (issuing carrier's agent)
+];
+
+function _normalizeForMatch(s) {
+  return String(s || "")
+    .toUpperCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Returns the matched AliExpress marker found in any of the given texts, else null. */
+function detectAliExpressAgent(...texts) {
+  const hay = _normalizeForMatch(texts.filter(Boolean).join(" \n "));
+  if (!hay) return null;
+  for (const marker of ALIEXPRESS_AGENT_MARKERS) {
+    if (hay.includes(_normalizeForMatch(marker))) return marker;
+  }
+  return null;
+}
+
 // ── Generic logistics words that must NOT be used as discriminating fragments ─
 // These words appear in many company names and cause false-positive matches.
 // Only company-specific words (e.g. FIXLINK, MAERSK, BOLLORÉ) should discriminate.
@@ -504,9 +530,12 @@ async function supplementCurrencyFretViaVision(pdfPath, log) {
    Plain integer, no other text.
 4. GROSS WEIGHT — the number in the "Gross Weight" column of the cargo line (e.g. 2311).
    Plain number, no unit ("kg"), no thousands separators.
+5. ISSUING AGENT — the exact text inside the "Issuing Carrier's Agent Name and City" box
+   (NOT the shipper/consignee). e.g. "TRIMANSON EXPRESS LIMITED / HKG". Return the raw
+   string as printed, or null if that box is empty/unreadable.
 
 Respond ONLY in this exact JSON (no markdown):
-{"currency": "TWD", "total_prepaid": "142083.09", "charges_sum": "142083.09", "no_of_pieces": "121", "gross_weight": "2311"}`;
+{"currency": "TWD", "total_prepaid": "142083.09", "charges_sum": "142083.09", "no_of_pieces": "121", "gross_weight": "2311", "issuing_agent": "TRIMANSON EXPRESS LIMITED / HKG"}`;
 
   for (const modelName of GEMINI_MODEL_FALLBACKS) {
     try {
@@ -556,9 +585,10 @@ Respond ONLY in this exact JSON (no markdown):
         fretConfident,
         nbrPieces: parsed.no_of_pieces || null,
         grossWeight: parsed.gross_weight || null,
+        issuingAgent: parsed.issuing_agent || null,
       };
       log(
-        `Complément Vision: devise=${result.mawbCurrency} fret=${result.fretValue} (confiance=${result.fretConfident}) colis=${result.nbrPieces} poids=${result.grossWeight}`,
+        `Complément Vision: devise=${result.mawbCurrency} fret=${result.fretValue} (confiance=${result.fretConfident}) colis=${result.nbrPieces} poids=${result.grossWeight} agent="${result.issuingAgent || "—"}"`,
       );
       return result;
     } catch (e) {
@@ -608,6 +638,25 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
   const data = await pdfParse(buf);
   const text = String(data.text || "");
   log(`PDF lu: ${text.length} caracteres extraits`);
+
+  // "Issuing Carrier's Agent Name and City" — a distinct MAWB field (NOT the
+  // shipper). Read via the Vision supplement below; the AliExpress (AE) flag is
+  // derived from THIS agent field only. A raw-text scan is used solely as a
+  // fallback when the agent field couldn't be read.
+  let issuingAgent = null;
+  const withAE = (obj) => {
+    const agentField = (obj && obj.issuingAgent) || issuingAgent || null;
+    const marker =
+      detectAliExpressAgent(agentField) ||
+      (agentField ? null : detectAliExpressAgent(text));
+    if (marker) log(`⚠ AliExpress (AE) détecté via agent "${agentField || marker}"`);
+    return {
+      ...obj,
+      issuingAgent: (obj && obj.issuingAgent) || issuingAgent || null,
+      aliexpress: !!marker,
+      aliexpressAgent: marker || null,
+    };
+  };
   log(
     `Texte brut (500 premiers chars): "${text
       .slice(0, 500)
@@ -618,7 +667,7 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
   // ── Scanned PDF: single Gemini Vision call extracts all 3 fields ─────────
   if (text.replace(/\s/g, "").length < 50) {
     log("PDF scanné détecté (< 50 chars) — utilisation de Gemini Vision");
-    return await extractVisionMeta(pdfPath, knownCompanies, log);
+    return withAE(await extractVisionMeta(pdfPath, knownCompanies, log));
   }
 
   // ── Text-based PDF ────────────────────────────────────────────────────────
@@ -652,6 +701,7 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
     }
     if (supplement.nbrPieces != null) nbrPieces = supplement.nbrPieces;
     if (supplement.grossWeight != null) grossWeight = supplement.grossWeight;
+    if (supplement.issuingAgent) issuingAgent = supplement.issuingAgent;
   }
 
   const anchorPatterns = [
@@ -697,7 +747,7 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
 
     const shipperName = await resolveCandidate(candidates, knownCompanies, log);
     if (shipperName)
-      return { shipperName, mawbCurrency, fretValue, fretConfident, nbrPieces, grossWeight };
+      return withAE({ shipperName, mawbCurrency, fretValue, fretConfident, nbrPieces, grossWeight });
   }
 
   log(
@@ -710,11 +760,11 @@ async function extractMawbMeta(pdfPath, knowCompaniesPath, log = () => {}) {
 
   if (candidates.length === 0) {
     log("Aucun candidat societe trouve — retour null");
-    return { shipperName: null, mawbCurrency, fretValue, fretConfident, nbrPieces, grossWeight };
+    return withAE({ shipperName: null, mawbCurrency, fretValue, fretConfident, nbrPieces, grossWeight });
   }
 
   const shipperName = await resolveCandidate(candidates, knownCompanies, log);
-  return { shipperName, mawbCurrency, fretValue, fretConfident, nbrPieces, grossWeight };
+  return withAE({ shipperName, mawbCurrency, fretValue, fretConfident, nbrPieces, grossWeight });
 }
 
 /** Backward-compat wrapper — returns just the shipper name string. */

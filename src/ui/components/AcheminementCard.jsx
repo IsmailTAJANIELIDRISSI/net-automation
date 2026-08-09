@@ -90,21 +90,40 @@ export default function AcheminementCard({
         ? "border-blue-600/50"
         : "border-slate-700/50";
 
+  // AliExpress (AE) shipment detected from the MAWB → highlight the whole card so
+  // the operator double-checks the declared value before launching.
+  const isAliExpress = !!ach.isAliExpress;
+
   return (
     <div
       className={`bg-slate-800/60 border ${cardBorder} rounded-2xl p-4 flex flex-col gap-3
                      transition-all duration-200 shadow-lg shadow-black/20
-                     hover:border-slate-600/70 hover:bg-slate-800/80`}
+                     hover:border-slate-600/70 hover:bg-slate-800/80 ${
+                       isAliExpress
+                         ? "ring-2 ring-orange-500/80 shadow-orange-900/30"
+                         : ""
+                     }`}
     >
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <div className="flex items-start justify-between gap-2">
         <div className="flex-1 min-w-0">
-          <p
-            className="text-sm font-semibold text-slate-100 truncate"
-            title={name}
-          >
-            {name}
-          </p>
+          <div className="flex items-center gap-1.5 min-w-0">
+            {isAliExpress && (
+              <span
+                className="flex-shrink-0 text-[10px] font-black px-1.5 py-0.5 rounded
+                           bg-orange-500 text-white tracking-wide"
+                title="AliExpress — vérifier la valeur totale"
+              >
+                AE
+              </span>
+            )}
+            <p
+              className="text-sm font-semibold text-slate-100 truncate"
+              title={name}
+            >
+              {name}
+            </p>
+          </div>
           {refNumber && (
             <p className="text-xs text-emerald-400 font-mono mt-0.5">
               Réf: {refNumber}
@@ -113,6 +132,24 @@ export default function AcheminementCard({
         </div>
         <StatusBadge status={status} nextVol={nextVol} />
       </div>
+
+      {/* ── AliExpress (AE) alert — verify the declared value before launching ─ */}
+      {isAliExpress && (
+        <div className="rounded-lg bg-orange-500/15 border border-orange-500/60 px-3 py-2">
+          <p className="text-sm font-bold text-orange-300 leading-snug">
+            ⚠️ AE — ALIEXPRESS détecté
+          </p>
+          <p className="text-xs text-orange-200/90 mt-0.5 leading-snug">
+            Vérifiez impérativement la <span className="font-semibold">valeur
+            totale</span> avant de lancer cet acheminement.
+          </p>
+          {ach.issuingAgent && (
+            <p className="text-[11px] text-orange-200/70 mt-1 leading-snug">
+              Agent transitaire (MAWB) : {ach.issuingAgent}
+            </p>
+          )}
+        </div>
+      )}
 
       {/* ── PDFs ───────────────────────────────────────────────────────────── */}
       <div className="grid grid-cols-2 gap-2">

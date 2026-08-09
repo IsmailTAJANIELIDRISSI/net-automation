@@ -2551,7 +2551,9 @@ async function scanSingleAcheminement(rootFolderPath, entryName) {
           meta.mawbCurrency ||
           meta.fretValue ||
           meta.nbrPieces ||
-          meta.grossWeight
+          meta.grossWeight ||
+          meta.aliexpress ||
+          meta.issuingAgent
         ) {
           savedForShipper.shipperName =
             meta.shipperName || savedForShipper.shipperName;
@@ -2570,6 +2572,19 @@ async function scanSingleAcheminement(rootFolderPath, entryName) {
           if (meta.nbrPieces != null) patch.mawbNbrPieces = meta.nbrPieces;
           if (meta.grossWeight != null)
             patch.mawbGrossWeight = meta.grossWeight;
+          // "Issuing Carrier's Agent Name and City" (distinct MAWB field) + the
+          // AliExpress (AE) flag derived from it — the operator must verify the
+          // declared value before submitting to customs.
+          if (meta.issuingAgent) patch.issuingAgent = meta.issuingAgent;
+          patch.isAliExpress = !!meta.aliexpress;
+          patch.aliexpressAgent = meta.aliexpressAgent || null;
+          if (meta.aliexpress) {
+            sendLog(
+              "warn",
+              "MAWB",
+              `[${entry.name}] ⚠ AWB AliExpress (AE) détecté — agent transitaire "${meta.issuingAgent || meta.aliexpressAgent}" — vérifier la valeur totale avant de lancer.`,
+            );
+          }
           writeAcheminementFile(dirPath, { ...current, ...patch });
           sendLog(
             "info",
@@ -2694,6 +2709,9 @@ async function scanSingleAcheminement(rootFolderPath, entryName) {
       partiels: saved.partiels ?? null,
       mawbNbrPieces: saved.mawbNbrPieces ?? null,
       mawbGrossWeight: saved.mawbGrossWeight ?? null,
+      issuingAgent: saved.issuingAgent ?? null,
+      isAliExpress: saved.isAliExpress ?? false,
+      aliexpressAgent: saved.aliexpressAgent ?? null,
       // Freight couldn't be confidently reconciled from the MAWB → must be typed.
       fretUncertain: saved.fretUncertain ?? false,
       // Manifest-vs-MAWB cross-check (all LTAs). mawbMismatch = blocking colis
@@ -2761,6 +2779,11 @@ const SAVED_FIELDS = [
   // re-scans/restarts and edits aren't overwritten by re-extraction.
   "valueRangeAck",
   "_editedFields",
+  // "Issuing Carrier's Agent Name and City" (MAWB field) + AliExpress (AE)
+  // detection derived from it — flags a card for value verification.
+  "issuingAgent",
+  "isAliExpress",
+  "aliexpressAgent",
 ];
 ipcMain.handle(
   "acheminement:save",
@@ -2826,12 +2849,28 @@ ipcMain.handle(
             );
             extractedMeta = meta;
             extractedShipperName = meta.shipperName || null;
-            if (meta.shipperName || meta.mawbCurrency || meta.fretValue) {
+            if (
+              meta.shipperName ||
+              meta.mawbCurrency ||
+              meta.fretValue ||
+              meta.aliexpress ||
+              meta.issuingAgent
+            ) {
               const refreshed = readAcheminementFile(fp);
               const patch = {};
               if (meta.shipperName) patch.shipperName = meta.shipperName;
               if (meta.mawbCurrency) patch.mawbCurrency = meta.mawbCurrency;
               if (meta.fretValue) patch.fretValue = meta.fretValue;
+              if (meta.issuingAgent) patch.issuingAgent = meta.issuingAgent;
+              patch.isAliExpress = !!meta.aliexpress;
+              patch.aliexpressAgent = meta.aliexpressAgent || null;
+              if (meta.aliexpress) {
+                sendLog(
+                  "warn",
+                  "MAWB",
+                  `[${folderName}] ⚠ AWB AliExpress (AE) détecté (agent "${meta.aliexpressAgent}") — vérifier la valeur totale avant de lancer.`,
+                );
+              }
               writeAcheminementFile(fp, { ...refreshed, ...patch });
               sendLog(
                 "info",
