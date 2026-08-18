@@ -5,6 +5,18 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-08-18 — Wider scrollbar for remote (AnyDesk-from-phone) users
+
+The right-hand scrollbar was only 6px wide — too thin to grab with a cursor when controlling the desktop via AnyDesk from a phone.
+
+- `src/ui/index.css`: `::-webkit-scrollbar` width/height **6px → 16px**; thumb gets a 4px transparent border + `background-clip: content-box` (visible gap, full 16px stays grabbable) and `min-height/width: 48px` for an easy target on long content. Added a Firefox `scrollbar-width: auto` + `scrollbar-color` fallback (harmless in Chromium/Electron).
+
+Applies globally to every scroll area (cards grid, log panel, dropdowns).
+
+**Files changed:** `src/ui/index.css`
+
+---
+
 ## 2026-08-03 — AliExpress (AE) detection from the MAWB "Issuing Carrier's Agent"
 
 New MAWB field **`issuingAgent`** = the "Issuing Carrier's Agent Name and City" box (a distinct field, **not** the shipper — shipper/company extraction untouched). When that agent matches a known AliExpress marker (e.g. **"TRIMANSON EXPRESS LIMITED"**), the LTA is flagged **AE** so the operator verifies the declared value before submitting to customs.

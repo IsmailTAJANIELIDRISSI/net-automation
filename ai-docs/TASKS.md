@@ -90,6 +90,10 @@ The core automation flow is **fully implemented and working in production**:
   - Wired into all Vision functions: MAWB shipper/currency/fret extraction + manifest extraction
   - Model fallback updated: `gemini-1.5-flash` → `gemini-2.0-flash` (not deprecated)
 
+- **Wider scrollbar for remote users ✅** (2026-08-18)
+  - `src/ui/index.css`: `::-webkit-scrollbar` 6px → 16px, thumb 4px transparent border + `background-clip: content-box` + `min-height/width: 48px`; Firefox `scrollbar-width/color` fallback
+  - Makes the thumb an easy hit target when controlling the desktop via AnyDesk from a phone
+
 ## Next Steps / Testing
 
 - [ ] Verify upload table selector `#mainTab:form7:listFichiersAnnexeDT_data` matches real DOM — if upload verify still fails, paste table HTML
