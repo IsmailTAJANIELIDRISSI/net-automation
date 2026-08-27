@@ -261,7 +261,9 @@ export default function App() {
               ...(sequenceNumber ? { sequenceNumber } : {}),
               ...(lieuChargement ? { lieuChargement } : {}),
             };
-            window.api.saveAcheminement(a.folderPath, updated).catch(() => {});
+            window.api
+              .saveAcheminement(a.folderPath, updated, "sequenceNumber")
+              .catch(() => {});
             return updated;
           }),
         );
@@ -392,7 +394,7 @@ export default function App() {
         setShipperLoadingIds((prev) => new Set([...prev, id]));
       }
       window.api
-        .saveAcheminement(ach.folderPath, withEdit(ach))
+        .saveAcheminement(ach.folderPath, withEdit(ach), key)
         .then((result) => {
           // If saving partiel=true triggered extraction, update the fields
           if (

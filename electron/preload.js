@@ -32,8 +32,10 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.invoke("folder:delete-done", { folders }),
 
   // ── Persist form data ──────────────────────────────────────────────────────
-  saveAcheminement: (folderPath, data) =>
-    ipcRenderer.invoke("acheminement:save", { folderPath, data }),
+  // changedKey = which field triggered the save (so the backend only re-extracts
+  // the shipper when the "partiel" checkbox itself changed, never on field edits).
+  saveAcheminement: (folderPath, data, changedKey) =>
+    ipcRenderer.invoke("acheminement:save", { folderPath, data, changedKey }),
 
   // Force a fresh MAWB extraction for one folder ("Rescan" button on partiel cards)
   rescanMawb: (folderPath) =>

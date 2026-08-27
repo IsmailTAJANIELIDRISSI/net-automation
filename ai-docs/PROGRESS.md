@@ -5,6 +5,19 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-08-20 — Editing the shipper field kept resetting to the extracted value
+
+Editing a partiel LTA's shipper (to correct a bad extraction) snapped back to the extracted name mid-typing: `acheminement:save` re-ran MAWB extraction whenever it saw an **empty** shipper on a partiel LTA — which happens the moment you clear the field to retype — and `handleChange`'s `.then()` overwrote your input with the result.
+
+**Fix:** the save now carries **which field changed** (`changedKey`), and extraction runs only when the **partiel checkbox itself** was toggled (`changedKey === "partiel"`, or `undefined` for legacy callers) — never on a `shipperName` (or any other field) edit.
+- `electron/preload.js`: `saveAcheminement(folderPath, data, changedKey)`.
+- `electron/main.js` (`acheminement:save`): gate the auto-extract on `changedKey`.
+- `src/ui/App.jsx`: `handleChange` passes `key`; the status-event persist passes `"sequenceNumber"` so it never re-extracts.
+
+**Files changed:** `electron/preload.js`, `electron/main.js`, `src/ui/App.jsx`
+
+---
+
 ## 2026-08-20 — Shipper mis-match: city name used as a distinctive fragment
 
 Wrong shipper on several LTAs: the real shipper `SHENZHEN SHENGSILI TRADING CO., LTD` was captured as a candidate, but `matchAgainstKnown` returned `STG INTERNATIONAL LOGISTICS (SHENZHEN)` from `known_companies.json`. Not a Gemini/Vision issue — Vision only reads currency/fret/pieces/weight; the shipper comes from text candidates matched to known companies.

@@ -2836,7 +2836,7 @@ const SAVED_FIELDS = [
 ];
 ipcMain.handle(
   "acheminement:save",
-  async (_event, { folderPath: fp, data }) => {
+  async (_event, { folderPath: fp, data, changedKey }) => {
     try {
       const existing = readAcheminementFile(fp);
       const toSave = Object.fromEntries(
@@ -2847,10 +2847,18 @@ ipcMain.handle(
       }
       writeAcheminementFile(fp, toSave);
 
-      // ── Auto-extract shipper name when partiel is newly enabled ──────────
+      // ── Auto-extract shipper name ONLY when the partiel checkbox is toggled ──
+      // NOT on other field edits: otherwise clearing the shipper field to retype
+      // it (empty shipper on a partiel LTA) would re-extract and overwrite what
+      // the operator is typing. `changedKey === "partiel"` = the checkbox changed;
+      // undefined (legacy callers) still allows it.
       let extractedShipperName = null;
       let extractedMeta = null;
-      if (data.partiel === true && !data.shipperName) {
+      if (
+        (changedKey === undefined || changedKey === "partiel") &&
+        data.partiel === true &&
+        !data.shipperName
+      ) {
         const folderName = path.basename(fp);
         sendLog(
           "info",
