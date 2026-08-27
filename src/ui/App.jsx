@@ -446,7 +446,11 @@ export default function App() {
 
   // ── Declare scellés for partiel DUM (after manual signature) ─────────────
   const handleDeclareScelles = useCallback(async (ach, signedSerie) => {
-    setIsRunning(true);
+    // Don't hijack the global running flag when a batch is already running — the
+    // declaration is queued and processed by the monitor. Only reflect activity
+    // when idle.
+    const batchActive = runInProgressRef.current;
+    if (!batchActive) setIsRunning(true);
     setStatuses((prev) => ({
       ...prev,
       [ach.id]: { acheminementId: ach.id, status: "running" },
@@ -461,8 +465,14 @@ export default function App() {
         ach.folderPath,
         signedSerie,
       );
-      if (!result.ok) {
-        addLog("error", "Scellés", `Échec: ${result.error}`);
+      if (result?.queued) {
+        addLog(
+          "info",
+          "Scellés",
+          `${ach.name} : déclaration mise en file — sera traitée par le lot en cours.`,
+        );
+      } else if (!result?.ok) {
+        addLog("error", "Scellés", `Échec: ${result?.error}`);
       }
     } catch (err) {
       setStatuses((prev) => ({
@@ -475,7 +485,7 @@ export default function App() {
       }));
       addLog("error", "Scellés", `Exception: ${err.message}`);
     } finally {
-      setIsRunning(false);
+      if (!batchActive) setIsRunning(false);
     }
   }, []);
 

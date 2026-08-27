@@ -5,6 +5,35 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-08-20 — Shipper mis-match: city name used as a distinctive fragment
+
+Wrong shipper on several LTAs: the real shipper `SHENZHEN SHENGSILI TRADING CO., LTD` was captured as a candidate, but `matchAgainstKnown` returned `STG INTERNATIONAL LOGISTICS (SHENZHEN)` from `known_companies.json`. Not a Gemini/Vision issue — Vision only reads currency/fret/pieces/weight; the shipper comes from text candidates matched to known companies.
+
+**Cause:** after dropping generic words, the only "distinctive" fragment of `STG INTERNATIONAL LOGISTICS (SHENZHEN)` was the **city** `SHENZHEN` (inside `()`). The code stripped `()` from the candidate but not from the known-company name, so `SHENZHEN` matched any SHENZHEN-based shipper.
+
+**Fix (`src/utils/mawbShipperExtract.js`):**
+- `matchAgainstKnown`: strip parenthesized city/location from the known name too before extracting fragments; the all-generic fallback now requires strict containment of the stripped name.
+- Added city/region names (SHENZHEN, GUANGZHOU, SHANGHAI, …) + `BRANCH` to `GENERIC_LOGISTICS_WORDS` so a city never discriminates.
+- Verified: the SHENGSILI candidate no longer false-matches STG (→ falls to Gemini); a real `STG INTERNATIONAL LOGISTICS (SHENZHEN)CO., LTD` still matches (strict); `FIXLINK`-type distinctive matches still work.
+
+Note: already-extracted LTAs keep the wrong name (mawbExtracted flag skips auto re-extract) — use the per-card **↻ Rescan** to re-pull them.
+
+**Files changed:** `src/utils/mawbShipperExtract.js`
+
+---
+
+## 2026-08-20 — Partiel signature: empty the serie input + allow declaring mid-run
+
+Two problems on the partiel "Signature manuelle requise" panel: the signed-serie input was **pre-filled** with the validated `dumSerie` (operator must type the serie BADR shows after signing — only they know it), and the input/button were **disabled while a batch ran** (`disabled={isGlobalRunning}`) — which now bites more because the monitor stays active longer (waiting-manifest/error retries), leaving a partiel stuck at "waiting signature" un-declarable.
+
+- `src/ui/components/AcheminementCard.jsx`: `signedSerie` now starts **empty** (`useState("")`); the validated serie is shown only as a placeholder hint (`ex: 5191 (à confirmer sur BADR)`). Input is always editable + `autoFocus`; "Déclarer scellés" is gated only on `signedSerie.trim()` (no longer on `isGlobalRunning`). Removed the now-unused `isGlobalRunning` prop.
+- `electron/main.js`: extracted the declaration into `declareScellesPartielFlow(folderPath, signedSerie)`. The IPC now **queues** the declaration (`declarationQueue`) when `monitorActive`, and the monitor loop drains it (`drainDeclarationQueue`, guarded by `badrBusy`) so declaring never races the monitor's own BADR work. When idle it runs directly as before.
+- `src/ui/App.jsx` `handleDeclareScelles`: handles the `queued` result (info log) and no longer toggles the global running flag while a batch is active.
+
+**Files changed:** `src/ui/components/AcheminementCard.jsx`, `electron/main.js`, `src/ui/App.jsx`
+
+---
+
 ## 2026-08-19 — Stop auto re-scan from clobbering verified partiel MAWB fields + "Rescan" button
 
 **Bug:** while a batch runs and the operator adds another LTA folder, the watcher fires an automatic re-scan. That re-ran the MAWB extraction (the condition `mawbNbrPieces == null || mawbGrossWeight == null` fires whenever Vision didn't return pieces/weight) and **overwrote the operator's verified `shipperName` / `mawbCurrency` / `fretValue`** in `acheminement.json`.

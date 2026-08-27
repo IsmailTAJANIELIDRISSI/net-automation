@@ -14,7 +14,6 @@ export default function AcheminementCard({
   status = "idle",
   error,
   nextVol,
-  isGlobalRunning,
   shipperLoading = false,
   onChange,
   onRun,
@@ -68,9 +67,10 @@ export default function AcheminementCard({
   const hasMissingRequired = missingRequired.length > 0;
 
   // Local state for the signed-serie input (prefilled with the validated serie)
-  const [signedSerie, setSignedSerie] = useState(
-    ach.automationState?.dumSerie ?? "",
-  );
+  // Start EMPTY — the operator types the serie shown in BADR AFTER signing (only
+  // they know it; it may differ from the validated dumSerie). dumSerie is just a
+  // placeholder hint, not a pre-filled value.
+  const [signedSerie, setSignedSerie] = useState("");
 
   // ── Valeur totale sanity-range guard ───────────────────────────────────────
   // A value outside the expected range for its currency (usually a bad manifest
@@ -517,21 +517,28 @@ export default function AcheminementCard({
             <label className="text-xs text-slate-400 font-medium">
               Série signée (après validation BADR)
             </label>
+            {/* Always editable: the operator must type the signed serie even while
+                a batch is still running (the backend queues the declaration so it
+                runs safely on the shared BADR session). */}
             <input
               type="text"
               value={signedSerie}
               onChange={(e) => setSignedSerie(e.target.value)}
-              placeholder={ach.automationState?.dumSerie ?? "ex: 3064"}
-              disabled={isGlobalRunning}
+              placeholder={
+                ach.automationState?.dumSerie
+                  ? `ex: ${ach.automationState.dumSerie} (à confirmer sur BADR)`
+                  : "ex: 3064"
+              }
+              autoFocus
               className="bg-slate-900 border border-amber-700/50 rounded px-2.5 py-1.5 text-sm
                          text-slate-100 placeholder-slate-600 font-mono
                          focus:border-amber-400 focus:ring-1 focus:ring-amber-400/50
-                         disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                         transition-colors"
             />
           </div>
           <button
             onClick={() => onDeclareScelles?.(ach, signedSerie)}
-            disabled={!signedSerie.trim() || isGlobalRunning}
+            disabled={!signedSerie.trim()}
             className="w-full py-2 rounded-lg text-sm font-semibold transition-all duration-200
                        bg-amber-700 hover:bg-amber-600 text-white border border-amber-600
                        disabled:opacity-50 disabled:cursor-not-allowed shadow-md"

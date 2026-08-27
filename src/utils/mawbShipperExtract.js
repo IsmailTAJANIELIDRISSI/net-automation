@@ -72,6 +72,29 @@ const GENERIC_LOGISTICS_WORDS = new Set([
   "FORWARDING",
   "TRANSPORT",
   "TRANSPORTATION",
+  "BRANCH",
+  // City / region names (≥5 chars) — a shipper's city is NOT its identity, so it
+  // must never discriminate (e.g. "(SHENZHEN)" wrongly matching another SHENZHEN
+  // company). Add more as needed.
+  "SHENZHEN",
+  "GUANGZHOU",
+  "SHANGHAI",
+  "BEIJING",
+  "NINGBO",
+  "QINGDAO",
+  "XIAMEN",
+  "HANGZHOU",
+  "TIANJIN",
+  "DONGGUAN",
+  "FOSHAN",
+  "ZHONGSHAN",
+  "SHANTOU",
+  "GUANGDONG",
+  "ZHEJIANG",
+  "JIANGSU",
+  "FUJIAN",
+  "HONGKONG",
+  "CHINA",
 ]);
 
 // ── Text that cannot be a shipper name ───────────────────────────────────────
@@ -819,10 +842,17 @@ function matchAgainstKnown(candidates, companies, log) {
 
     for (const name of companies) {
       const nameUpper = String(name).toUpperCase().trim();
+      // Strip parenthesized city/location qualifiers from the KNOWN name too
+      // (e.g. "STG INTERNATIONAL LOGISTICS (SHENZHEN)") — a city inside "()" is
+      // not company identity and must never become a distinctive fragment.
+      const nameStripped = nameUpper
+        .replace(/\([^)]*\)/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
 
-      // Distinctive = ≥5 chars AND not a generic logistics word.
+      // Distinctive = ≥5 chars AND not a generic logistics word / city name.
       // Only these words discriminate between companies (e.g. FIXLINK, MAERSK).
-      const allFragments = nameUpper
+      const allFragments = nameStripped
         .split(/[\s,.()']+/)
         .filter((f) => f.length >= 5);
       const distinctive = allFragments.filter(
@@ -842,8 +872,9 @@ function matchAgainstKnown(candidates, companies, log) {
           return name;
         }
       } else {
-        // Company name has no distinctive word (all-generic name) — require strict containment.
-        if (candidateStripped.includes(nameUpper)) {
+        // Name has no distinctive word (all-generic / city-only) — require strict
+        // containment of the full stripped name to avoid a city-only false match.
+        if (nameStripped && candidateStripped.includes(nameStripped)) {
           log(`Correspondance stricte known_companies: "${name}"`);
           return name;
         }

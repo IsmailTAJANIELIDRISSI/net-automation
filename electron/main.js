@@ -216,6 +216,27 @@ function valueRangeError(ach) {
 let batchRunning = false;
 let monitorActive = false;
 const injectionQueue = []; // [{ id, folderPath }] awaiting the running monitor
+// [{ folderPath, signedSerie }] partiel scellés declarations awaiting the running
+// monitor — declaring uses BADR, so it must be serialized with the monitor's own
+// BADR work (see drainDeclarationQueue).
+const declarationQueue = [];
+
+// Drain queued partiel scellés declarations on the shared BADR session (called
+// inside the monitor loop, guarded by badrBusy so it can't race the keepalive).
+async function drainDeclarationQueue() {
+  if (declarationQueue.length === 0) return 0;
+  const reqs = declarationQueue.splice(0);
+  let done = 0;
+  for (const { folderPath, signedSerie } of reqs) {
+    try {
+      const res = await declareScellesPartielFlow(folderPath, signedSerie);
+      if (res?.ok) done++;
+    } catch (e) {
+      sendLog("error", "Scellés", `Déclaration en file échouée: ${e.message}`);
+    }
+  }
+  return done;
+}
 
 async function ensurePortnetSession() {
   const PortnetLogin = require("../src/portnet/portnetLogin");
@@ -1308,6 +1329,7 @@ async function monitorPendingPortnetRequests(
       try {
         changed += await drainInjectionQueue();
         changed += await retryWaitingManifest();
+        changed += await drainDeclarationQueue();
       } finally {
         badrBusy = false;
       }
@@ -3012,13 +3034,12 @@ ipcMain.handle("automation:close-sessions", async () => {
   return { success: true };
 });
 
-// ── IPC: Declare scellés for a partiel DUM (after manual signature) ──────────
-// Called by the UI when the user has signed the DUM in BADR manually and
-// comes back to confirm the signed serie.  signedSerie may differ from the
-// originally validated dumSerie if BADR regenerated it during signing.
-ipcMain.handle(
-  "automation:declare-scelles-partiel",
-  async (_event, { folderPath, signedSerie }) => {
+// ── Declare scellés for a partiel DUM (after manual signature) ───────────────
+// Runs after the operator signs the DUM in BADR manually and enters the signed
+// serie. signedSerie may differ from the originally validated dumSerie if BADR
+// regenerated it during signing. Invoked directly when idle, or drained from
+// declarationQueue by the monitor when a batch is running (BADR serialization).
+async function declareScellesPartielFlow(folderPath, signedSerie) {
     const id = path.basename(folderPath);
     const state = getAutomationState(folderPath);
     const saved = readAcheminementFile(folderPath);
@@ -3161,6 +3182,26 @@ ipcMain.handle(
       );
       return failWaiting(err.message);
     }
+}
+
+ipcMain.handle(
+  "automation:declare-scelles-partiel",
+  async (_event, { folderPath, signedSerie }) => {
+    // While a batch monitor holds the BADR session, queue the declaration so it
+    // runs serialized inside the monitor loop (no BADR concurrency race). The
+    // card stays on its waiting-signature panel until the monitor processes it.
+    if (monitorActive) {
+      declarationQueue.push({ folderPath, signedSerie });
+      const id = path.basename(folderPath);
+      sendLog(
+        "info",
+        "Scellés",
+        `[${id}] Déclaration en file — sera traitée par le lot en cours (BADR occupé).`,
+      );
+      sendProgress(id, "running");
+      return { ok: true, queued: true };
+    }
+    return await declareScellesPartielFlow(folderPath, signedSerie);
   },
 );
 
