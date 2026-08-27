@@ -20,6 +20,7 @@ export default function AcheminementCard({
   onRun,
   onDelete,
   onDeclareScelles,
+  onRescanMawb,
 }) {
   const { id, name, folderPath, manifeste, mawb, refNumber } = ach;
 
@@ -93,6 +94,12 @@ export default function AcheminementCard({
   // AliExpress (AE) shipment detected from the MAWB → highlight the whole card so
   // the operator double-checks the declared value before launching.
   const isAliExpress = !!ach.isAliExpress;
+
+  // Partiel LTAs with 2+ lots: BADR returns one série per part. Show them all
+  // (read-only) instead of the single "Séquence" input. Lieu de chargement stays
+  // single (same for every part).
+  const partiels = Array.isArray(ach.partiels) ? ach.partiels : [];
+  const showPartielSeries = ach.partiel && partiels.length > 0;
 
   return (
     <div
@@ -256,7 +263,34 @@ export default function AcheminementCard({
         {field("scelle2", "Scellé #2", "ex: SN789012")}
         {field("nombreContenant", "Nb. contenant", "ex: 3", "number")}
         {field("poidTotal", "Poids total (kg)", "ex: 245.50", "number")}
-        {field("sequenceNumber", "Séquence (optionnel)", "ex: 3447 U")}
+        {showPartielSeries ? (
+          // Partiel: one série per part, found in BADR (read-only).
+          <div className="col-span-2 flex flex-col gap-1">
+            <label className="text-xs text-slate-400 font-medium">
+              Séquences trouvées ({partiels.length}{" "}
+              {partiels.length > 1 ? "parts" : "part"})
+            </label>
+            <div className="flex flex-col gap-1.5">
+              {partiels.map((p, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <span className="text-[11px] text-slate-500 w-12 flex-shrink-0">
+                    Part {i + 1}
+                  </span>
+                  <input
+                    type="text"
+                    readOnly
+                    value={`${p?.serie ?? ""}${p?.cle ? " " + p.cle : ""}`.trim()}
+                    title="Série trouvée dans BADR"
+                    className="flex-1 bg-slate-900/70 border border-slate-700 rounded px-2.5 py-1.5
+                               text-sm text-slate-200 font-mono cursor-default select-all"
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : (
+          field("sequenceNumber", "Séquence (optionnel)", "ex: 3447 U")
+        )}
         {field(
           "lieuChargement",
           "Lieu de chargement (optionnel)",
@@ -517,29 +551,30 @@ export default function AcheminementCard({
               ⚠ Champs obligatoires manquants : {missingRequired.join(", ")}
             </p>
           )}
-          <button
-            onClick={() => onRun(ach)}
-            disabled={
-              // Only THIS card's own running/done state blocks it — an idle card
-              // can be launched while other LTAs process; the backend queues it
-              // into the running monitor (no concurrent batch).
-              isRunning ||
-              isDone ||
-              (!!ach.refMismatch && !ach.manifestRef) ||
-              !!ach.mawbMismatch ||
-              (hasMissingRequired && !isRunning) ||
-              valueBlocked
-            }
-            title={
-              ach.mawbMismatch
-                ? ach.mawbMismatch
-                : valueBlocked
-                  ? valueIssue.message
-                  : hasMissingRequired
-                    ? `Champs obligatoires manquants : ${missingRequired.join(", ")}`
-                    : undefined
-            }
-            className={`mt-1 w-full py-2 rounded-lg text-sm font-semibold transition-all duration-200
+          <div className="mt-1 flex gap-2">
+            <button
+              onClick={() => onRun(ach)}
+              disabled={
+                // Only THIS card's own running/done state blocks it — an idle card
+                // can be launched while other LTAs process; the backend queues it
+                // into the running monitor (no concurrent batch).
+                isRunning ||
+                isDone ||
+                (!!ach.refMismatch && !ach.manifestRef) ||
+                !!ach.mawbMismatch ||
+                (hasMissingRequired && !isRunning) ||
+                valueBlocked
+              }
+              title={
+                ach.mawbMismatch
+                  ? ach.mawbMismatch
+                  : valueBlocked
+                    ? valueIssue.message
+                    : hasMissingRequired
+                      ? `Champs obligatoires manquants : ${missingRequired.join(", ")}`
+                      : undefined
+              }
+              className={`flex-1 py-2 rounded-lg text-sm font-semibold transition-all duration-200
             ${
               isError
                 ? "bg-red-600 hover:bg-red-500 text-white border border-red-500 disabled:opacity-50"
@@ -547,9 +582,24 @@ export default function AcheminementCard({
                   ? "bg-blue-700/40 text-blue-300 cursor-not-allowed border border-blue-700/40 animate-pulse"
                   : "bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
             }`}
-          >
-            {isRunning ? "En cours…" : isError ? "↺ Réessayer" : "Lancer"}
-          </button>
+            >
+              {isRunning ? "En cours…" : isError ? "↺ Réessayer" : "Lancer"}
+            </button>
+            {/* Partiel: manual MAWB re-extraction (auto re-scans never re-extract). */}
+            {ach.partiel && (
+              <button
+                onClick={() => onRescanMawb?.(ach)}
+                disabled={isRunning || isDone || shipperLoading}
+                title="Relancer l'extraction MAWB (expéditeur, devise, fret) depuis le PDF — écrase les valeurs auto (pas vos saisies protégées)"
+                className="flex-shrink-0 px-3 py-2 rounded-lg text-sm font-semibold transition-all duration-200
+                           bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white
+                           border border-slate-700 hover:border-slate-600
+                           disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {shipperLoading ? "…" : "↻ Rescan"}
+              </button>
+            )}
+          </div>
         </>
       )}
     </div>

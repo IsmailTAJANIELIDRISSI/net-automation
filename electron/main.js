@@ -2525,8 +2525,16 @@ async function scanSingleAcheminement(rootFolderPath, entryName) {
     // Extract MAWB metrics for ANY LTA with a MAWB (pieces/weight are cross-checked
     // against the manifest for all LTAs). Shipper/currency/fret are also captured —
     // only used for partiels, but the single Vision call returns them anyway.
+    //
+    // Runs ONCE per folder (mawbExtracted flag). Auto re-scans (folder watcher /
+    // "Actualiser") must NOT re-extract — that overwrote the operator's verified
+    // partiel fields (shipperName, qteFacturee, mawbCurrency, fretValue). A fresh
+    // extraction is only triggered explicitly via the per-card "Rescan" button
+    // (acheminement:rescan-mawb, which clears mawbExtracted). `forceReextract`
+    // is set by that IPC path.
     if (
       mawb &&
+      !savedForShipper.mawbExtracted &&
       (savedForShipper.mawbNbrPieces == null ||
         savedForShipper.mawbGrossWeight == null ||
         (savedForShipper.partiel && !savedForShipper.shipperName))
@@ -2555,19 +2563,30 @@ async function scanSingleAcheminement(rootFolderPath, entryName) {
           meta.aliexpress ||
           meta.issuingAgent
         ) {
-          savedForShipper.shipperName =
-            meta.shipperName || savedForShipper.shipperName;
-          // Persist back so it shows up on next scan
+          // Persist back so it shows up on next scan. Never overwrite a field the
+          // operator has explicitly edited (edit-tracking) — the "Rescan" button
+          // clears those flags first when a forced re-extraction IS wanted.
           const current = readAcheminementFile(dirPath);
-          const patch = {};
-          if (meta.shipperName) patch.shipperName = meta.shipperName;
-          if (meta.mawbCurrency) patch.mawbCurrency = meta.mawbCurrency;
+          const patch = { mawbExtracted: true };
+          if (meta.shipperName && !userEdited(current, "shipperName")) {
+            patch.shipperName = meta.shipperName;
+            savedForShipper.shipperName = meta.shipperName;
+          }
+          if (meta.mawbCurrency && !userEdited(current, "mawbCurrency"))
+            patch.mawbCurrency = meta.mawbCurrency;
           // Freight: only auto-fill when the Total Prepaid was confidently
           // reconciled (printed total ≈ sum of charges). Otherwise leave it empty
           // and flag it — a partiel LTA then can't run until it's filled manually.
-          if (meta.fretValue && meta.fretConfident)
+          if (
+            meta.fretValue &&
+            meta.fretConfident &&
+            !userEdited(current, "fretValue")
+          ) {
             patch.fretValue = meta.fretValue;
-          patch.fretUncertain = !meta.fretConfident;
+            patch.fretUncertain = false;
+          } else if (!userEdited(current, "fretValue")) {
+            patch.fretUncertain = !meta.fretConfident;
+          }
           // MAWB pieces/weight — used to cross-check against the manifest.
           if (meta.nbrPieces != null) patch.mawbNbrPieces = meta.nbrPieces;
           if (meta.grossWeight != null)
@@ -2592,6 +2611,10 @@ async function scanSingleAcheminement(rootFolderPath, entryName) {
             `[${entry.name}] ✓ Extrait: expéditeur="${meta.shipperName}" devise=${meta.mawbCurrency} fret=${meta.fretValue ?? "—"} (confiance=${meta.fretConfident}) colis=${meta.nbrPieces} poids=${meta.grossWeight}`,
           );
         } else {
+          // No usable data — still mark as extracted so auto re-scans don't retry
+          // every cycle (operator fills manually, or forces via "Rescan").
+          const current = readAcheminementFile(dirPath);
+          writeAcheminementFile(dirPath, { ...current, mawbExtracted: true });
           sendLog(
             "warn",
             "MAWB",
@@ -2712,6 +2735,7 @@ async function scanSingleAcheminement(rootFolderPath, entryName) {
       issuingAgent: saved.issuingAgent ?? null,
       isAliExpress: saved.isAliExpress ?? false,
       aliexpressAgent: saved.aliexpressAgent ?? null,
+      mawbExtracted: saved.mawbExtracted ?? false,
       // Freight couldn't be confidently reconciled from the MAWB → must be typed.
       fretUncertain: saved.fretUncertain ?? false,
       // Manifest-vs-MAWB cross-check (all LTAs). mawbMismatch = blocking colis
@@ -2784,6 +2808,9 @@ const SAVED_FIELDS = [
   "issuingAgent",
   "isAliExpress",
   "aliexpressAgent",
+  // MAWB was already extracted once → auto re-scans skip re-extraction (avoids
+  // clobbering the operator's verified partiel fields). Reset by "Rescan".
+  "mawbExtracted",
 ];
 ipcMain.handle(
   "acheminement:save",
@@ -2857,7 +2884,7 @@ ipcMain.handle(
               meta.issuingAgent
             ) {
               const refreshed = readAcheminementFile(fp);
-              const patch = {};
+              const patch = { mawbExtracted: true };
               if (meta.shipperName) patch.shipperName = meta.shipperName;
               if (meta.mawbCurrency) patch.mawbCurrency = meta.mawbCurrency;
               if (meta.fretValue) patch.fretValue = meta.fretValue;
@@ -2908,6 +2935,36 @@ ipcMain.handle(
     }
   },
 );
+
+// ── IPC: Force a fresh MAWB extraction for ONE folder ("Rescan" button) ──────
+// Auto re-scans never re-extract (mawbExtracted flag) so the operator's verified
+// partiel fields are never clobbered. This is the ONLY path that re-extracts: it
+// clears the once-flag and drops the edit-locks on the auto-extracted MAWB fields
+// so the fresh values can replace them, then re-scans just this folder.
+ipcMain.handle("acheminement:rescan-mawb", async (_event, { folderPath }) => {
+  try {
+    if (!folderPath || !fs.existsSync(folderPath)) {
+      return { ok: false, error: "Dossier introuvable" };
+    }
+    const id = path.basename(folderPath);
+    const current = readAcheminementFile(folderPath);
+    const edited = Array.isArray(current._editedFields)
+      ? current._editedFields
+      : [];
+    const REEXTRACT = ["shipperName", "mawbCurrency", "fretValue"];
+    writeAcheminementFile(folderPath, {
+      ...current,
+      mawbExtracted: false, // force re-extraction on the scan below
+      _editedFields: edited.filter((k) => !REEXTRACT.includes(k)),
+    });
+    sendLog("info", "MAWB", `[${id}] Rescan manuel — nouvelle extraction MAWB…`);
+    const ach = await scanSingleAcheminement(path.dirname(folderPath), id);
+    return { ok: true, ach };
+  } catch (e) {
+    sendLog("error", "MAWB", `Rescan échoué: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+});
 
 // ── IPC: Open file in OS explorer ────────────────────────────────────────────
 ipcMain.handle("shell:openPath", async (_event, filePath) => {
@@ -3049,8 +3106,36 @@ ipcMain.handle(
         `[${id}] ✓ Scellés déclarés — DUM Normale Partiel terminée`,
       );
 
-      // Email the DUM Normale Partiel PDF (saved during run, path kept in state).
-      const dumPdfPath = getAutomationState(folderPath)?.pdfPath;
+      // Fetch the REAL registered (signed) DUM PDF: DEDOUANEMENT → Services →
+      // Rechercher par référence (301/085/année/série/clé + "Déclaration
+      // enregistrée") → Valider → IMPRIMER. The PDF saved during the run is only
+      // provisional (pre-signature) and must NOT be emailed.
+      let signedPdfPath = null;
+      try {
+        await badrConn.navigateToAccueil();
+        finalizer.page = badrConn.page;
+        const annee = new Date().getFullYear().toString();
+        const safeName = `${id}-DUM-NORMAL-SIGNE-${serie}${cle}`
+          .replace(/[\\/:*?"<>|]/g, "_")
+          .slice(0, 120);
+        signedPdfPath = await finalizer.printRegisteredDumByRef(
+          "301",
+          "085",
+          annee,
+          serie,
+          cle,
+          { saveDir: folderPath, saveName: safeName },
+        );
+        updateAutomationState(folderPath, { signedPdfPath });
+        sendLog("info", "BADR", `[${id}] ✓ DUM signé récupéré: ${signedPdfPath}`);
+      } catch (printErr) {
+        sendLog(
+          "warn",
+          "BADR",
+          `[${id}] Récupération du DUM signé échouée: ${printErr.message} — email envoyé sans pièce jointe.`,
+        );
+      }
+
       // LTA/MAWB reference from the manifest/MAWB filename (NOT the scellés).
       const dumRef =
         normalizeLotReference(extractLotReferenceFromFolder(folderPath)) ||
@@ -3060,9 +3145,9 @@ ipcMain.handle(
         subject: buildAcheminementSubject(id, "Dum Normale", dumRef),
         text:
           `Bonjour,\n\n` +
-          `Veuillez trouver ci-joint le DUM Normale Partiel pour la LTA N° ${dumRef}.\n\n` +
+          `Veuillez trouver ci-joint le DUM Normale Partiel signé pour la LTA N° ${dumRef}.\n\n` +
           `-- MedAfrica --`,
-        attachments: dumPdfPath ? [{ path: dumPdfPath }] : [],
+        attachments: signedPdfPath ? [{ path: signedPdfPath }] : [],
       }).catch(() => {});
 
       sendProgress(id, "done");

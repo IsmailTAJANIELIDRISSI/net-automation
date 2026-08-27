@@ -479,6 +479,34 @@ export default function App() {
     }
   }, []);
 
+  // ── Rescan MAWB for one partiel card (explicit — never automatic) ──────────
+  // Forces a fresh MAWB extraction for this folder. Auto re-scans never touch
+  // already-verified fields; this is the only way to re-extract them on demand.
+  const handleRescanMawb = useCallback(async (ach) => {
+    if (!ach?.folderPath) return;
+    setShipperLoadingIds((prev) => new Set([...prev, ach.id]));
+    addLog("info", "UI", `Rescan MAWB pour "${ach.name}"…`);
+    try {
+      const res = await window.api.rescanMawb(ach.folderPath);
+      if (res?.ok && res.ach) {
+        setAcheminements((prev) =>
+          prev.map((a) => (a.id === ach.id ? { ...a, ...res.ach } : a)),
+        );
+        addLog("success", "UI", `Rescan MAWB terminé pour "${ach.name}".`);
+      } else {
+        addLog("warn", "UI", `Rescan échoué: ${res?.error || "inconnu"}`);
+      }
+    } catch (e) {
+      addLog("error", "UI", `Rescan échoué: ${e.message}`);
+    } finally {
+      setShipperLoadingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(ach.id);
+        return next;
+      });
+    }
+  }, []);
+
   // ── Run one acheminement ───────────────────────────────────────────────────
   const handleRun = useCallback(async (ach) => {
     // A batch is already running → hand this LTA to the running monitor instead
@@ -816,6 +844,7 @@ export default function App() {
                         onRun={handleRun}
                         onDelete={handleDelete}
                         onDeclareScelles={handleDeclareScelles}
+                        onRescanMawb={handleRescanMawb}
                       />
                     ))}
                   </div>

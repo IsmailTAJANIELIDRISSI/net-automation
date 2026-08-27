@@ -35,6 +35,10 @@ contextBridge.exposeInMainWorld("api", {
   saveAcheminement: (folderPath, data) =>
     ipcRenderer.invoke("acheminement:save", { folderPath, data }),
 
+  // Force a fresh MAWB extraction for one folder ("Rescan" button on partiel cards)
+  rescanMawb: (folderPath) =>
+    ipcRenderer.invoke("acheminement:rescan-mawb", { folderPath }),
+
   // ── Live event subscriptions ───────────────────────────────────────────────
   /** @param {(entry: {level:string, context:string, message:string, ts:string}) => void} cb */
   onLog: (cb) => {

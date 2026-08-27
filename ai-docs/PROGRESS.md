@@ -5,6 +5,68 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-08-19 — Stop auto re-scan from clobbering verified partiel MAWB fields + "Rescan" button
+
+**Bug:** while a batch runs and the operator adds another LTA folder, the watcher fires an automatic re-scan. That re-ran the MAWB extraction (the condition `mawbNbrPieces == null || mawbGrossWeight == null` fires whenever Vision didn't return pieces/weight) and **overwrote the operator's verified `shipperName` / `mawbCurrency` / `fretValue`** in `acheminement.json`.
+
+**Fix — extract once, re-extract only on explicit request:**
+- `electron/main.js` (`scanSingleAcheminement`): new persisted `mawbExtracted` flag. Extraction runs only when `!mawbExtracted` (set true after any attempt, incl. no-data). So auto re-scans of existing folders **never re-extract** → verified fields are safe; new folders still extract on first scan → still appear. The extraction patch also now guards every auto-filled field with `!userEdited(...)`. Added `mawbExtracted` to `SAVED_FIELDS` + scan output; partiel-toggle extraction sets it too.
+- New IPC `acheminement:rescan-mawb` (+ `preload.rescanMawb`): the ONLY re-extraction path — clears `mawbExtracted` and drops the edit-locks on `shipperName`/`mawbCurrency`/`fretValue`, then re-scans that one folder and returns it.
+- `src/ui/App.jsx` `handleRescanMawb` + `src/ui/components/AcheminementCard.jsx`: partiel cards get a **"↻ Rescan"** button next to "Lancer" (skeleton while running) that forces a fresh MAWB extraction on demand.
+
+Net: automatic re-scans only pick up new folders; existing cards' verified values are never touched unless the operator clicks Rescan.
+
+**Files changed:** `electron/main.js`, `electron/preload.js`, `src/ui/App.jsx`, `src/ui/components/AcheminementCard.jsx`
+
+---
+
+## 2026-08-19 — Partiel card shows all found series (one per part)
+
+For a partiel LTA whose BADR lot lookup returns 2+ rows, each part has its own série. The card now displays **all** of them (read-only) instead of the single "Séquence" input; "Lieu de chargement" stays single (same for every part).
+
+- Data already collected/persisted: `runPartielDumFlow` writes `partiels = [{serie, cle, lieu, ref}, …]` to `acheminement.json` (SAVED_FIELDS + scan output already carry it), so no backend change.
+- `src/ui/components/AcheminementCard.jsx`: when `ach.partiel && ach.partiels.length > 0`, render "Séquences trouvées (N parts)" with one read-only `serie cle` field per part (e.g. `5406 X`); otherwise keep the single editable "Séquence (optionnel)". Non-partiel behavior unchanged.
+
+**Files changed:** `src/ui/components/AcheminementCard.jsx`
+
+---
+
+## 2026-08-19 — Partiel: email the REAL signed DUM, not the provisional run PDF
+
+The PDF saved during the partiel run is provisional (pre-signature). After the operator signs manually + declares scellés, the app now fetches the **registered (signed)** DUM and emails that instead.
+
+- `src/badr/badrDsCombineFinalize.js`: new `printRegisteredDumByRef(bureau, regime, annee, serie, cle, {saveDir, saveName})` — DEDOUANEMENT → Services (`a#_2051`) → "Rechercher par référence" (`a#_2052`/cf2052, opens a popup) → fill `rootForm:_bureauId/_regimeId/_anneeId/_serieId/_cleId` + tick `rootForm:selectcheckbxDecEnreg` ("Déclaration enregistrée") → Valider (`rootForm:btnConfirmer`) → IMPRIMER (`a#secure_imprimer`, searched across popup + iframes) → capture the download, save to the LTA folder (+ Downloads copy). Menu open retries 3× via `navigateToAccueil`.
+- `electron/main.js` (`automation:declare-scelles-partiel`): after scellés + `partiel_done`, `navigateToAccueil` → `printRegisteredDumByRef("301","085", currentYear, serie, cle, …)` → persist `signedPdfPath` → email attaches **that** (bureau 301 / régime 085 fixed). Removed the provisional `state.pdfPath` attachment; on print failure the email still goes out **without** attachment (non-fatal — scellés already declared).
+
+**Files changed:** `src/badr/badrDsCombineFinalize.js`, `electron/main.js`
+
+---
+
+## 2026-08-19 — Reference: partiel post-signature (declare-scellés) flow (docs only, no code change)
+
+Documented the flow after the operator signs the DUM manually and enters the signed série in the app:
+
+1. Card "Déclarer scellés" → `App.handleDeclareScelles` → `window.api.declareScelles` → IPC `automation:declare-scelles-partiel` (`electron/main.js`).
+2. Handler validates + normalizes the signed série (strips whitespace, drops leading zeros, uppercases clé; digits-only reuses stored `dumCle`); ensures BADR session + Accueil.
+3. `BADRDsCombineFinalize.declarerScellesPartiel(301, 085, serie, cle, scelle1, scelle2)` → `_fillScellesForm`: DEDOUANEMENT → Déclarer scellés (partiel `a#_1225`/cf1225), search by bureau/régime/année/série/clé → Confirmer, then Numéro Pince (last-2 of each scellé, `06-07`) + Nombre=2, add both scellés (polled, retried), re-set Nombre to list size, final Confirmer, require "Opération effectuée avec succès".
+4. Success → phase `partiel_done`, email the DUM PDF (`state.pdfPath`), card → Terminé. Failure → card returns to `partiel-waiting-signature` with the error (retry just this step, no full re-run).
+
+**Files (reference only):** `src/ui/App.jsx`, `electron/main.js`, `src/badr/badrDsCombineFinalize.js`
+
+---
+
+## 2026-08-19 — Partiel upload: wait for the blockUI spinner to actually clear
+
+**Bug:** on a slow BADR, a FACTURE upload failed with *"Upload of FACTURE did not appear in the document list"* even though the "Traitement en cours…" spinner was still visible.
+
+**Root cause** (`src/badr/badrDumNormalPartiel.js` `_uploadOne`): the wait was `iframe.locator(".ui-blockui-content").first().waitFor({state:"hidden", timeout:45000})`. BADR has several `.ui-blockui-content` nodes; `.first()` matched an already-hidden one and returned instantly, so the row-check ran while the real spinner was still processing → false failure.
+
+**Fix:** wait for the **visible** blockUI to clear — `iframe.locator(".ui-blockui-content:visible")` polled until `count() === 0`, patient up to **3 min** (logs "Traitement BADR en cours…" once so a long wait doesn't look frozen); throws a clear "BADR still processing after 3 min" only if it truly never clears. Only then poll the document list for the row (and re-wait if BADR fires another spinner). The active spinner (`display:block` inline, despite a `ui-helper-hidden` class) is correctly seen as visible.
+
+**Files changed:** `src/badr/badrDumNormalPartiel.js`
+
+---
+
 ## 2026-08-18 — Wider scrollbar for remote (AnyDesk-from-phone) users
 
 The right-hand scrollbar was only 6px wide — too thin to grab with a cursor when controlling the desktop via AnyDesk from a phone.

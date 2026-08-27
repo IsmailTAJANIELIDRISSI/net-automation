@@ -49,6 +49,10 @@ The core automation flow is **fully implemented and working in production**:
   - `automation:declare-scelles-partiel` IPC: user-triggered after manual signing in BADR
   - Batch runner skips `partiel_waiting_signature` LTAs (no automation possible without human action)
   - **Fixed signed-serie+clé parsing and per-step retry ✅** (2026-06-12): user's combined input (e.g. "12345S"/"12345 S") is now split into numeric série + BADR-assigned clé; on failure the card stays on the waiting-signature panel (with an error banner) so the user retries just the scellés step instead of the whole partiel flow
+  - **Post-signature flow (reference, 2026-08-19)**: `App.handleDeclareScelles` → IPC `automation:declare-scelles-partiel` → `BADRDsCombineFinalize.declarerScellesPartiel(301, 085, serie, cle, scelle1, scelle2)` → `_fillScellesForm`: DEDOUANEMENT → Déclarer scellés (partiel `a#_1225`/cf1225), search by bureau/régime/année/série/clé → Confirmer, Numéro Pince = last-2 of each scellé (`06-07`) + Nombre=2, add both scellés (polled/retried), re-set Nombre to list size, final Confirmer, require "Opération effectuée avec succès" → phase `partiel_done` → **fetch signed PDF** → email it; failure → back to `partiel-waiting-signature`
+  - **Emails the REAL signed DUM, not the provisional run PDF ✅** (2026-08-19): after scellés, `navigateToAccueil` → `printRegisteredDumByRef(301, 085, currentYear, serie, cle)` — DEDOUANEMENT → Services (`_2051`) → "Rechercher par référence" (`_2052`, popup) → fill `rootForm:_bureauId/_regimeId/_anneeId/_serieId/_cleId` + tick "Déclaration enregistrée" → Valider → IMPRIMER (`a#secure_imprimer`) → capture download to the LTA folder; email attaches this `signedPdfPath` (provisional `state.pdfPath` no longer attached). Print failure is non-fatal (email sent without attachment)
+  - **Card shows all partiel series (one per part) ✅** (2026-08-19): when `ach.partiel && ach.partiels.length > 0` (BADR lot lookup found 2+ rows), `AcheminementCard` renders "Séquences trouvées (N parts)" — one read-only `serie cle` field per part — instead of the single "Séquence" input; "Lieu de chargement" stays single. Data from the already-persisted `partiels[]`; no backend change
+  - **Auto re-scan no longer clobbers verified MAWB fields + "Rescan" button ✅** (2026-08-19): MAWB extraction now runs ONCE per folder (`mawbExtracted` flag in `scanSingleAcheminement`, added to `SAVED_FIELDS`/scan output). Auto re-scans (watcher/"Actualiser") skip re-extraction → the operator's verified `shipperName`/`mawbCurrency`/`fretValue` are never overwritten; extraction patch also guarded by `!userEdited(...)`. New IPC `acheminement:rescan-mawb` (`preload.rescanMawb`) + `App.handleRescanMawb` + a **"↻ Rescan"** button on partiel cards (beside "Lancer") force a fresh extraction on demand (clears `mawbExtracted` + the edit-locks). Fixes verified partiel data being reset by mid-run auto re-scans
 - **Email notifications ✅** (2026-06-19)
   - `src/utils/mailer.js` (`sendNotification`) + `EMAIL_CC` config; enabled in `.env`
   - DS success → emails downloaded DS PDF; DUM partiel success → emails DUM PDF
@@ -93,6 +97,10 @@ The core automation flow is **fully implemented and working in production**:
 - **Wider scrollbar for remote users ✅** (2026-08-18)
   - `src/ui/index.css`: `::-webkit-scrollbar` 6px → 16px, thumb 4px transparent border + `background-clip: content-box` + `min-height/width: 48px`; Firefox `scrollbar-width/color` fallback
   - Makes the thumb an easy hit target when controlling the desktop via AnyDesk from a phone
+
+- **Partiel upload waits for blockUI spinner to clear ✅** (2026-08-19)
+  - `src/badr/badrDumNormalPartiel.js` `_uploadOne`: replaced the `.ui-blockui-content.first().waitFor({hidden})` (matched an already-hidden node → instant false "upload failed" on slow BADR) with a patient poll on `.ui-blockui-content:visible` until it clears (up to 3 min), then the document-row check
+  - Fixes false FACTURE upload failures when BADR is slow/down
 
 ## Next Steps / Testing
 

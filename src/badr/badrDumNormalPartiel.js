@@ -1084,17 +1084,35 @@ class BADRDumNormalPartiel {
       mimeType: "application/pdf",
       buffer: fs.readFileSync(filePath),
     });
-    await this.page.waitForTimeout(1000);
+    await this.page.waitForTimeout(500);
 
-    // The upload runs an AJAX "Traitement en cours…" spinner (ui-blockui); a 2 MB
-    // file can take several seconds. Wait for it to clear before checking the list.
-    await iframe
-      .locator(".ui-blockui-content")
-      .first()
-      .waitFor({ state: "hidden", timeout: 45000 })
-      .catch(() => {});
+    // The upload runs an AJAX "Traitement en cours…" spinner (PrimeFaces blockUI).
+    // BADR can be slow — WAIT FOR THE SPINNER TO ACTUALLY CLEAR before deciding,
+    // rather than a short fixed timeout. Target only the VISIBLE blockUI: there are
+    // several ".ui-blockui-content" nodes, so ".first()" often matched an already-
+    // hidden one and returned instantly → the old false "upload failed" while the
+    // real spinner was still processing a large file on a slow BADR.
+    const spinner = iframe.locator(".ui-blockui-content:visible");
+    const blockDeadline = Date.now() + 180000; // patient: up to 3 min for slow BADR
+    let loggedWait = false;
+    while (Date.now() < blockDeadline) {
+      if ((await spinner.count().catch(() => 0)) === 0) break;
+      if (!loggedWait) {
+        log.info(
+          `Traitement BADR en cours (spinner actif) — attente de la fin de l'upload ${typeLabel}…`,
+        );
+        loggedWait = true;
+      }
+      await this.page.waitForTimeout(1000);
+    }
+    if ((await spinner.count().catch(() => 0)) > 0) {
+      throw new Error(
+        `BADR toujours en traitement (spinner actif) après 3 min pour l'upload ${typeLabel} — système lent/indisponible, réessayez plus tard`,
+      );
+    }
 
-    // Verify: rows for this label reached expectedCount (handles multiple FACTURE rows).
+    // Spinner cleared → NOW verify: rows for this label reached expectedCount
+    // (handles multiple FACTURE rows).
     const rowsForLabel = iframe.locator(
       `#mainTab\\:form7\\:listFichiersAnnexeDT_data tr:has-text("${expectLabel}")`,
     );
@@ -1104,6 +1122,11 @@ class BADRDumNormalPartiel {
       if ((await rowsForLabel.count().catch(() => 0)) >= expectedCount) {
         ok = true;
         break;
+      }
+      // If BADR kicked off another AJAX spinner, keep waiting for it too.
+      if ((await spinner.count().catch(() => 0)) > 0) {
+        await this.page.waitForTimeout(500);
+        continue;
       }
       await this.page.waitForTimeout(500);
     }

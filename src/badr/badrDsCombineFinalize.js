@@ -459,6 +459,143 @@ class BADRDsCombineFinalize {
     );
   }
 
+  // ── Fetch & print the REGISTERED (signed) DUM PDF ────────────────────────────
+  // DEDOUANEMENT → Services → "Rechercher par référence" (popup) → fill
+  // bureau/régime/année/série/clé + tick "Déclaration enregistrée" → Valider →
+  // IMPRIMER → capture the download. Returns the saved path.
+  //
+  // Used AFTER the operator signs the DUM manually: the PDF saved during the run
+  // is only provisional (pre-signature); this pulls the real registered document
+  // for the email.
+  async printRegisteredDumByRef(
+    bureau,
+    regime,
+    annee,
+    serie,
+    cle,
+    { saveDir, saveName },
+  ) {
+    const page = this.page;
+    log.info(
+      `Impression du DUM enregistré par référence: ${bureau}/${regime}/${annee}/${serie}/${cle}`,
+    );
+    await page.bringToFront();
+
+    // Expand DEDOUANEMENT → Services, then open the "Rechercher par référence"
+    // window (retry-refreshing Accueil if the PrimeFaces menu is stuck).
+    let popup = null;
+    const MAX_MENU_RETRIES = 3;
+    for (let attempt = 1; attempt <= MAX_MENU_RETRIES; attempt++) {
+      try {
+        const dedPanel = page.locator(
+          'h3.ui-panelmenu-header:has-text("DEDOUANEMENT")',
+        );
+        const dedExpanded =
+          (await dedPanel.getAttribute("aria-expanded")) === "true";
+        if (!dedExpanded) {
+          await dedPanel.click();
+          await page.waitForTimeout(700);
+        }
+
+        // "Services" is a nested parent menu (id _2051) — expand if its sub-list
+        // is hidden.
+        const servicesLink = page.locator("a#_2051").first();
+        await servicesLink.waitFor({ state: "visible", timeout: 15000 });
+        const nested = servicesLink.locator("xpath=following-sibling::ul[1]");
+        const svcOpen = await nested
+          .evaluate((el) => window.getComputedStyle(el).display !== "none")
+          .catch(() => false);
+        if (!svcOpen) {
+          await servicesLink.click();
+          await page.waitForTimeout(500);
+        }
+
+        // "Rechercher par référence" (id _2052 / cf2052) opens a new window.
+        const rechLink = page
+          .locator('a#_2052, a[title*="codeFonctionnalite=cf2052"]')
+          .first();
+        await rechLink.waitFor({ state: "visible", timeout: 15000 });
+        [popup] = await Promise.all([
+          page.waitForEvent("popup", { timeout: 20000 }),
+          rechLink.click(),
+        ]);
+        break;
+      } catch (menuErr) {
+        if (attempt >= MAX_MENU_RETRIES) throw menuErr;
+        log.warn(
+          `Menu "Rechercher par référence" bloqué (tentative ${attempt}/${MAX_MENU_RETRIES}): ${menuErr.message} — rafraîchissement Accueil…`,
+        );
+        if (this.badrConn) {
+          await this.badrConn.navigateToAccueil();
+          this.page = this.badrConn.page;
+        }
+      }
+    }
+    if (!popup) throw new Error("Popup 'Rechercher par référence' non ouverte");
+    await popup.waitForLoadState("domcontentloaded");
+    log.info("Popup 'Rechercher par référence' ouverte.");
+
+    // Fill the reference search form (fixed bureau/régime; année/série/clé vary).
+    await popup.locator("input#rootForm\\:_bureauId").fill(bureau);
+    await popup.locator("input#rootForm\\:_regimeId").fill(regime);
+    await popup.locator("input#rootForm\\:_anneeId").fill(annee);
+    await popup.locator("input#rootForm\\:_serieId").fill(serie);
+    await popup.locator("input#rootForm\\:_cleId").fill(cle);
+
+    // Tick "Déclaration enregistrée" (PrimeFaces styled checkbox → click the box).
+    const chkInput = popup.locator("#rootForm\\:selectcheckbxDecEnreg_input");
+    const alreadyChecked = await chkInput.isChecked().catch(() => false);
+    if (!alreadyChecked) {
+      await popup
+        .locator("#rootForm\\:selectcheckbxDecEnreg .ui-chkbox-box")
+        .click();
+      await popup.waitForTimeout(300);
+    }
+
+    // Valider → BADR opens the registered declaration in the popup.
+    await popup.locator("button#rootForm\\:btnConfirmer").click();
+    await popup.waitForTimeout(2000);
+
+    // Find IMPRIMER (may render inside an iframe of the popup).
+    const findImprimer = async (timeout = 30000) => {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        for (const ctx of [popup, ...popup.frames()]) {
+          const btn = ctx
+            .locator("a#secure_imprimer, a[id='secure_imprimer']")
+            .first();
+          if (await btn.isVisible().catch(() => false)) return btn;
+        }
+        await popup.waitForTimeout(300);
+      }
+      throw new Error("Bouton IMPRIMER introuvable sur la déclaration");
+    };
+    const printBtn = await findImprimer();
+
+    log.info("Impression de la déclaration enregistrée…");
+    const [download] = await Promise.all([
+      popup.waitForEvent("download", { timeout: 60000 }),
+      printBtn.click(),
+    ]);
+
+    const destPath = path.join(saveDir, `${saveName}.pdf`);
+    await download.saveAs(destPath);
+    log.info(`DUM enregistré (signé) sauvegardé: ${destPath}`);
+
+    // Copy to system Downloads too (non-fatal).
+    try {
+      const dlDir = path.join(os.homedir(), "Downloads");
+      if (!fs.existsSync(dlDir)) fs.mkdirSync(dlDir, { recursive: true });
+      fs.copyFileSync(destPath, path.join(dlDir, `${saveName}.pdf`));
+    } catch (e) {
+      log.warn(`Copie vers Downloads échouée: ${e.message}`);
+    }
+
+    await popup.close().catch(() => {});
+    await page.bringToFront().catch(() => {});
+    return destPath;
+  }
+
   // ── Shared form-filling used by both declarerScelles and declarerScellesPartiel ──
   async _fillScellesForm(
     page,
