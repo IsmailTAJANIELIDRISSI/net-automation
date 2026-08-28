@@ -5,6 +5,31 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-08-28 — Every email now names the acheminement ("3éme acheminement — …")
+
+Only the done / "en cours validation" mails carried the acheminement ordinal (via `buildAcheminementSubject`). The mismatch / no-manifest mails didn't.
+
+- `electron/main.js`: new `subjectWithOrdinal(folderName, subject)` = `"<Nème acheminement> — <subject>"` (no-op when the folder has no leading number). Wrapped every remaining subject: "LTA partielle…", "Le poids trouvé… différent…" (colis + weight, DS + partiel), "En attente du Nème vol".
+- `src/badr/badrLotLookup.js`: `searchLot`/`_parseResults`/`_sendNoResultEmail` now take a `subjectPrefix`; main.js passes `acheminementOrdinal(id)` so **"[BADR] Pas encore manifest"** is prefixed too.
+
+**Files changed:** `electron/main.js`, `src/badr/badrLotLookup.js`
+
+---
+
+## 2026-08-28 — Colis mismatch: use weight to tell "partiel LTA" from a data error + screenshot the lot panel
+
+**Behavior change (`electron/main.js`, DS Combinée pré-apurement):** when BADR's `Nbre contenant` differs from the LTA, the app now checks the weight too:
+- **Colis differ AND poids differ (> 20 kg)** → the shipment is split across flights → **partiel LTA, not DS Combinée**. Sets `partiel_skip`, emails *"LTA partielle (à traiter en Partiel, pas en DS Combinée)"* with both colis and poids.
+- **Colis differ but poids matches** → genuine colis mismatch → the existing *"Le poids trouvé dans le système BADR est différent…"* / "rectifier le nombre de colis" email (subject unchanged).
+
+Previously any colis mismatch sent the single "rectify colis" mail regardless of weight.
+
+**Screenshot (`captureBadrPreapShot`):** now scrolls the **"Lot de dédouanement"** panel (`#mainTab:form3:declarationExistante` — Mode de transport / Poids brut / Nbre contenant / Tare) into view inside the iframe and captures *that panel* directly, so the attached image shows the poids + colis. Falls back to the iframe element, then full page.
+
+**Files changed:** `electron/main.js`
+
+---
+
 ## 2026-08-20 — Editing the shipper field kept resetting to the extracted value
 
 Editing a partiel LTA's shipper (to correct a bad extraction) snapped back to the extracted name mid-typing: `acheminement:save` re-ran MAWB extraction whenever it saw an **empty** shipper on a partiel LTA — which happens the moment you clear the field to retype — and `handleChange`'s `.then()` overwrote your input with the result.

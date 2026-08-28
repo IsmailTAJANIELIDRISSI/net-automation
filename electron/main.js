@@ -51,6 +51,31 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
   }
 
+  // Zoom the whole app out a bit so tall cards (e.g. the "Lancer" button) fit
+  // without scrolling. Re-applied on every load (dev HMR resets it). The operator
+  // can fine-tune live with Ctrl +/- and reset with Ctrl+0.
+  const DEFAULT_ZOOM = 0.8;
+  const applyZoom = (z) => {
+    const clamped = Math.max(0.5, Math.min(1.5, z));
+    mainWindow.webContents.setZoomFactor(clamped);
+    return clamped;
+  };
+  mainWindow.webContents.on("did-finish-load", () => applyZoom(DEFAULT_ZOOM));
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    if (!input.control || input.type !== "keyDown") return;
+    const z = mainWindow.webContents.getZoomFactor();
+    if (input.key === "=" || input.key === "+") {
+      applyZoom(z + 0.1);
+      event.preventDefault();
+    } else if (input.key === "-") {
+      applyZoom(z - 0.1);
+      event.preventDefault();
+    } else if (input.key === "0") {
+      applyZoom(DEFAULT_ZOOM);
+      event.preventDefault();
+    }
+  });
+
   mainWindow.once("ready-to-show", () => mainWindow.show());
   mainWindow.on("closed", () => {
     mainWindow = null;
@@ -608,6 +633,7 @@ async function prepareLotAndWeightCheck(acheminement) {
       // Only email "Pas encore manifest" the first time — not on every retry.
       lotInfo = await lotLookup.searchLot(resolvedRef, {
         emailOnEmpty: !priorState?.manifestNotified,
+        subjectPrefix: acheminementOrdinal(id),
       });
       await lotLookup.close();
 
@@ -733,6 +759,65 @@ async function prepareLotAndWeightCheck(acheminement) {
       10,
     );
     if (!isNaN(colisBadr) && !isNaN(colisUser) && colisBadr !== colisUser) {
+      // When the colis count differs, the WEIGHT tells us which case it is:
+      //  • weight ALSO differs (> 20 kg) → the shipment is split across flights →
+      //    it's a partiel LTA (to declare in DUM Normale Partiel), NOT a DS Combinée.
+      //  • weight matches → the full shipment arrived but the colis count is off →
+      //    a genuine data mismatch the operator must rectify.
+      const POIDS_PARTIAL_THRESHOLD = 20; // kg
+      const poidsDiffKg =
+        !isNaN(poidsBadr) && !isNaN(poidsUser)
+          ? Math.abs(poidsBadr - poidsUser)
+          : null;
+      const weightAlsoDiffers =
+        poidsDiffKg != null && poidsDiffKg > POIDS_PARTIAL_THRESHOLD;
+
+      const shot = await captureBadrPreapShot(
+        badrConn.page,
+        resolvedRef,
+        folderPath,
+      );
+
+      if (weightAlsoDiffers) {
+        // Colis AND weight differ → partiel LTA, not DS Combinée.
+        const error = `LTA partielle probable — colis (BADR=${colisBadr} ≠ saisie=${colisUser}) et poids (BADR=${poidsBadr} ≠ saisie=${poidsUser} kg) diffèrent`;
+        updateAutomationState(folderPath, {
+          phase: "partiel_skip",
+          error,
+          badrColis: colisBadr,
+          userColis: colisUser,
+          badrWeight: poidsBadr,
+          userWeight: poidsUser,
+          diff: poidsDiffKg,
+        });
+        sendLog(
+          "warn",
+          "ColisCheck",
+          `${error} pour ${resolvedRef} — à traiter en DUM Normale Partiel`,
+        );
+        await sendNotification({
+          subject: subjectWithOrdinal(
+            id,
+            `LTA partielle (à traiter en Partiel, pas en DS Combinée) — LTA N° ${resolvedRef}`,
+          ),
+          text:
+            `Bonjour,\n\n` +
+            `La LTA N° ${resolvedRef} semble être une LTA partielle (colis ET poids partiels dans BADR) — ` +
+            `à traiter en DUM Normale Partiel, pas en DS Combinée.\n\n` +
+            `Nombre de colis — BADR : ${colisBadr} / saisi : ${colisUser}\n` +
+            `Poids brut — BADR : ${poidsBadr} kg / saisi : ${poidsUser} kg (écart ${poidsDiffKg.toFixed(2)} kg)\n\n` +
+            `Voir la capture des lots ci-jointe.\n\n-- MedAfrica --`,
+          attachments: shot ? [{ path: shot }] : [],
+        }).catch(() => {});
+        sendProgress(id, "partiel-skip", {
+          badrWeight: poidsBadr,
+          userWeight: poidsUser,
+          diff: poidsDiffKg,
+        });
+        return { success: false, error };
+      }
+
+      // Colis differ but weight matches → genuine colis mismatch, rectify.
       const error = `Nombre de colis différent (BADR=${colisBadr}, saisie=${colisUser}) — rectification requise`;
       updateAutomationState(folderPath, {
         phase: "error",
@@ -743,18 +828,20 @@ async function prepareLotAndWeightCheck(acheminement) {
       sendLog(
         "warn",
         "ColisCheck",
-        `${error} pour ${resolvedRef} — traitement arrêté, notification envoyée`,
+        `${error} pour ${resolvedRef} (poids identique) — traitement arrêté, notification envoyée`,
       );
-      const colisShot = await captureBadrPreapShot(badrConn.page, resolvedRef, folderPath);
       await sendNotification({
-        subject: `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${resolvedRef}`,
+        subject: subjectWithOrdinal(
+          id,
+          `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${resolvedRef}`,
+        ),
         text:
           `Bonjour,\n\n` +
           `Merci de rectifier le nombre de colis de la LTA N° ${resolvedRef}.\n\n` +
           `Nombre trouvé dans BADR : ${colisBadr}\n` +
           `Nombre saisi : ${colisUser}\n\n` +
           `Voir la capture des lots ci-jointe.\n\n-- MedAfrica --`,
-        attachments: colisShot ? [{ path: colisShot }] : [],
+        attachments: shot ? [{ path: shot }] : [],
       }).catch(() => {});
       sendProgress(id, "error", { error });
       return { success: false, error };
@@ -774,7 +861,10 @@ async function prepareLotAndWeightCheck(acheminement) {
           );
         }
         await sendNotification({
-          subject: `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${resolvedRef}`,
+          subject: subjectWithOrdinal(
+          id,
+          `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${resolvedRef}`,
+        ),
           text:
             `Bonjour,\n\n` +
             `Merci de régler le poids de la LTA N° ${resolvedRef} (écart ${kind}).\n\n` +
@@ -1819,6 +1909,7 @@ async function runPartielDumFlow(acheminement) {
     await lotLookup.openLotPopup();
     const lotResult = await lotLookup.searchLot(resolvedRef, {
       emailOnEmpty: !priorState?.manifestNotified,
+      subjectPrefix: acheminementOrdinal(id),
     });
     await lotLookup.close();
 
@@ -2318,6 +2409,14 @@ function buildAcheminementSubject(folderName, typeLabel, ref) {
   return `${ordinal} ${typeLabel} LTA N° ${ref}`;
 }
 
+// Prefix any email subject with the acheminement ordinal ("3éme acheminement — …")
+// so EVERY mail identifies which acheminement it's about, like the done mails.
+// No-op when the folder name has no leading number.
+function subjectWithOrdinal(folderName, subject) {
+  const ordinal = acheminementOrdinal(folderName);
+  return ordinal ? `${ordinal} — ${subject}` : subject;
+}
+
 // Screenshot the BADR préapurement lots section (in #iframeMenu) to Downloads,
 // cropped to the form3 panel when visible; falls back to a full-page capture.
 // Returns the saved path, or null. Used by the weight/colis mismatch emails.
@@ -2336,10 +2435,25 @@ async function captureBadrPreapShot(page, label, folderPath) {
   if (targets.length === 0) return null;
 
   const primary = targets[0];
-  // Screenshot the iframe ELEMENT (the BADR content area) rather than the inner
-  // form panel — the latter clipped ~30% on the left. The iframe box captures
-  // the full lots table from its left edge, excluding the top-page menu.
   const capture = async (dest) => {
+    // Best: the "Lot de dédouanement" panel itself (Mode de transport, Poids brut,
+    // Nbre contenant, Tare) — scroll it into view inside the iframe and capture it
+    // directly, so the email shows exactly the poids/colis the operator must check.
+    try {
+      const frame = page.frameLocator("#iframeMenu");
+      const lotPanel = frame
+        .locator("#mainTab\\:form3\\:declarationExistante")
+        .first();
+      if (await lotPanel.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await lotPanel.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(400);
+        await lotPanel.screenshot({ path: dest });
+        return;
+      }
+    } catch {
+      /* fall through to the iframe / full-page capture */
+    }
+    // Fallback: the iframe ELEMENT (full BADR content area), then the full page.
     const panel = page.locator("#iframeMenu").first();
     if (await panel.isVisible().catch(() => false)) {
       await panel.screenshot({ path: dest });
@@ -2378,7 +2492,10 @@ async function notifyPartielPoidsMismatch(id, acheminement, state) {
 
   if (pm.kind === "waiting_vol") {
     await sendNotification({
-      subject: `En attente du ${pm.nextVol}ème vol — LTA N° ${ref}`,
+      subject: subjectWithOrdinal(
+        id,
+        `En attente du ${pm.nextVol}ème vol — LTA N° ${ref}`,
+      ),
       text:
         `Bonjour,\n\n` +
         `La somme du nombre de colis des lots (${pm.totalNbr}) ne correspond pas encore au manifeste (${pm.expectedNbr}) pour la LTA N° ${ref}.\n` +
@@ -2388,7 +2505,10 @@ async function notifyPartielPoidsMismatch(id, acheminement, state) {
     }).catch(() => {});
   } else {
     await sendNotification({
-      subject: `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${ref}`,
+      subject: subjectWithOrdinal(
+        id,
+        `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${ref}`,
+      ),
       text:
         `Bonjour,\n\n` +
         `Merci de régler le poids de la LTA N° ${ref}.\n\n` +

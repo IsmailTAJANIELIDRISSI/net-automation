@@ -97,20 +97,20 @@ function StatCard({ label, value, tone, active, onClick, pulse }) {
   return (
     <button
       onClick={onClick}
-      className={`flex-1 min-w-[104px] text-left px-4 py-2.5 rounded-xl border transition-all ${
+      className={`flex-1 min-w-[104px] text-left px-3 py-1.5 rounded-lg border transition-all ${
         active
           ? "bg-slate-800 border-slate-600 ring-1 ring-emerald-500/40"
           : "bg-slate-900/60 border-slate-800/80 hover:border-slate-700 hover:bg-slate-900"
       }`}
     >
       <div
-        className={`text-2xl font-bold tabular-nums leading-none ${tones[tone] || tones.slate} ${
+        className={`text-lg font-bold tabular-nums leading-none ${tones[tone] || tones.slate} ${
           pulse ? "animate-pulse" : ""
         }`}
       >
         {value}
       </div>
-      <div className="text-[11px] uppercase tracking-wide text-slate-500 mt-1.5">
+      <div className="text-[10px] uppercase tracking-wide text-slate-500 mt-1">
         {label}
       </div>
     </button>
@@ -783,7 +783,7 @@ export default function App() {
             ) : (
               <>
                 {/* Stat filters */}
-                <div className="flex flex-wrap gap-2.5 mb-5">
+                <div className="flex flex-wrap gap-2 mb-3">
                   <StatCard
                     label="Total"
                     value={acheminements.length}

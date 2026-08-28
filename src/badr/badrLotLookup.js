@@ -143,7 +143,10 @@ class BADRLotLookup {
    * Fill all required fields and submit.
    * @param {string} lotReference – MAWB number, e.g. "607-52839835"
    */
-  async searchLot(lotReference, { emailOnEmpty = true } = {}) {
+  async searchLot(
+    lotReference,
+    { emailOnEmpty = true, subjectPrefix = null } = {},
+  ) {
     const p = this.popupPage;
     const normalizedLotReference = this._normalizeLotReference(lotReference);
 
@@ -257,6 +260,7 @@ class BADRLotLookup {
         // the last opérateur) — otherwise we'd email before trying SWIFTAIR.
         lastResult = await this._parseResults(normalizedLotReference, {
           sendNoResultEmail: emailOnEmpty && isFinalAttempt && isLastOperateur,
+          subjectPrefix,
         });
 
         if (!lastResult?.isEmpty) return lastResult;
@@ -301,7 +305,10 @@ class BADRLotLookup {
   //  STEP 3 – Parse the result table
   // ────────────────────────────────────────────────────────────────────────────
 
-  async _parseResults(lotReference, { sendNoResultEmail = true } = {}) {
+  async _parseResults(
+    lotReference,
+    { sendNoResultEmail = true, subjectPrefix = null } = {},
+  ) {
     const p = this.popupPage;
 
     const headerText = await p
@@ -317,7 +324,7 @@ class BADRLotLookup {
     if (rowCount === 0) {
       if (sendNoResultEmail) {
         log.warn(`No lot found for "${lotReference}" – notifying by email`);
-        await this._sendNoResultEmail(lotReference);
+        await this._sendNoResultEmail(lotReference, subjectPrefix);
       } else {
         log.info(
           `No lot found for "${lotReference}" — email deferred until final attempt`,
@@ -447,8 +454,9 @@ class BADRLotLookup {
     return { dateDu: fmt(dateDu), dateAu: fmt(dateAu) };
   }
 
-  /** Send email notification when no result found ("Pas encore manifest"). */
-  async _sendNoResultEmail(lotReference) {
+  /** Send email notification when no result found ("Pas encore manifest").
+   *  `subjectPrefix` (e.g. "3éme acheminement") identifies which acheminement. */
+  async _sendNoResultEmail(lotReference, subjectPrefix = null) {
     const { email } = config;
     if (!email.enabled || !email.user || !email.to) {
       log.warn("Email notification skipped (EMAIL_ENABLED not set in .env)");
@@ -466,7 +474,7 @@ class BADRLotLookup {
       await transporter.sendMail({
         from: email.from || email.user,
         to: email.to,
-        subject: `[BADR] Pas encore manifest – ${lotReference}`,
+        subject: `${subjectPrefix ? `${subjectPrefix} — ` : ""}[BADR] Pas encore manifest – ${lotReference}`,
         text: [
           `Bonjour,`,
           ``,
