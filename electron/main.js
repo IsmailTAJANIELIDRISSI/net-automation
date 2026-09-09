@@ -759,18 +759,21 @@ async function prepareLotAndWeightCheck(acheminement) {
       10,
     );
     if (!isNaN(colisBadr) && !isNaN(colisUser) && colisBadr !== colisUser) {
-      // When the colis count differs, the WEIGHT tells us which case it is:
-      //  • weight ALSO differs (> 20 kg) → the shipment is split across flights →
-      //    it's a partiel LTA (to declare in DUM Normale Partiel), NOT a DS Combinée.
-      //  • weight matches → the full shipment arrived but the colis count is off →
-      //    a genuine data mismatch the operator must rectify.
-      const POIDS_PARTIAL_THRESHOLD = 20; // kg
+      // When the colis count differs, the WEIGHT decides which case it is:
+      //  • weight ALSO differs (beyond a tiny rounding tolerance — even ~5 kg) →
+      //    part of the shipment is missing → partiel LTA / next vol not yet arrived
+      //    (to declare in DUM Normale Partiel), NOT a DS Combinée.
+      //  • weight MATCHES (within rounding) → the full shipment arrived but the
+      //    colis count is off → a genuine data mismatch the operator must rectify.
+      // NB: this tolerance is deliberately tight — unlike the colis-MATCH weight
+      // check below, here even a small weight gap means part of the lot is absent.
+      const POIDS_MATCH_TOLERANCE = 2; // kg — only rounding; more than this = partiel
       const poidsDiffKg =
         !isNaN(poidsBadr) && !isNaN(poidsUser)
           ? Math.abs(poidsBadr - poidsUser)
           : null;
       const weightAlsoDiffers =
-        poidsDiffKg != null && poidsDiffKg > POIDS_PARTIAL_THRESHOLD;
+        poidsDiffKg != null && poidsDiffKg > POIDS_MATCH_TOLERANCE;
 
       const shot = await captureBadrPreapShot(
         badrConn.page,
@@ -802,8 +805,9 @@ async function prepareLotAndWeightCheck(acheminement) {
           ),
           text:
             `Bonjour,\n\n` +
-            `La LTA N° ${resolvedRef} semble être une LTA partielle (colis ET poids partiels dans BADR) — ` +
-            `à traiter en DUM Normale Partiel, pas en DS Combinée.\n\n` +
+            `La LTA N° ${resolvedRef} est une LTA partielle (colis ET poids partiels dans BADR — ` +
+            `tous les vols ne sont pas encore arrivés) — à traiter en DUM Normale Partiel, ` +
+            `pas en DS Combinée.\n\n` +
             `Nombre de colis — BADR : ${colisBadr} / saisi : ${colisUser}\n` +
             `Poids brut — BADR : ${poidsBadr} kg / saisi : ${poidsUser} kg (écart ${poidsDiffKg.toFixed(2)} kg)\n\n` +
             `Voir la capture des lots ci-jointe.\n\n-- MedAfrica --`,

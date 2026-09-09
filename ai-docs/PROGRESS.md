@@ -5,6 +5,16 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-09-09 — Colis mismatch: a small weight gap already means "partiel", not "rectify"
+
+Follow-up to the 2026-08-28 colis-mismatch logic: the "weight also differs" threshold was `> 20 kg`, so colis-differ + a small weight gap (e.g. BADR 61 colis / 1442 kg vs saisie 64 / 1447 = 5 kg) was wrongly emailed as "rectifier le nombre de colis" instead of partiel.
+
+- `electron/main.js`: replaced `POIDS_PARTIAL_THRESHOLD = 20` with `POIDS_MATCH_TOLERANCE = 2` kg. Now, when the colis count differs: **any** weight gap beyond rounding (~5 kg included) → **partiel LTA** ("tous les vols ne sont pas encore arrivés — à traiter en DUM Normale Partiel"); only a weight that **matches within rounding** → the "rectifier le nombre de colis" mail. The colis-MATCH weight check below (≤5 kg tolerated, take BADR weight) is unchanged.
+
+**Files changed:** `electron/main.js`
+
+---
+
 ## 2026-09-09 — Relaunching a "waiting 2nd vol" partiel now actually re-checks BADR
 
 Clicking "Lancer" on a `partiel_waiting_lots` LTA logged *"en attente du 2ème vol — rien à faire"* and did nothing — it could only be relaunched by toggling the Partiel checkbox off/on. Cause: an early-return guard at the top of `runPartielDumFlow` bailed whenever the checkpoint was `partiel_waiting_lots`, so it never re-ran the lot lookup.
