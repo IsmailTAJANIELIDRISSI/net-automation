@@ -5,6 +5,28 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-09-09 — Relaunching a "waiting 2nd vol" partiel now actually re-checks BADR
+
+Clicking "Lancer" on a `partiel_waiting_lots` LTA logged *"en attente du 2ème vol — rien à faire"* and did nothing — it could only be relaunched by toggling the Partiel checkbox off/on. Cause: an early-return guard at the top of `runPartielDumFlow` bailed whenever the checkpoint was `partiel_waiting_lots`, so it never re-ran the lot lookup.
+
+- `electron/main.js`: removed that guard — an explicit relaunch now re-does the lot lookup (proceeds if both vols are in BADR, else re-sets `partiel_waiting_lots`). Also removed `partiel_waiting_lots` from `noSessionPhases` so the batch opens BADR to re-check.
+- `src/ui/App.jsx`: removed `partiel_waiting_lots` from `NON_LAUNCHABLE_PHASES` (and its skip reason) so **Tout lancer** also re-checks it, not just the per-card Lancer.
+
+**Files changed:** `electron/main.js`, `src/ui/App.jsx`
+
+---
+
+## 2026-09-09 — "Tout lancer" now explains skips + fix partiel-waiting-lots badge after restart
+
+Confusing case: after a restart, LTAs stuck at `partiel_waiting_lots` (waiting for the 2nd vol) showed a plain "En attente" badge and "Tout lancer" silently skipped them → only "Aucun LTA complet".
+
+- `src/ui/App.jsx` `checkpointToStatus`: added the missing `partiel_waiting_lots → "partiel-waiting-lots"` case, so after a scan/restart the badge correctly reads "En attente prochain vol" (not a generic idle "En attente").
+- `src/ui/App.jsx` `handleRunAll`: now logs a **per-LTA skip reason** (mirroring `computeLaunchable`) — ref mismatch, non-launchable phase (partiel_skip / partiel_waiting_lots / waiting-signature / weight_mismatch / done), missing fields, or out-of-range value — instead of only the opaque "Aucun LTA complet". These phases are skipped on purpose; the operator uses the card's own **Lancer** to force one.
+
+**Files changed:** `src/ui/App.jsx`
+
+---
+
 ## 2026-09-09 — Mismatch screenshot: capture the whole Préapurement block
 
 The mismatch/partiel email screenshot captured only the "Lot de dédouanement" panel. Now it captures the **entire block** (`#mainTab:form3:preap_details`): Recherche du lot (Type DS / Référence DS / Lieu de chargement / Référence lot) **and** Lot de dédouanement (Poids brut / Nbre contenant / Tare) + Confirmer — so the email shows the full context.

@@ -20,7 +20,8 @@ const NON_LAUNCHABLE_PHASES = new Set([
   "partiel_done",
   "partiel_skip",
   "partiel_waiting_signature",
-  "partiel_waiting_lots",
+  // NOTE: partiel_waiting_lots is intentionally NOT here — "Tout lancer" (and the
+  // per-card Lancer) re-check it against BADR in case the next vol has arrived.
   "weight_mismatch",
 ]);
 
@@ -195,6 +196,8 @@ export default function App() {
         return "portnet-accepted";
       case "partiel_waiting_signature":
         return "partiel-waiting-signature";
+      case "partiel_waiting_lots":
+        return "partiel-waiting-lots";
       case "badr_done":
       case "partiel_done":
         return "done";
@@ -582,24 +585,36 @@ export default function App() {
     // Launchable LTAs right now (complete fields, not done/waiting/error).
     const pending = computeLaunchable(acheminements);
 
+    // Explain, per LTA, WHY it isn't launched by "Tout lancer" (mirrors
+    // computeLaunchable) — otherwise the operator only sees "Aucun LTA complet".
+    // These phases are skipped on purpose; use the card's own "Lancer" to force one.
+    const PHASE_SKIP_REASONS = {
+      badr_done: "déjà terminé",
+      partiel_done: "déjà terminé",
+      partiel_skip:
+        "LTA partielle détectée — utilisez « Lancer » sur la carte pour la traiter en DUM Normale Partiel",
+      partiel_waiting_signature: "en attente de signature manuelle",
+      weight_mismatch: "écart de poids à vérifier",
+    };
+    const launchableIds = new Set(pending.map((a) => a.id));
     for (const a of acheminements) {
-      if (a.refMismatch) continue;
-      const missing = getMissingRequiredFields(a);
-      if (missing.length > 0) {
-        addLog(
-          "warn",
-          "UI",
-          `${a.name}: ignoré — champs obligatoires manquants : ${missing.join(", ")}`,
-        );
+      if (launchableIds.has(a.id)) continue; // will be launched
+      const phase = a.automationState?.phase;
+      let reason;
+      if (a.refMismatch) {
+        reason = "référence incohérente (corrigez la réf. sur la carte)";
+      } else if (phase && PHASE_SKIP_REASONS[phase]) {
+        reason = PHASE_SKIP_REASONS[phase];
+      } else {
+        const missing = getMissingRequiredFields(a);
+        const vIssue = getValueRangeIssue(a);
+        if (missing.length > 0) {
+          reason = `champs obligatoires manquants : ${missing.join(", ")}`;
+        } else if (vIssue && !a.valueRangeAck) {
+          reason = `${vIssue.message} À confirmer sur la carte avant lancement`;
+        }
       }
-      const vIssue = getValueRangeIssue(a);
-      if (vIssue && !a.valueRangeAck) {
-        addLog(
-          "warn",
-          "UI",
-          `${a.name}: ignoré — ${vIssue.message} À confirmer sur la carte avant lancement.`,
-        );
-      }
+      if (reason) addLog("warn", "UI", `${a.name}: ignoré — ${reason}.`);
     }
 
     if (pending.length === 0) {

@@ -1846,13 +1846,11 @@ async function runPartielDumFlow(acheminement) {
     sendProgress(id, "weight-mismatch");
     return { success: false, error: checkpoint.errorMessage };
   }
-  if (checkpoint?.phase === "partiel_waiting_lots") {
-    const nextVol =
-      checkpoint.nextVol ?? checkpoint.poidsMismatch?.nextVol ?? 2;
-    sendLog("info", "BADR", `"${id}" en attente du ${nextVol}ème vol — rien à faire`);
-    sendProgress(id, "partiel-waiting-lots", { nextVol });
-    return { success: false, skipped: true, reason: "partiel_waiting_lots" };
-  }
+  // NOTE: no early-return for `partiel_waiting_lots`. An explicit "Lancer" must
+  // RE-CHECK the lots (the operator clicks it because the 2nd vol may have arrived).
+  // The lot lookup below re-evaluates: if both vols are now in BADR it proceeds;
+  // if still only one, it simply re-sets partiel_waiting_lots. (Previously it bailed
+  // with "rien à faire", so the LTA could only be relaunched by toggling Partiel.)
 
   // Cross-check manifest vs MAWB. Only a colis discrepancy blocks; a weight gap
   // is a non-blocking warning the operator can rectify before launching.
@@ -2197,11 +2195,12 @@ async function runAllAutomationTasks(acheminements) {
       );
 
     // Phases that are terminal / can't progress in a batch → need no browser.
+    // NOTE: partiel_waiting_lots is NOT here — relaunching it must re-open BADR to
+    // re-check whether the next vol has arrived.
     const noSessionPhases = [
       "badr_done",
       "partiel_done",
       "partiel_skip",
-      "partiel_waiting_lots",
       "partiel_waiting_signature",
       "weight_mismatch",
     ];
