@@ -5,6 +5,16 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-09-09 — Mismatch screenshot: capture the whole Préapurement block
+
+The mismatch/partiel email screenshot captured only the "Lot de dédouanement" panel. Now it captures the **entire block** (`#mainTab:form3:preap_details`): Recherche du lot (Type DS / Référence DS / Lieu de chargement / Référence lot) **and** Lot de dédouanement (Poids brut / Nbre contenant / Tare) + Confirmer — so the email shows the full context.
+
+- `electron/main.js` `captureBadrPreapShot`: try `preap_details` → `panelDecExistante` → `declarationExistante` (widest → narrowest), scroll into view, capture; iframe/full-page fallback unchanged.
+
+**Files changed:** `electron/main.js`
+
+---
+
 ## 2026-08-28 — Every email now names the acheminement ("3éme acheminement — …")
 
 Only the done / "en cours validation" mails carried the acheminement ordinal (via `buildAcheminementSubject`). The mismatch / no-manifest mails didn't.

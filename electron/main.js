@@ -2436,19 +2436,26 @@ async function captureBadrPreapShot(page, label, folderPath) {
 
   const primary = targets[0];
   const capture = async (dest) => {
-    // Best: the "Lot de dédouanement" panel itself (Mode de transport, Poids brut,
-    // Nbre contenant, Tare) — scroll it into view inside the iframe and capture it
-    // directly, so the email shows exactly the poids/colis the operator must check.
+    // Capture the ENTIRE préapurement block (Recherche du lot — Type DS / Référence
+    // DS / Lieu de chargement / Référence lot — AND Lot de dédouanement — Poids
+    // brut / Nbre contenant / Tare — plus Confirmer). Scroll it into view inside
+    // the iframe and capture it directly so the email shows the full context.
+    // Ordered widest → narrowest so a layout change still yields a useful shot.
+    const blockSelectors = [
+      "#mainTab\\:form3\\:preap_details", // whole "Préapurement N°" block
+      "#mainTab\\:form3\\:panelDecExistante", // Recherche + Lot de dédouanement + Confirmer
+      "#mainTab\\:form3\\:declarationExistante", // just "Lot de dédouanement"
+    ];
     try {
       const frame = page.frameLocator("#iframeMenu");
-      const lotPanel = frame
-        .locator("#mainTab\\:form3\\:declarationExistante")
-        .first();
-      if (await lotPanel.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await lotPanel.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
-        await page.waitForTimeout(400);
-        await lotPanel.screenshot({ path: dest });
-        return;
+      for (const sel of blockSelectors) {
+        const block = frame.locator(sel).first();
+        if (await block.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await block.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+          await page.waitForTimeout(400);
+          await block.screenshot({ path: dest });
+          return;
+        }
       }
     } catch {
       /* fall through to the iframe / full-page capture */
