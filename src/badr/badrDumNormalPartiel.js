@@ -440,6 +440,25 @@ class BADRDumNormalPartiel {
     log.info("Step 1 — Declaration opened, tabs loaded");
   }
 
+  // USD→MAD rate (MAD per 1 USD): prefer BADR's own taux (#id_tauxChange lives in
+  // the Entête tab but stays in the DOM from any tab — read its text directly, no
+  // visibility check, so the Articles tab uses the same rate), else the live rate,
+  // else 10.
+  async _getUsdMadRate(iframe) {
+    const tauxText = await iframe
+      .locator("#mainTab\\:form0\\:id_tauxChange")
+      .textContent({ timeout: 2000 })
+      .catch(() => "");
+    const tauxNum = parseFloat(String(tauxText).replace(",", "."));
+    if (tauxNum > 0) return tauxNum;
+    try {
+      return await fetchMADRate("USD");
+    } catch (e) {
+      log.warn("Could not fetch USD rate — using fallback 10", e.message);
+      return 10;
+    }
+  }
+
   // ── STEP 2 — Entête Tab ──────────────────────────────────────────────────
 
   async _step2_entete(iframe, ach) {
@@ -471,21 +490,7 @@ class BADRDumNormalPartiel {
       );
     } else {
       // Manifest is in another currency (e.g. MAD) — convert to USD via tauxChange
-      let tauxChange = null;
-      const tauxSpan = iframe.locator("#mainTab\\:form0\\:id_tauxChange");
-      if (await tauxSpan.isVisible().catch(() => false)) {
-        const tauxText = await tauxSpan.textContent().catch(() => "");
-        const tauxNum = parseFloat(String(tauxText).replace(",", "."));
-        if (tauxNum > 0) tauxChange = tauxNum;
-      }
-      if (!tauxChange) {
-        try {
-          tauxChange = await fetchMADRate("USD");
-        } catch (e) {
-          log.warn("Could not fetch USD rate — using fallback 10", e.message);
-          tauxChange = 10;
-        }
-      }
+      const tauxChange = await this._getUsdMadRate(iframe);
       montantTotal = roundBADR(parseFloat(ach.totalValue || "0") / tauxChange);
       log.info(
         `Manifest currency is ${manifestCurrency || "unknown"} — converted via USD rate ${tauxChange}: ${montantTotal}`,
@@ -1246,15 +1251,32 @@ class BADRDumNormalPartiel {
       String(ach.qteFacturee || ""),
     );
 
-    // Valeur déclarée = fretValueMAD + totalValue(MAD), rounded
+    // Valeur déclarée (MAD) = fret converti en MAD + valeur totale du manifeste
+    // convertie en MAD. The manifest totalValue is in the MANIFEST currency: if USD,
+    // convert to MAD (× BADR taux); if already MAD, use as-is. (Previously totalValue
+    // was added as-is — mixing USD into a MAD total when the manifest was in USD.)
     let valDec = 0;
     try {
-      const rate = await fetchMADRate(ach.mawbCurrency || "USD");
-      const fretMAD = parseFloat(ach.fretValue || "0") * rate;
-      const manifVal = parseFloat(
+      const fretRate = await fetchMADRate(ach.mawbCurrency || "USD");
+      const fretMAD = parseFloat(ach.fretValue || "0") * fretRate;
+
+      const totalValueNum = parseFloat(
         String(ach.totalValue || "0").replace(",", "."),
       );
-      valDec = roundBADR(fretMAD + manifVal);
+      const manifestCurrency = (ach.currency || "").toUpperCase().trim();
+      let manifValMAD = totalValueNum; // already MAD
+      if (manifestCurrency === "USD") {
+        const tauxChange = await this._getUsdMadRate(iframe);
+        manifValMAD = totalValueNum * tauxChange;
+        log.info(
+          `Manifest en USD — valeur totale ${totalValueNum} USD × ${tauxChange} = ${manifValMAD.toFixed(2)} MAD`,
+        );
+      }
+
+      valDec = roundBADR(fretMAD + manifValMAD);
+      log.info(
+        `Valeur déclarée = fret ${fretMAD.toFixed(2)} MAD + total ${manifValMAD.toFixed(2)} MAD = ${valDec} MAD`,
+      );
     } catch (e) {
       log.error("Exchange rate fetch failed for Articles tab:", e.message);
       throw e;

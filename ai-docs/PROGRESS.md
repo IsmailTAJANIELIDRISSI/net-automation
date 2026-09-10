@@ -5,6 +5,17 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-09-10 — Partiel Articles "Valeur déclarée": convert a USD manifest total to MAD
+
+In `badrDumNormalPartiel.js` Step 8 (Articles), `valDec = fretMAD + totalValue` added the manifest `totalValue` **as-is** assuming MAD — so when the manifest currency was **USD**, it added USD onto a MAD fret → wrong declared value.
+
+- New `_getUsdMadRate(iframe)` helper: BADR's own `#mainTab:form0:id_tauxChange` (read via `textContent`, so it works from the Articles tab where that span is on the hidden Entête tab) → live `fetchMADRate("USD")` → fallback 10. Step 2 (Entête) refactored to use it.
+- Step 8: when `ach.currency === "USD"`, `totalValue` is now converted to MAD (`× tauxChange`) before adding to `fretMAD`; MAD manifests are used as-is. `fret` conversion (via `mawbCurrency` rate) unchanged.
+
+**Files changed:** `src/badr/badrDumNormalPartiel.js`
+
+---
+
 ## 2026-09-09 — Colis mismatch: a small weight gap already means "partiel", not "rectify"
 
 Follow-up to the 2026-08-28 colis-mismatch logic: the "weight also differs" threshold was `> 20 kg`, so colis-differ + a small weight gap (e.g. BADR 61 colis / 1442 kg vs saisie 64 / 1447 = 5 kg) was wrongly emailed as "rectifier le nombre de colis" instead of partiel.
