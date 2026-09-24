@@ -49,6 +49,10 @@ const RUNNING_STATUSES = new Set([
   "badr-downloading",
 ]);
 
+// Stats strip (Total / En cours / En attente / Terminés / Erreurs — also the card
+// filters). Hidden to give the cards more vertical room; set to true to bring it back.
+const SHOW_STATS = false;
+
 /** Bucket a card status into one of the filter categories. */
 function categoryOf(status) {
   if (status === "done") return "done";
@@ -798,7 +802,8 @@ export default function App() {
               </div>
             ) : (
               <>
-                {/* Stat filters */}
+                {/* Stat filters (hidden unless SHOW_STATS) */}
+                {SHOW_STATS && (
                 <div className="flex flex-wrap gap-2 mb-3">
                   <StatCard
                     label="Total"
@@ -845,6 +850,7 @@ export default function App() {
                     }
                   />
                 </div>
+                )}
 
                 {/* Card grid */}
                 {visibleAch.length === 0 ? (

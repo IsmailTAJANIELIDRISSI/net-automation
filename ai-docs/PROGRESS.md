@@ -5,6 +5,12 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-09-24 — Stats strip hidden
+
+The Total / En cours / En attente / Terminés / Erreurs row above the cards is hidden to free vertical space. It is behind `const SHOW_STATS = false` in `src/ui/App.jsx` (set `true` to restore). Note the strip also doubled as the card filter, so filtering by status is unavailable while it is hidden. **Files changed:** `src/ui/App.jsx`
+
+---
+
 ## 2026-09-24 — Zoom: default 90%, and it is NOT remembered across restarts
 
 Default zoom is now **90%** (`DEFAULT_ZOOM = 0.9` in `electron/main.js`). Reverted the "remember zoom" behaviour from the entry below: the level lives only in memory for the current run (so a dev-HMR page reload keeps it) and **every app restart starts at the default**. Removed `userData/zoom.json`, `loadZoom` and the persist logic. Buttons, Ctrl +/-/0 and Ctrl+wheel are unchanged.
