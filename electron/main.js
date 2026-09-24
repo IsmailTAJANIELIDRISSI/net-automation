@@ -24,7 +24,7 @@ let mainWindow = null;
 // on-load re-apply all go through applyZoom(). The level is persisted in
 // userData/zoom.json so it survives restarts, and pushed to the renderer
 // ("zoom-changed") so the header shows the current percentage.
-const DEFAULT_ZOOM = 0.8; // compact default so tall cards (Lancer) fit
+const DEFAULT_ZOOM = 0.9; // compact default so tall cards (Lancer) fit
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 1.5;
 const ZOOM_STEP = 0.1;
