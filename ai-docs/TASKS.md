@@ -103,6 +103,9 @@ The core automation flow is **fully implemented and working in production**:
   - `src/badr/badrDumNormalPartiel.js` `_uploadOne`: replaced the `.ui-blockui-content.first().waitFor({hidden})` (matched an already-hidden node → instant false "upload failed" on slow BADR) with a patient poll on `.ui-blockui-content:visible` until it clears (up to 3 min), then the document-row check
   - Fixes false FACTURE upload failures when BADR is slow/down
 
+- **Pré-apurement flow documented ✅** (2026-09-24): see `ai-docs/PREAPUREMENT-FLOW.md` — every colis/poids outcome for DS Combinée and partiel (phases, badges, emails, tolerances)
+  - Open item found while documenting: `_step5_preapurement` hard-codes année `"2026"` for each partiel lot (should use the lot's own année)
+
 ## Next Steps / Testing
 
 - [ ] Verify upload table selector `#mainTab:form7:listFichiersAnnexeDT_data` matches real DOM — if upload verify still fails, paste table HTML

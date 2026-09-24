@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import Header from "./components/Header.jsx";
 import AcheminementCard from "./components/AcheminementCard.jsx";
 import LogPanel from "./components/LogPanel.jsx";
+import ZoomControl from "./components/ZoomControl.jsx";
 import {
   getMissingRequiredFields,
   getValueRangeIssue,
@@ -140,8 +141,8 @@ function LiveLogBar({ logs, onOpen }) {
     <button
       onClick={onOpen}
       title="Ouvrir le journal complet"
-      className="group flex-shrink-0 flex items-center gap-2.5 w-full h-8 px-4 text-left
-                 bg-slate-900/80 border-t border-slate-800 hover:bg-slate-900 transition-colors"
+      className="group flex items-center gap-2.5 w-full h-full px-4 text-left
+                 hover:bg-slate-900 transition-colors"
     >
       <span
         className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
@@ -887,10 +888,16 @@ export default function App() {
         )}
       </div>
 
-      {/* ── Live log bar — always-on real-time footer (redundant on Journal) ── */}
-      {activeTab !== "journal" && (
-        <LiveLogBar logs={logs} onOpen={() => setActiveTab("journal")} />
-      )}
+      {/* ── Footer: live log bar (hidden on Journal, where the full log is shown)
+          + zoom − / % / + control, always visible in the bottom margin ───── */}
+      <div className="flex-shrink-0 flex items-center h-9 bg-slate-900/80 border-t border-slate-800">
+        <div className="flex-1 min-w-0 h-full">
+          {activeTab !== "journal" && (
+            <LiveLogBar logs={logs} onOpen={() => setActiveTab("journal")} />
+          )}
+        </div>
+        <ZoomControl />
+      </div>
     </div>
   );
 }

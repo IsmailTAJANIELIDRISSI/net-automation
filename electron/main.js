@@ -19,6 +19,58 @@ const isDev = process.env.NODE_ENV === "development" || !app.isPackaged;
 
 let mainWindow = null;
 
+// ── Zoom ──────────────────────────────────────────────────────────────────────
+// One place owns the zoom level: the header buttons (IPC), Ctrl +/-/0 and the
+// on-load re-apply all go through applyZoom(). The level is persisted in
+// userData/zoom.json so it survives restarts, and pushed to the renderer
+// ("zoom-changed") so the header shows the current percentage.
+const DEFAULT_ZOOM = 0.8; // compact default so tall cards (Lancer) fit
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 1.5;
+const ZOOM_STEP = 0.1;
+let currentZoom = null;
+
+const clampZoom = (z) =>
+  Math.round(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z)) * 100) / 100;
+const zoomFile = () => path.join(app.getPath("userData"), "zoom.json");
+
+function loadZoom() {
+  try {
+    const z = JSON.parse(fs.readFileSync(zoomFile(), "utf8")).zoom;
+    if (Number.isFinite(z)) return clampZoom(z);
+  } catch {
+    /* no saved zoom yet */
+  }
+  return DEFAULT_ZOOM;
+}
+
+function applyZoom(z, { persist = true } = {}) {
+  currentZoom = clampZoom(z);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.setZoomFactor(currentZoom);
+    mainWindow.webContents.send("zoom-changed", currentZoom);
+  }
+  if (persist) {
+    try {
+      fs.writeFileSync(zoomFile(), JSON.stringify({ zoom: currentZoom }));
+    } catch {
+      /* non-fatal */
+    }
+  }
+  return currentZoom;
+}
+
+/** action: "in" | "out" | "reset" */
+function stepZoom(action) {
+  const base = currentZoom ?? loadZoom();
+  if (action === "in") return applyZoom(base + ZOOM_STEP);
+  if (action === "out") return applyZoom(base - ZOOM_STEP);
+  return applyZoom(DEFAULT_ZOOM); // "reset"
+}
+
+ipcMain.handle("zoom:get", () => currentZoom ?? loadZoom());
+ipcMain.handle("zoom:step", (_event, action) => stepZoom(action));
+
 // ── Window ────────────────────────────────────────────────────────────────────
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -51,27 +103,21 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
   }
 
-  // Zoom the whole app out a bit so tall cards (e.g. the "Lancer" button) fit
-  // without scrolling. Re-applied on every load (dev HMR resets it). The operator
-  // can fine-tune live with Ctrl +/- and reset with Ctrl+0.
-  const DEFAULT_ZOOM = 0.8;
-  const applyZoom = (z) => {
-    const clamped = Math.max(0.5, Math.min(1.5, z));
-    mainWindow.webContents.setZoomFactor(clamped);
-    return clamped;
-  };
-  mainWindow.webContents.on("did-finish-load", () => applyZoom(DEFAULT_ZOOM));
+  // Re-apply the saved zoom on every load (a dev HMR reload resets it), without
+  // re-writing the file. Ctrl +/- / Ctrl+0 use the same functions as the header.
+  mainWindow.webContents.on("did-finish-load", () =>
+    applyZoom(currentZoom ?? loadZoom(), { persist: false }),
+  );
   mainWindow.webContents.on("before-input-event", (event, input) => {
     if (!input.control || input.type !== "keyDown") return;
-    const z = mainWindow.webContents.getZoomFactor();
     if (input.key === "=" || input.key === "+") {
-      applyZoom(z + 0.1);
+      stepZoom("in");
       event.preventDefault();
     } else if (input.key === "-") {
-      applyZoom(z - 0.1);
+      stepZoom("out");
       event.preventDefault();
     } else if (input.key === "0") {
-      applyZoom(DEFAULT_ZOOM);
+      stepZoom("reset");
       event.preventDefault();
     }
   });
@@ -3274,7 +3320,18 @@ async function declareScellesPartielFlow(folderPath, signedSerie) {
         await badrConn.navigateToAccueil();
         finalizer.page = badrConn.page;
         const annee = new Date().getFullYear().toString();
-        const safeName = `${id}-DUM-NORMAL-SIGNE-${serie}${cle}`
+        // File name like "DS_3eme_acheminement_DUM_NORMAL_SIGNE_4885P" — the
+        // acheminement ordinal (accents stripped, spaces → "_"), not the raw folder.
+        const ordSlug = (acheminementOrdinal(id) || id)
+          .replace(/[éèêë]/gi, "e") // "3éme" → "3eme" (accents → ASCII)
+          .replace(/[àâä]/gi, "a")
+          .replace(/[îï]/gi, "i")
+          .replace(/[ôö]/gi, "o")
+          .replace(/[ûüù]/gi, "u")
+          .replace(/[çÇ]/g, "c")
+          .replace(/[^A-Za-z0-9]+/g, "_")
+          .replace(/^_+|_+$/g, "");
+        const safeName = `DS_${ordSlug}_DUM_NORMAL_SIGNE_${serie}${cle}`
           .replace(/[\\/:*?"<>|]/g, "_")
           .slice(0, 120);
         signedPdfPath = await finalizer.printRegisteredDumByRef(

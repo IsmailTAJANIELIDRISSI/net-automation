@@ -5,6 +5,37 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-09-24 — On-screen zoom control (bottom bar) + Ctrl+wheel + remembered zoom level
+
+The app already zoomed to 80% with hidden Ctrl +/-/0 shortcuts. Added visible controls and made the level stick.
+
+- `electron/main.js`: one zoom owner — `applyZoom` / `stepZoom("in"|"out"|"reset")` (clamp 50–150%, step 10%, default 80%). Level persisted in `userData/zoom.json` and re-applied on every load; pushed to the renderer via `zoom-changed`. New IPC `zoom:get` / `zoom:step`; Ctrl +/-/0 now use the same functions.
+- `electron/preload.js`: `getZoom`, `stepZoom`, `onZoomChanged`.
+- `src/ui/components/ZoomControl.jsx` (new): `[−] [80%] [+]` (click % = reset) **and** the **Ctrl + mouse-wheel** gesture (throttled 120 ms, `preventDefault` so Chromium's own zoom doesn't double-step).
+- `src/ui/App.jsx`: new always-visible footer row — live-log bar on the left (still hidden on the Journal tab) + `ZoomControl` on the right, in the bottom margin.
+
+**Files changed:** `electron/main.js`, `electron/preload.js`, `src/ui/App.jsx`, `src/ui/components/ZoomControl.jsx` (new), `src/ui/components/Header.jsx` (unchanged in the end)
+
+---
+
+## 2026-09-24 — Documentation: BADR pré-apurement check, all outcomes
+
+New `ai-docs/PREAPUREMENT-FLOW.md` (docs only, no code change): how `badrPreapurement.js` reads Poids brut / Nbre contenant, then the full decision tree for DS Combinée (colis same/differ × poids gap 0 / ≤5 / 5–20 / >20 / ≤2 / >2 kg) and for the partiel Step 5 (waiting next vol / poids mismatch / ≤1 kg rounding / all OK), with phases, badges, emails, tolerances and where each constant lives. Also records two gotchas found while reading: the partiel Step 5 hard-codes année `"2026"`, and the DS/partiel screenshots capture different regions.
+
+**Files added:** `ai-docs/PREAPUREMENT-FLOW.md`
+
+---
+
+## 2026-09-10 — Signed DUM PDF filename → DS_<ordinal>_DUM_NORMAL_SIGNE_<serie><cle>
+
+The emailed signed-DUM PDF was named from the raw folder (`3EME 13460929-13460930-DUM-NORMAL-SIGNE-4885P.pdf`). Now it's `DS_3eme_acheminement_DUM_NORMAL_SIGNE_4885P.pdf`.
+
+- `electron/main.js` (`declareScellesPartielFlow`): `safeName` built from `acheminementOrdinal(id)` slugified (French accents → ASCII, non-alnum → `_`) → `DS_${ordSlug}_DUM_NORMAL_SIGNE_${serie}${cle}`. Falls back to the folder name if there's no leading number.
+
+**Files changed:** `electron/main.js`
+
+---
+
 ## 2026-09-10 — Partiel Articles "Valeur déclarée": convert a USD manifest total to MAD
 
 In `badrDumNormalPartiel.js` Step 8 (Articles), `valDec = fretMAD + totalValue` added the manifest `totalValue` **as-is** assuming MAD — so when the manifest currency was **USD**, it added USD onto a MAD fret → wrong declared value.

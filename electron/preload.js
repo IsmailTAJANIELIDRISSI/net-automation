@@ -64,6 +64,17 @@ contextBridge.exposeInMainWorld("api", {
     return () => ipcRenderer.removeListener("acheminements-changed", listener);
   },
 
+  // ── App zoom (header − / % / + control) ────────────────────────────────────
+  getZoom: () => ipcRenderer.invoke("zoom:get"),
+  /** @param {"in"|"out"|"reset"} action */
+  stepZoom: (action) => ipcRenderer.invoke("zoom:step", action),
+  /** Fires with the new zoom factor (e.g. 0.8) whenever it changes (buttons or Ctrl +/-). */
+  onZoomChanged: (cb) => {
+    const listener = (_event, z) => cb(z);
+    ipcRenderer.on("zoom-changed", listener);
+    return () => ipcRenderer.removeListener("zoom-changed", listener);
+  },
+
   // ── Utilities ──────────────────────────────────────────────────────────────
   platform: process.platform,
 });
