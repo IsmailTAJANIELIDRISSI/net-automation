@@ -5,6 +5,19 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-09-24 — "Pas encore manifest" re-check interval: 15 min → 6 h
+
+`MANIFEST_CHECK_INTERVAL_MS` is now `6 * 60 * 60 * 1000` (was 15 min) in `electron/main.js`. Still persisted in `manifestLastCheckAt` (a relaunch after 6 h re-checks) and still `MAX_MANIFEST_CHECKS = 3`, email only once.
+
+- The monitor's "only waiting-manifest LTAs left" loop ticks every minute and used to give up after `maxAttempts = 240` cycles (4 h) — that would have quit **before** the first 6 h re-check. New `MANIFEST_ONLY_MAX_CYCLES = (MAX_MANIFEST_CHECKS-1) × interval + 60 min` ≈ 780 cycles ≈ 13 h, so the re-checks at 6 h and 12 h actually happen.
+- The per-minute "En attente du manifeste…" log line now prints once per ~30 min; log messages show the interval dynamically (`manifestIntervalLabel()`, e.g. "6 h") instead of "~15 min".
+
+Trade-off: while only waiting-manifest LTAs remain, the app keeps the Portnet/BADR browsers open up to ~13 h. If a manifest appears after hours of idle, the Portnet page may have timed out; the submit then fails and is retried only at the next interval.
+
+**Files changed:** `electron/main.js`
+
+---
+
 ## 2026-09-24 — Stats strip hidden
 
 The Total / En cours / En attente / Terminés / Erreurs row above the cards is hidden to free vertical space. It is behind `const SHOW_STATS = false` in `src/ui/App.jsx` (set `true` to restore). Note the strip also doubled as the card filter, so filtering by status is unavailable while it is hidden. **Files changed:** `src/ui/App.jsx`

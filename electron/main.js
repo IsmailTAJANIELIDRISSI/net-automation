@@ -216,15 +216,22 @@ let sharedPortnetPage = null;
 let sharedBadrConn = null;
 
 // "Pas encore manifest" throttling. A waiting-manifest LTA is re-checked in BADR
-// at most once every 15 min (persisted via manifestLastCheckAt — survives app
-// restarts, so a relaunch tomorrow re-checks), and the monitor stops retrying
-// after MAX_MANIFEST_CHECKS checks so it doesn't hold the browser for hours (the
-// LTA stays "waiting_manifest", re-launchable later). The email fires only once
+// at most once every MANIFEST_CHECK_INTERVAL_MS (persisted via manifestLastCheckAt
+// — survives app restarts, so a relaunch after the interval re-checks), and the
+// monitor stops retrying after MAX_MANIFEST_CHECKS checks (the LTA stays
+// "waiting_manifest", re-launchable later). The email fires only once
 // (manifestNotified). This kills the previous once-a-minute re-check + mail spam.
-const MANIFEST_CHECK_INTERVAL_MS = 15 * 60 * 1000;
+// NOTE: while ONLY waiting-manifest LTAs remain, the monitor stays open (browser
+// sessions held) for up to (MAX_MANIFEST_CHECKS - 1) × interval — see
+// MANIFEST_ONLY_MAX_CYCLES in monitorPendingPortnetRequests.
+const MANIFEST_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 h
 const MAX_MANIFEST_CHECKS = 3;
+const manifestIntervalLabel = () =>
+  MANIFEST_CHECK_INTERVAL_MS >= 3_600_000
+    ? `${+(MANIFEST_CHECK_INTERVAL_MS / 3_600_000).toFixed(1)} h`
+    : `${Math.round(MANIFEST_CHECK_INTERVAL_MS / 60_000)} min`;
 
-/** True when it's too soon (< 15 min) to re-check this LTA's manifest again. */
+/** True when it's too soon (< MANIFEST_CHECK_INTERVAL_MS) to re-check this LTA's manifest again. */
 function manifestCheckThrottled(checkpoint) {
   const lastAt = checkpoint?.manifestLastCheckAt
     ? Date.parse(checkpoint.manifestLastCheckAt)
@@ -668,7 +675,7 @@ async function prepareLotAndWeightCheck(acheminement) {
       if (lotInfo.isEmpty) {
         // NOT a hard error — the manifest just isn't in BADR yet. Retryable
         // "waiting_manifest" state; the monitor re-checks it (throttled to once
-        // per 15 min, max 3/session) and picks it up as soon as it appears.
+        // per MANIFEST_CHECK_INTERVAL_MS, max MAX_MANIFEST_CHECKS) and picks it up as soon as it appears.
         const checks = (priorState?.manifestCheckCount || 0) + 1;
         updateAutomationState(folderPath, {
           phase: "waiting_manifest",
@@ -680,7 +687,7 @@ async function prepareLotAndWeightCheck(acheminement) {
         sendLog(
           "warn",
           "BADR",
-          `Pas encore manifest pour ${resolvedRef} (vérification ${checks}) — nouvelle tentative dans ~15 min.`,
+          `Pas encore manifest pour ${resolvedRef} (vérification ${checks}) — nouvelle vérification dans ~${manifestIntervalLabel()}.`,
         );
         sendProgress(id, "waiting-manifest");
         return { success: false, waitingManifest: true };
@@ -1266,7 +1273,7 @@ async function monitorPendingPortnetRequests(
 
   // ── Re-check "pas encore manifest" LTAs (throttled) ────────────────────────
   // Their manifest wasn't in BADR yet. Re-run the lot lookup (+ submit) — but at
-  // most once every 15 min (manifestCheckThrottled) and only until the check count
+  // most once per MANIFEST_CHECK_INTERVAL_MS (manifestCheckThrottled) and only until the check count
   // reaches MAX_MANIFEST_CHECKS, then drop it from the retry list so the batch can
   // end (it stays "waiting_manifest", re-launchable later — e.g. tomorrow).
   async function retryWaitingManifest() {
@@ -1298,7 +1305,7 @@ async function monitorPendingPortnetRequests(
         continue; // drop — no more retries this session
       }
       if (manifestCheckThrottled(st)) {
-        stillWaiting.push(ach); // < 15 min since last check — wait, no BADR work
+        stillWaiting.push(ach); // interval not elapsed since last check — wait, no BADR work
         continue;
       }
       sendLog("info", "BADR", `Vérification manifeste pour "${ach.id}"…`);
@@ -1440,6 +1447,14 @@ async function monitorPendingPortnetRequests(
   }, 45000); // 45 seconds — frequent enough to keep BADR session alive
 
   const maxAttempts = 240;
+  // While only waiting-manifest LTAs remain the loop ticks once a minute, so the
+  // cap must outlast the re-check schedule: checks happen at t=0 then every
+  // MANIFEST_CHECK_INTERVAL_MS, the last one at (MAX_MANIFEST_CHECKS-1)×interval.
+  // (A flat 240 cycles = 4 h would quit before the first 6 h re-check ever ran.)
+  const MANIFEST_ONLY_MAX_CYCLES =
+    Math.ceil(
+      ((MAX_MANIFEST_CHECKS - 1) * MANIFEST_CHECK_INTERVAL_MS) / 60_000,
+    ) + 60;
   let manifestOnlyCycles = 0;
   monitorActive = true;
   try {
@@ -1465,19 +1480,23 @@ async function monitorPendingPortnetRequests(
         // Nothing submitted to poll yet — only waiting-manifest LTAs remain. Wait,
         // then re-check the manifest next cycle. Bounded so the batch can't hang
         // forever if a manifest never arrives (the LTAs stay retryable via re-run).
-        if (++manifestOnlyCycles > maxAttempts) {
+        if (++manifestOnlyCycles > MANIFEST_ONLY_MAX_CYCLES) {
           sendLog(
             "warn",
             "BADR",
-            `Manifeste toujours absent pour ${manifestRetry.length} LTA(s) après ${maxAttempts} vérifications — arrêt du suivi (relançable).`,
+            `Manifeste toujours absent pour ${manifestRetry.length} LTA(s) après ${MANIFEST_ONLY_MAX_CYCLES} min d'attente — arrêt du suivi (relançable).`,
           );
           break;
         }
-        sendLog(
-          "info",
-          "BADR",
-          `En attente du manifeste pour ${manifestRetry.length} LTA(s) — nouvelle vérification dans 1 min…`,
-        );
+        // Log once per ~30 min (not every minute) — with a multi-hour interval a
+        // per-minute line would flood the journal.
+        if (manifestOnlyCycles === 1 || manifestOnlyCycles % 30 === 0) {
+          sendLog(
+            "info",
+            "BADR",
+            `En attente du manifeste pour ${manifestRetry.length} LTA(s) — prochaine vérification BADR selon l'intervalle (${manifestIntervalLabel()}).`,
+          );
+        }
         const d = Date.now() + 60_000;
         while (Date.now() < d) {
           if (injectionQueue.length > 0) break;
@@ -1957,7 +1976,7 @@ async function runPartielDumFlow(acheminement) {
       sendLog(
         "warn",
         "BADR",
-        `Pas encore manifest pour ${resolvedRef} (vérification ${checks}) — nouvelle tentative dans ~15 min.`,
+        `Pas encore manifest pour ${resolvedRef} (vérification ${checks}) — nouvelle vérification dans ~${manifestIntervalLabel()}.`,
       );
       return { success: false, waitingManifest: true };
     }
@@ -2129,7 +2148,7 @@ async function runAutomationTask(
   }
 
   // Manifest re-check throttle: if this LTA is waiting for its manifest and the
-  // last BADR check was < 15 min ago, don't hit BADR (or email) again yet. This
+  // last BADR check was < MANIFEST_CHECK_INTERVAL_MS ago, don't hit BADR (or email) again yet. This
   // also guards the restart path — relaunching won't immediately re-check.
   if (
     checkpoint?.phase === "waiting_manifest" &&
