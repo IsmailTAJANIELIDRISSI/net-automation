@@ -5,7 +5,15 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
-## 2026-09-24 — On-screen zoom control (bottom bar) + Ctrl+wheel + remembered zoom level
+## 2026-09-24 — Zoom: default 90%, and it is NOT remembered across restarts
+
+Default zoom is now **90%** (`DEFAULT_ZOOM = 0.9` in `electron/main.js`). Reverted the "remember zoom" behaviour from the entry below: the level lives only in memory for the current run (so a dev-HMR page reload keeps it) and **every app restart starts at the default**. Removed `userData/zoom.json`, `loadZoom` and the persist logic. Buttons, Ctrl +/-/0 and Ctrl+wheel are unchanged.
+
+**Files changed:** `electron/main.js`
+
+---
+
+## 2026-09-24 — On-screen zoom control (bottom bar) + Ctrl+wheel (persistence since removed, see above)
 
 The app already zoomed to 80% with hidden Ctrl +/-/0 shortcuts. Added visible controls and made the level stick.
 

@@ -20,55 +20,37 @@ const isDev = process.env.NODE_ENV === "development" || !app.isPackaged;
 let mainWindow = null;
 
 // ── Zoom ──────────────────────────────────────────────────────────────────────
-// One place owns the zoom level: the header buttons (IPC), Ctrl +/-/0 and the
-// on-load re-apply all go through applyZoom(). The level is persisted in
-// userData/zoom.json so it survives restarts, and pushed to the renderer
-// ("zoom-changed") so the header shows the current percentage.
+// One place owns the zoom level: the footer buttons (IPC), Ctrl +/-/0, Ctrl+wheel
+// and the on-load re-apply all go through applyZoom(), and the new level is pushed
+// to the renderer ("zoom-changed") so the control shows the current percentage.
+// The level is deliberately NOT saved to disk: it lives only for this run of the
+// app (so a dev-HMR reload keeps it), and every app restart starts at DEFAULT_ZOOM.
 const DEFAULT_ZOOM = 0.9; // compact default so tall cards (Lancer) fit
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 1.5;
 const ZOOM_STEP = 0.1;
-let currentZoom = null;
+let currentZoom = DEFAULT_ZOOM;
 
 const clampZoom = (z) =>
   Math.round(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z)) * 100) / 100;
-const zoomFile = () => path.join(app.getPath("userData"), "zoom.json");
 
-function loadZoom() {
-  try {
-    const z = JSON.parse(fs.readFileSync(zoomFile(), "utf8")).zoom;
-    if (Number.isFinite(z)) return clampZoom(z);
-  } catch {
-    /* no saved zoom yet */
-  }
-  return DEFAULT_ZOOM;
-}
-
-function applyZoom(z, { persist = true } = {}) {
+function applyZoom(z) {
   currentZoom = clampZoom(z);
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.setZoomFactor(currentZoom);
     mainWindow.webContents.send("zoom-changed", currentZoom);
-  }
-  if (persist) {
-    try {
-      fs.writeFileSync(zoomFile(), JSON.stringify({ zoom: currentZoom }));
-    } catch {
-      /* non-fatal */
-    }
   }
   return currentZoom;
 }
 
 /** action: "in" | "out" | "reset" */
 function stepZoom(action) {
-  const base = currentZoom ?? loadZoom();
-  if (action === "in") return applyZoom(base + ZOOM_STEP);
-  if (action === "out") return applyZoom(base - ZOOM_STEP);
+  if (action === "in") return applyZoom(currentZoom + ZOOM_STEP);
+  if (action === "out") return applyZoom(currentZoom - ZOOM_STEP);
   return applyZoom(DEFAULT_ZOOM); // "reset"
 }
 
-ipcMain.handle("zoom:get", () => currentZoom ?? loadZoom());
+ipcMain.handle("zoom:get", () => currentZoom);
 ipcMain.handle("zoom:step", (_event, action) => stepZoom(action));
 
 // ── Window ────────────────────────────────────────────────────────────────────
@@ -103,10 +85,10 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
   }
 
-  // Re-apply the saved zoom on every load (a dev HMR reload resets it), without
-  // re-writing the file. Ctrl +/- / Ctrl+0 use the same functions as the header.
+  // Re-apply the current in-session zoom on every page load (a dev HMR reload
+  // resets Chromium's zoom). Starts at DEFAULT_ZOOM on each app launch.
   mainWindow.webContents.on("did-finish-load", () =>
-    applyZoom(currentZoom ?? loadZoom(), { persist: false }),
+    applyZoom(currentZoom),
   );
   mainWindow.webContents.on("before-input-event", (event, input) => {
     if (!input.control || input.type !== "keyDown") return;
