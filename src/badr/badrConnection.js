@@ -233,7 +233,7 @@ class BADRConnection {
    * Resets the DOM context to a known state before starting new operations.
    * Automatically recovers from session-timeout by re-logging in.
    */
-  async navigateToAccueil() {
+  async navigateToAccueil({ force = false } = {}) {
     if (!this.page || this.page.isClosed()) {
       log.warn("BADR page is closed – cannot navigate to Accueil");
       return;
@@ -278,7 +278,10 @@ class BADRConnection {
       .isVisible()
       .catch(() => false);
 
-    if (isOnAccueil && menuExists) {
+    // `force`: always reload Accueil. Needed to LEAVE an open declaration — it
+    // lives in an iframe on the same Accueil URL, so the URL check alone can't tell
+    // (and BADR swaps the left menu while a declaration is open).
+    if (isOnAccueil && menuExists && !force) {
       log.info("BADR already on Accueil — skipping navigation");
       return;
     }

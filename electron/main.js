@@ -2216,6 +2216,17 @@ async function runPartielDumFlow(acheminement) {
         `"${id}" — pré-contrôle des lots indisponible (${preErr.message}) — poursuite avec le flux normal.`,
       );
     }
+    // LEAVE the throw-away declaration: back to the BADR Accueil home page. While
+    // a declaration is open BADR swaps the left menu (SAUVEGARDER / VALIDER / …),
+    // so the real run's "DEDOUANEMENT → Créer une déclaration" wouldn't be found
+    // and Step 1 hung. `force` because the draft lives in an iframe on the same
+    // Accueil URL, which the normal "already on Accueil" shortcut can't detect.
+    try {
+      await badrConn.navigateToAccueil({ force: true });
+      sendLog("info", "BADR", `"${id}" — retour à l'Accueil BADR (fin du pré-contrôle).`);
+    } catch (navErr) {
+      sendLog("warn", "BADR", `"${id}" — retour à l'Accueil échoué: ${navErr.message}`);
+    }
     if (preMismatch) {
       // Same state Step 5 would set → the catch below emails the operator
       // (En attente du Nème vol / poids différent) and sets the card badge.

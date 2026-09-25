@@ -372,6 +372,16 @@ class BADRDumNormalPartiel {
     const dedHeader = page
       .locator("#leftMenuId .ui-panelmenu-header a")
       .filter({ hasText: "DEDOUANEMENT" });
+    // If a declaration is still open (e.g. the early pré-contrôle's throw-away, or
+    // a previous failed run), BADR shows the declaration menu instead and the
+    // DEDOUANEMENT menu doesn't exist → go back to Accueil first (otherwise the
+    // click below waits until it times out).
+    if (!(await dedHeader.isVisible().catch(() => false)) && badrConn) {
+      log.warn(
+        "Step 1 — menu DEDOUANEMENT introuvable (déclaration encore ouverte ?) — retour à l'Accueil…",
+      );
+      await badrConn.navigateToAccueil({ force: true });
+    }
     const dedContent = page.locator("#_2000");
     const isOpen = await dedContent.isVisible().catch(() => false);
     if (!isOpen) {

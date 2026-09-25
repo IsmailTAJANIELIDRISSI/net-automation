@@ -5,6 +5,18 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-09-25 — Fix: real run hung after the early pré-contrôle (must go back to BADR Accueil)
+
+**Bug (from the 16EME log):** the early lot pré-contrôle worked ("lots complets"), but the real run's Step 1 then sat on "Opening Créer une déclaration…" forever. The pre-check left BADR inside its throw-away declaration; while a declaration is open BADR swaps the left menu (SAUVEGARDER / VALIDER / SUPPRIMER…), so DEDOUANEMENT → "Créer une déclaration" (`#_2001`) didn't exist.
+
+- `src/badr/badrConnection.js`: `navigateToAccueil({ force })` — `force` always reloads Accueil. The old "already on Accueil — skipping" shortcut can't detect an open declaration (it lives in an iframe on the same Accueil URL).
+- `electron/main.js` (`runPartielDumFlow`): right after the pre-check (match, mismatch or unavailable) → `navigateToAccueil({ force: true })`, logged as "retour à l'Accueil BADR (fin du pré-contrôle)".
+- `src/badr/badrDumNormalPartiel.js` `_step1_openDeclaration`: safety net — if the DEDOUANEMENT menu isn't visible (declaration still open, e.g. after any earlier failed run), go back to Accueil first instead of timing out.
+
+**Files changed:** `src/badr/badrConnection.js`, `electron/main.js`, `src/badr/badrDumNormalPartiel.js`
+
+---
+
 ## 2026-09-25 — "Pas encore manifest": background watcher + BADR/Portnet keepalive
 
 **Gap:** the manifest wait/re-check + BADR keepalive only existed inside the batch monitor, which only starts in a batch that opened a Portnet session (≥ 1 non-partiel LTA). A partiel-only batch, a single "Lancer", or an LTA added mid-run was parked at "En attente manifeste" with no re-check and no session refresh (BADR expires after ~15 min). Portnet was never refreshed during the manifest-only wait either (only polling touched it).
