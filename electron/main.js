@@ -224,7 +224,7 @@ let sharedBadrConn = null;
 // NOTE: while ONLY waiting-manifest LTAs remain, the monitor stays open (browser
 // sessions held) for up to (MAX_MANIFEST_CHECKS - 1) × interval — see
 // MANIFEST_ONLY_MAX_CYCLES in monitorPendingPortnetRequests.
-const MANIFEST_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 h
+const MANIFEST_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 h
 const MAX_MANIFEST_CHECKS = 3;
 const manifestIntervalLabel = () =>
   MANIFEST_CHECK_INTERVAL_MS >= 3_600_000
@@ -356,6 +356,174 @@ async function closeSharedSessions() {
     await sharedBadrConn.disconnect().catch(() => {});
     sharedBadrConn.kill();
     sharedBadrConn = null;
+  }
+}
+
+// ── Session keepalives ─────────────────────────────────────────────────────────
+// BADR expires an idle session after ~15 min and Portnet after a while too; both
+// need a real HTTP request to reset the server-side idle timer.
+
+/** One BADR keepalive: real page reload (sends a request) then back to Accueil. */
+async function badrKeepAliveOnce() {
+  const badrConn = await ensureBadrSession();
+  // A real reload — merely checking the URL (navigateToAccueil when already on
+  // Accueil) sends NO request, so the JSF session would still silently expire.
+  await badrConn.page
+    .reload({ waitUntil: "domcontentloaded", timeout: 30_000 })
+    .catch((reloadErr) =>
+      sendLog(
+        "warn",
+        "BADR",
+        `BADR keepalive reload failed: ${reloadErr.message} — trying navigateToAccueil`,
+      ),
+    );
+  // Ends on Accueil (also handles session-expiry redirects after the reload).
+  await badrConn.navigateToAccueil();
+}
+
+const PORTNET_KEEPALIVE_MS = 5 * 60 * 1000;
+let lastPortnetKeepAlive = 0;
+
+/**
+ * Refresh the Portnet session (throttled to PORTNET_KEEPALIVE_MS). Only touches an
+ * EXISTING session — never opens one (that would demand a CAPTCHA). Uses a goto of
+ * the consultation page (what the monitor's polling does) so it's a real request.
+ */
+async function portnetKeepAliveIfDue(page = sharedPortnetPage) {
+  if (Date.now() - lastPortnetKeepAlive < PORTNET_KEEPALIVE_MS) return;
+  if (!page || page.isClosed()) return;
+  lastPortnetKeepAlive = Date.now();
+  try {
+    sendLog(
+      "info",
+      "Portnet",
+      "Rafraîchissement de la session Portnet (attente du manifeste)…",
+    );
+    await page.goto("https://cargo.portnet.ma/dsCombine/consultation", {
+      waitUntil: "domcontentloaded",
+      timeout: 30_000,
+    });
+  } catch (err) {
+    sendLog("warn", "Portnet", `Keepalive Portnet échoué: ${err.message}`);
+  }
+}
+
+// ── Background "pas encore manifest" watcher ──────────────────────────────────
+// The batch monitor waits for + re-checks missing manifests, but it only exists in
+// a batch that opened a Portnet session (≥ 1 non-partiel LTA). A partiel-only
+// batch, a single "Lancer", or an LTA added mid-run left the LTA parked with no
+// re-check and no session refresh. This watcher covers every path: any LTA that
+// ends "waiting_manifest" is registered; while such LTAs exist and the app is
+// otherwise IDLE it keeps BADR (45 s) and Portnet (5 min) alive and re-runs the
+// LTA once its interval (MANIFEST_CHECK_INTERVAL_MS) has elapsed — up to
+// MAX_MANIFEST_CHECKS. It never runs while any automation is in flight (a reload
+// mid-declaration would be destructive): `appBusy` counts user/watcher runs.
+const MANIFEST_WATCH_TICK_MS = 45_000;
+const manifestWatch = new Map(); // folderPath → { ach }
+let manifestWatchTimer = null;
+let manifestWatchTickRunning = false;
+let appBusy = 0; // in-flight automations (IPC-launched, declare-scellés, watcher)
+let watcherRunning = false; // the watcher's own re-check is in flight
+
+async function withBusy(fn) {
+  appBusy++;
+  try {
+    return await fn();
+  } finally {
+    appBusy--;
+  }
+}
+
+function registerManifestWatch(ach) {
+  if (!ach?.folderPath) return;
+  manifestWatch.set(ach.folderPath, { ach: { ...ach } });
+  if (!manifestWatchTimer) {
+    manifestWatchTimer = setInterval(manifestWatchTick, MANIFEST_WATCH_TICK_MS);
+  }
+}
+
+function stopManifestWatchTimer() {
+  if (manifestWatchTimer) {
+    clearInterval(manifestWatchTimer);
+    manifestWatchTimer = null;
+  }
+}
+
+/** Latest saved (operator-edited) fields win over the registered snapshot. */
+function mergeSavedIntoAch(ach, saved) {
+  const merged = { ...ach };
+  for (const [k, v] of Object.entries(saved || {})) {
+    if (k === CHECKPOINT_KEY) continue;
+    if (v !== null && v !== undefined && String(v).trim() !== "") merged[k] = v;
+  }
+  merged.automationState = saved?.[CHECKPOINT_KEY] || null;
+  return merged;
+}
+
+async function manifestWatchTick() {
+  if (manifestWatchTickRunning) return;
+  manifestWatchTickRunning = true;
+  try {
+    // Drop LTAs that are no longer waiting (progressed, deleted, or out of checks).
+    for (const [fp] of [...manifestWatch]) {
+      const st = fs.existsSync(fp) ? getAutomationState(fp) : null;
+      if (!st || st.phase !== "waiting_manifest") {
+        manifestWatch.delete(fp);
+      } else if ((st.manifestCheckCount || 0) >= MAX_MANIFEST_CHECKS) {
+        sendLog(
+          "info",
+          "BADR",
+          `"${path.basename(fp)}": manifeste toujours absent après ${st.manifestCheckCount} vérifications — arrêt du suivi automatique (relançable).`,
+        );
+        manifestWatch.delete(fp);
+      }
+    }
+    if (manifestWatch.size === 0) {
+      stopManifestWatchTimer();
+      return;
+    }
+
+    // Active work owns the sessions (and keeps them alive by using them; a batch
+    // monitor also runs its own keepalive + re-checks) — stay out of its way.
+    if (appBusy > 0 || batchRunning || monitorActive) return;
+
+    // 1. Keep BADR alive.
+    try {
+      await badrKeepAliveOnce();
+    } catch (err) {
+      sendLog("warn", "BADR", `Keepalive BADR (attente manifeste) échoué: ${err.message}`);
+    }
+
+    // 2. Keep Portnet alive — only if a non-partiel LTA will need it on submit.
+    if ([...manifestWatch.values()].some((e) => !e.ach.partiel)) {
+      await portnetKeepAliveIfDue();
+    }
+
+    // 3. Re-check LTAs whose interval has elapsed.
+    for (const [fp, entry] of [...manifestWatch]) {
+      if (appBusy > 0 || batchRunning || monitorActive) break; // user started work
+      const st = getAutomationState(fp);
+      if (!st || st.phase !== "waiting_manifest") continue;
+      if (manifestCheckThrottled(st)) continue; // not due yet
+      const ach = mergeSavedIntoAch(entry.ach, readAcheminementFile(fp));
+      sendLog(
+        "info",
+        "BADR",
+        `Re-vérification automatique du manifeste pour "${ach.id}" (vérification ${(st.manifestCheckCount || 0) + 1}/${MAX_MANIFEST_CHECKS})…`,
+      );
+      watcherRunning = true;
+      try {
+        await withBusy(() =>
+          ach.partiel ? runPartielDumFlow(ach) : runAutomationTask(ach),
+        );
+      } catch (err) {
+        sendLog("error", "Automation", `Re-vérification "${ach.id}" échouée: ${err.message}`);
+      } finally {
+        watcherRunning = false;
+      }
+    }
+  } finally {
+    manifestWatchTickRunning = false;
   }
 }
 
@@ -690,6 +858,9 @@ async function prepareLotAndWeightCheck(acheminement) {
           `Pas encore manifest pour ${resolvedRef} (vérification ${checks}) — nouvelle vérification dans ~${manifestIntervalLabel()}.`,
         );
         sendProgress(id, "waiting-manifest");
+        // Background watcher keeps sessions alive + re-checks after the interval,
+        // whichever launch path (batch, single Lancer, injected) brought us here.
+        registerManifestWatch(acheminement);
         return { success: false, waitingManifest: true };
       }
 
@@ -1418,22 +1589,7 @@ async function monitorPendingPortnetRequests(
         "BADR",
         "Refreshing BADR session to prevent timeout during Portnet polling...",
       );
-      const badrConn = await ensureBadrSession();
-      // Always do a real page reload so the BADR *server* receives an HTTP request
-      // and its session idle timer is reset.  Merely checking the URL with
-      // navigateToAccueil() when already on Accueil sends NO request to the server
-      // and the JSF session will silently expire after the server's idle timeout.
-      await badrConn.page
-        .reload({ waitUntil: "domcontentloaded", timeout: 30_000 })
-        .catch((reloadErr) =>
-          sendLog(
-            "warn",
-            "BADR",
-            `BADR keepalive reload failed: ${reloadErr.message} — trying navigateToAccueil`,
-          ),
-        );
-      // Ensure we end up on Accueil (handles session-expiry redirects after reload).
-      await badrConn.navigateToAccueil();
+      await badrKeepAliveOnce(); // real reload + back to Accueil (shared helper)
       sendLog(
         "info",
         "BADR",
@@ -1497,6 +1653,9 @@ async function monitorPendingPortnetRequests(
             `En attente du manifeste pour ${manifestRetry.length} LTA(s) — prochaine vérification BADR selon l'intervalle (${manifestIntervalLabel()}).`,
           );
         }
+        // Portnet is only refreshed by polling when something is submitted; while we
+        // just wait for a manifest nothing touches it, so keep it alive here.
+        await portnetKeepAliveIfDue(portnetPage);
         const d = Date.now() + 60_000;
         while (Date.now() < d) {
           if (injectionQueue.length > 0) break;
@@ -1978,6 +2137,7 @@ async function runPartielDumFlow(acheminement) {
         "BADR",
         `Pas encore manifest pour ${resolvedRef} (vérification ${checks}) — nouvelle vérification dans ~${manifestIntervalLabel()}.`,
       );
+      registerManifestWatch(acheminement); // background re-check + keepalive
       return { success: false, waitingManifest: true };
     }
 
@@ -3248,16 +3408,22 @@ function tryQueueDuringActiveBatch(items) {
 }
 
 // ── IPC: Run automation for one acheminement ──────────────────────────────────
+const WATCHER_BUSY_MSG =
+  "Une re-vérification automatique du manifeste est en cours — réessayez dans un instant.";
+
 ipcMain.handle("automation:run", async (_event, acheminement) => {
   const queued = tryQueueDuringActiveBatch([acheminement]);
   if (queued) return queued;
-  return await runAutomationTask(acheminement);
+  // The background manifest watcher is mid re-check on the shared BADR page.
+  if (watcherRunning) return { success: false, busy: true, error: WATCHER_BUSY_MSG };
+  return await withBusy(() => runAutomationTask(acheminement));
 });
 
 ipcMain.handle("automation:run-all", async (_event, acheminements) => {
   const queued = tryQueueDuringActiveBatch(acheminements || []);
   if (queued) return queued;
-  return await runAllAutomationTasks(acheminements || []);
+  if (watcherRunning) return { success: false, busy: true, error: WATCHER_BUSY_MSG };
+  return await withBusy(() => runAllAutomationTasks(acheminements || []));
 });
 
 ipcMain.handle("automation:close-sessions", async () => {
@@ -3443,7 +3609,21 @@ ipcMain.handle(
       sendProgress(id, "running");
       return { ok: true, queued: true };
     }
-    return await declareScellesPartielFlow(folderPath, signedSerie);
+    // The background manifest watcher is mid re-check on the shared BADR page:
+    // don't run two BADR flows at once. Put the card back on its signature panel
+    // (the UI had already flipped it to "running") and ask to retry.
+    if (watcherRunning) {
+      const id = path.basename(folderPath);
+      const st = getAutomationState(folderPath);
+      sendProgress(id, "partiel-waiting-signature", {
+        dumSerie: st?.dumSerie,
+        dumCle: st?.dumCle,
+        error: WATCHER_BUSY_MSG,
+      });
+      return { ok: false, error: WATCHER_BUSY_MSG };
+    }
+    // Counted as busy so the manifest watcher never reloads BADR mid-declaration.
+    return await withBusy(() => declareScellesPartielFlow(folderPath, signedSerie));
   },
 );
 
@@ -3456,5 +3636,7 @@ app.on("before-quit", async () => {
     }
     folderWatcher = null;
   }
+  stopManifestWatchTimer();
+  manifestWatch.clear();
   await closeSharedSessions();
 });

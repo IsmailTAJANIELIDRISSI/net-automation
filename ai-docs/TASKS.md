@@ -103,6 +103,7 @@ The core automation flow is **fully implemented and working in production**:
   - `src/badr/badrDumNormalPartiel.js` `_uploadOne`: replaced the `.ui-blockui-content.first().waitFor({hidden})` (matched an already-hidden node → instant false "upload failed" on slow BADR) with a patient poll on `.ui-blockui-content:visible` until it clears (up to 3 min), then the document-row check
   - Fixes false FACTURE upload failures when BADR is slow/down
 
+- **Manifest watcher + session keepalive ✅** (2026-09-25): LTAs left at "pas encore manifest" from ANY launch path (partiel-only batch, single Lancer, mid-run) are re-checked every `MANIFEST_CHECK_INTERVAL_MS` (1 h, max 3) by a background watcher (`manifestWatchTick` in `electron/main.js`), which also keeps BADR (45 s) and an existing Portnet session (5 min) alive while idle; it never runs during other automations (`withBusy`/`appBusy`). Not auto-registered for LTAs already waiting from a previous session
 - **Pré-apurement flow documented ✅** (2026-09-24): see `ai-docs/PREAPUREMENT-FLOW.md` — every colis/poids outcome for DS Combinée and partiel (phases, badges, emails, tolerances)
   - Open item found while documenting: `_step5_preapurement` hard-codes année `"2026"` for each partiel lot (should use the lot's own année)
 
