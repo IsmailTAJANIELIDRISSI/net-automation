@@ -5,6 +5,27 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-09-25 — "Pas encore manifest": background watcher + BADR/Portnet keepalive
+
+**Gap:** the manifest wait/re-check + BADR keepalive only existed inside the batch monitor, which only starts in a batch that opened a Portnet session (≥ 1 non-partiel LTA). A partiel-only batch, a single "Lancer", or an LTA added mid-run was parked at "En attente manifeste" with no re-check and no session refresh (BADR expires after ~15 min). Portnet was never refreshed during the manifest-only wait either (only polling touched it).
+
+**Fix (`electron/main.js`):**
+- **Background watcher.** Any LTA that ends `waiting_manifest` (both `prepareLotAndWeightCheck` and `runPartielDumFlow`) is registered via `registerManifestWatch`. A 45 s timer (`manifestWatchTick`) runs only while such LTAs exist AND the app is idle (`appBusy === 0`, no `batchRunning`/`monitorActive`): it (1) refreshes BADR (`badrKeepAliveOnce` — real reload + back to Accueil), (2) refreshes Portnet every 5 min (`portnetKeepAliveIfDue`, only if a session already exists and a non-partiel LTA is waiting — never opens one, so no surprise CAPTCHA), (3) re-runs each LTA once `MANIFEST_CHECK_INTERVAL_MS` (1 h) has elapsed — `runPartielDumFlow` or the full `runAutomationTask` — using the registered snapshot merged with the latest saved (operator-edited) fields. Stops per LTA when it progresses, its folder is deleted, or `MAX_MANIFEST_CHECKS` is reached.
+- **Busy accounting.** `automation:run`, `automation:run-all` and `automation:declare-scelles-partiel` are wrapped in `withBusy`, so the watcher never reloads BADR mid-declaration. While the watcher's own re-check is in flight (`watcherRunning`) a new Lancer / Tout lancer / Déclarer scellés is refused with "re-vérification automatique en cours — réessayez" (the signature card is restored to its panel); if that re-check has already reached the monitor phase, launches queue into it as usual.
+- **Monitor.** Its inline BADR keepalive now uses the shared `badrKeepAliveOnce`, and its manifest-only wait now also refreshes Portnet.
+
+Limits: LTAs already `waiting_manifest` from a previous app session are NOT auto-registered on startup (the watcher only follows LTAs launched in this session; opening the app must not silently log into BADR). Re-launch them once and they're followed again. The 1 h re-check for a non-partiel LTA that finally finds its manifest needs a live Portnet session — kept alive here, but if it expired the submit prompts the CAPTCHA.
+
+**Files changed:** `electron/main.js`
+
+---
+
+## 2026-09-25 — "Pas encore manifest" re-check interval: 6 h → 1 h
+
+`MANIFEST_CHECK_INTERVAL_MS` is now `60 * 60 * 1000` (1 h). Everything derived from it follows automatically: the monitor's manifest-only wait cap (`MANIFEST_ONLY_MAX_CYCLES` = (3−1) × 60 + 60 = 180 min ≈ 3 h, so the browsers are held ≈ 3 h instead of ≈ 13 h) and the log wording ("dans ~1 h"). Still max 3 checks, email only once, last-check time persisted across restarts. **Files changed:** `electron/main.js`
+
+---
+
 ## 2026-09-25 — Partiel: pré-apurement check BEFORE filling the declaration
 
 Two or more lots in the lot lookup used to go straight into filling the BADR partial declaration (Entête → Transport → Caution) and only checked colis/poids at Step 5 — so a partiel still missing its 3rd/4th vol was discovered after all that work (see the 16EME log: steps 1–4 ran, then "En attente du 3ème vol").
