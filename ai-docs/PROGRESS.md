@@ -5,6 +5,20 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-09-25 — Partiel: pré-apurement check BEFORE filling the declaration
+
+Two or more lots in the lot lookup used to go straight into filling the BADR partial declaration (Entête → Transport → Caution) and only checked colis/poids at Step 5 — so a partiel still missing its 3rd/4th vol was discovered after all that work (see the 16EME log: steps 1–4 ran, then "En attente du 3ème vol").
+
+- `src/badr/badrDumNormalPartiel.js`: new `precheckLots(ach, badrConn)` — opens a throw-away declaration (`_step1_openDeclaration`), runs `_step5_preapurement` over all lots, saves nothing. New `mismatchStatePatch(result)` (the state Step 5 writes on a mismatch), now shared by `run()` and the pre-check.
+- `electron/main.js` (`runPartielDumFlow`): after the lots are collected and before `dum.run`, run the pre-check. Mismatch → set the same state and throw into the existing catch, which sends the usual email ("En attente du Nème vol" / poids différent) and sets the card badge. Match → continue. **Fail-open**: if the pre-check itself errors, log a warning and run the normal flow (Step 5 remains the safety net).
+- Cost: a complete partiel now does the lot registration twice (pre-check + real Step 5), roughly +40–60 s; an incomplete one stops after ~1 min instead of after Steps 1–4. `ai-docs/PREAPUREMENT-FLOW.md` §4 updated.
+
+Not yet verified against live BADR: running Step 5 right after Step 1 (before Entête) in the throw-away declaration. If it misbehaves, the fail-open path keeps the old flow working.
+
+**Files changed:** `src/badr/badrDumNormalPartiel.js`, `electron/main.js`, `ai-docs/PREAPUREMENT-FLOW.md`
+
+---
+
 ## 2026-09-24 — "Pas encore manifest" re-check interval: 15 min → 6 h
 
 `MANIFEST_CHECK_INTERVAL_MS` is now `6 * 60 * 60 * 1000` (was 15 min) in `electron/main.js`. Still persisted in `manifestLastCheckAt` (a relaunch after 6 h re-checks) and still `MAX_MANIFEST_CHECKS = 3`, email only once.

@@ -93,6 +93,20 @@ the whole pré-apurement block (*Recherche du lot* + *Lot de dédouanement* + *C
 
 ## 4. Partiel LTA (DUM Normale Partiel): Step 5
 
+**Early check (since 2026-09-25).** Finding 2 or more lots in the lot lookup does not
+mean the LTA is complete — it may be a 3-, 4- or 5-vol partiel whose next flight is not
+registered yet. So `runPartielDumFlow` now runs the Step 5 comparison **before** filling
+the real declaration: `precheckLots` opens a throw-away partiel declaration (Step 1),
+registers every lot in Préapurement DS with the exact Step 5 code, and compares the
+summed colis/poids with the manifest. Nothing is saved; the real run then opens a fresh
+declaration. If the totals do not match, the LTA stops immediately with the same states
+and emails as Step 5 below (P1/P2 — "En attente du Nème vol" or weight mismatch), without
+Entête/Transport/Caution ever being filled. If the totals match, the run continues
+(and Step 5 checks again inside the real declaration, which also applies the ≤ 1 kg
+rounding correction). The pre-check is **fail-open**: if it cannot run (BADR or selector
+problem) it logs "pré-contrôle des lots indisponible" and the normal flow proceeds, where
+Step 5 is still the safety net.
+
 A partiel LTA has several lots (one per flight), so the reader is not used; instead
 `_step5_preapurement` loops over `ach.partiels`. For each lot it clicks *Nouveau*, fills
 the reference exactly as BADR listed it (série, clé, lieu, référence lot), clicks *OK*,

@@ -2017,6 +2017,52 @@ async function runPartielDumFlow(acheminement) {
       `"${id}" — ${lotResult.partiels.length} lots collectés`,
     );
 
+    // ── EARLY pré-apurement check ────────────────────────────────────────────
+    // 2+ lots in BADR ≠ complete: the LTA may be a 3/4/5-vol partiel whose next
+    // flight isn't registered yet. Check the lots' summed colis/poids against the
+    // manifest BEFORE filling Entête/Transport/Caution (in a throw-away
+    // declaration), so an incomplete LTA stops right away as "en attente du Nème
+    // vol" instead of after a half-filled declaration. Fail-open: if the check
+    // itself can't run, fall through to the normal flow (Step 5 still checks).
+    let preMismatch = null;
+    try {
+      sendLog(
+        "info",
+        "BADR",
+        `"${id}" — pré-contrôle pré-apurement des ${lotResult.partiels.length} lots (avant de remplir la déclaration)…`,
+      );
+      const pre = new BADRDumNormalPartiel(badrConn.page);
+      const preRes = await pre.precheckLots(
+        {
+          ...acheminement,
+          partiels: lotResult.partiels,
+          automationState: getAutomationState(folderPath),
+        },
+        badrConn,
+      );
+      if (preRes?.mismatch) {
+        preMismatch = { res: preRes, patch: pre.mismatchStatePatch(preRes) };
+      } else {
+        sendLog(
+          "info",
+          "BADR",
+          `"${id}" — lots complets (colis/poids conformes au manifeste) — remplissage de la déclaration…`,
+        );
+      }
+    } catch (preErr) {
+      sendLog(
+        "warn",
+        "BADR",
+        `"${id}" — pré-contrôle des lots indisponible (${preErr.message}) — poursuite avec le flux normal.`,
+      );
+    }
+    if (preMismatch) {
+      // Same state Step 5 would set → the catch below emails the operator
+      // (En attente du Nème vol / poids différent) and sets the card badge.
+      updateAutomationState(folderPath, preMismatch.patch);
+      throw new Error(preMismatch.res.errorMessage);
+    }
+
     // ── Run DUM declaration
     const freshAch = {
       ...acheminement,

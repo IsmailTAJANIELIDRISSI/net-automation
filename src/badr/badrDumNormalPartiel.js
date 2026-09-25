@@ -141,25 +141,8 @@ class BADRDumNormalPartiel {
         // waiting_vol = colis sum ≠ manifest (more flights to come);
         // poids = colis OK but weight differs. main.js reads `poidsMismatch`
         // from the state to send the right email + screenshot.
-        const phase =
-          result.kind === "waiting_vol"
-            ? "partiel_waiting_lots"
-            : "partiel_poids_mismatch";
         log.warn(`Step 5 — ${result.errorMessage} (${result.kind})`);
-        updateState({
-          phase,
-          errorMessage: result.errorMessage,
-          nextVol: result.nextVol ?? null,
-          poidsMismatch: {
-            kind: result.kind,
-            nextVol: result.nextVol ?? null,
-            totalPoids: result.totalPoids,
-            totalNbr: result.totalNbr,
-            expectedPoids: result.expectedPoids,
-            expectedNbr: result.expectedNbr,
-            screenshotPath: result.screenshotPath ?? null,
-          },
-        });
+        updateState(this.mismatchStatePatch(result));
         throw new Error(result.errorMessage);
       }
       // Rounding diff ≤ 1 kg: use lot-authoritative poids for all downstream steps.
@@ -280,6 +263,57 @@ class BADRDumNormalPartiel {
    *   immediately after an action without throwing).
    * Returns whatever the step function returns.
    */
+  // Checkpoint patch for a Step 5 mismatch result. main.js reads `poidsMismatch`
+  // from the state to send the right email/badge. Shared by run() and the early
+  // precheck so both produce the exact same state.
+  mismatchStatePatch(result) {
+    return {
+      phase:
+        result.kind === "waiting_vol"
+          ? "partiel_waiting_lots"
+          : "partiel_poids_mismatch",
+      errorMessage: result.errorMessage,
+      nextVol: result.nextVol ?? null,
+      poidsMismatch: {
+        kind: result.kind,
+        nextVol: result.nextVol ?? null,
+        totalPoids: result.totalPoids,
+        totalNbr: result.totalNbr,
+        expectedPoids: result.expectedPoids,
+        expectedNbr: result.expectedNbr,
+        screenshotPath: result.screenshotPath ?? null,
+      },
+    };
+  }
+
+  /**
+   * EARLY pré-apurement check — run BEFORE the real declaration is filled.
+   *
+   * Two or more lots in BADR do not mean the LTA is complete (it may be a 3-, 4-,
+   * 5-vol partiel whose next flight isn't registered yet). Rather than filling
+   * Entête / Transport / Caution and only discovering that at Step 5, open a
+   * throw-away declaration, register every lot in Préapurement DS (the exact Step
+   * 5 code) and compare the summed colis / poids with the manifest.
+   *
+   * Nothing is saved: the declaration is abandoned, the real run starts a fresh
+   * one. Returns Step 5's result ({ mismatch: false, ... } or { mismatch: true,
+   * kind: "waiting_vol" | "poids", ... }). Throws on BADR/selector problems — the
+   * caller treats that as "check unavailable" and carries on with the normal flow.
+   */
+  async precheckLots(ach, badrConn) {
+    const iframe = this.page.frameLocator("#iframeMenu");
+    await this._guardStep(
+      "precheck_open_declaration",
+      () => this._step1_openDeclaration(iframe, badrConn),
+      badrConn,
+    );
+    return await this._guardStep(
+      "precheck_preapurement",
+      () => this._step5_preapurement(iframe, ach),
+      badrConn,
+    );
+  }
+
   async _guardStep(label, stepFn, badrConn) {
     let result;
     try {
