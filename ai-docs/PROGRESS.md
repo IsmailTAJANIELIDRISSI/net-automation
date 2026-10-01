@@ -5,6 +5,20 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-10-01 — Manifest re-check: never give up automatically + a manual click sweeps ALL waiting LTAs
+
+Follow-up to the same-day "Ajouter au traitement silently did nothing" fix (below) — the log from that fix working (`forceManifestRecheck`) also showed a SEPARATE problem: after `MAX_MANIFEST_CHECKS = 3` checks, both the monitor (`retryWaitingManifest`) and the idle background watcher (`manifestWatchTick`) dropped the LTA entirely — `"manifeste toujours absent après N vérifications — arrêt du suivi"` — even while OTHER LTAs in the same batch were still being actively polled for "Acceptée" on Portnet. From then on nothing re-checked it automatically; it needed a fresh manual relaunch.
+
+**Fix — never give up (`electron/main.js`):**
+- Removed the `manifestCheckCount >= MAX_MANIFEST_CHECKS` drop from `retryWaitingManifest()` (monitor) and `manifestWatchTick()` (idle watcher). A waiting-manifest LTA is now re-checked every `MANIFEST_CHECK_INTERVAL_MS` (1 h) for as long as the app runs — never auto-dropped (only removed when it actually progresses, is deleted, or the folder is gone). Removed the now-unused `MAX_MANIFEST_CHECKS` constant.
+- `MANIFEST_ONLY_MAX_CYCLES` (the monitor's own idle-loop lifetime cap, previously derived from `MAX_MANIFEST_CHECKS` ≈ 3 h) is now a flat, generous crash-safety backstop (~30 days of 1-min cycles) that should never fire in normal use — not a deliberate give-up point.
+
+**Also — one manual click now sweeps every waiting-manifest LTA, not just the one clicked** (per the user's explicit ask): `retryWaitingManifest(force = false)` — when `force` is true it bypasses the interval for every item in `manifestRetry`, and the inner `runAutomationTask` call now also receives `forceManifestRecheck: force` (needed — its own independent throttle guard would otherwise silently re-block it). `drainInjectionQueue()` calls `retryWaitingManifest(true)` whenever the operator has just queued anything via Lancer / Tout lancer / Ajouter au traitement, covering the "a batch/monitor is already running" case. For the no-batch case, new `sweepManifestWatchExcept(excludeFolderPath)` sweeps every OTHER entry in the idle watcher's `manifestWatch` registry; wired into the `automation:run` IPC right after the single Lancer's own run.
+
+**Files changed:** `electron/main.js`
+
+---
+
 ## 2026-10-01 — Fix: "Ajouter au traitement" silently did nothing for a waiting-manifest LTA
 
 **Bug (from the log):** with 3 LTAs sitting at `waiting_manifest` (manifest re-check interval 1 h), the operator clicked "Ajouter au traitement" / "Tout lancer" to force an immediate re-check. The log showed `Starting automation for: 2EME …` — the very first line inside `runAutomationTask` — then nothing: no BADR activity, no error, no further log line. The card just stayed on "waiting-manifest". From the operator's side, the click visibly did nothing.

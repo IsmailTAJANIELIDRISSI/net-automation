@@ -217,15 +217,15 @@ let sharedBadrConn = null;
 
 // "Pas encore manifest" throttling. A waiting-manifest LTA is re-checked in BADR
 // at most once every MANIFEST_CHECK_INTERVAL_MS (persisted via manifestLastCheckAt
-// — survives app restarts, so a relaunch after the interval re-checks), and the
-// monitor stops retrying after MAX_MANIFEST_CHECKS checks (the LTA stays
-// "waiting_manifest", re-launchable later). The email fires only once
-// (manifestNotified). This kills the previous once-a-minute re-check + mail spam.
-// NOTE: while ONLY waiting-manifest LTAs remain, the monitor stays open (browser
-// sessions held) for up to (MAX_MANIFEST_CHECKS - 1) × interval — see
-// MANIFEST_ONLY_MAX_CYCLES in monitorPendingPortnetRequests.
+// — survives app restarts, so a relaunch after the interval re-checks). It is
+// NEVER dropped automatically — the app keeps re-checking every interval for as
+// long as it runs (the operator can always force an immediate re-check sooner by
+// clicking Lancer / Tout lancer / Ajouter au traitement, which also sweeps every
+// OTHER currently-waiting LTA — see forceManifestRecheck, retryWaitingManifest's
+// `force` param, and sweepManifestWatchExcept). The "pas encore manifest" email
+// fires only once per LTA (manifestNotified). This kills the previous
+// once-a-minute re-check + mail spam.
 const MANIFEST_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 h
-const MAX_MANIFEST_CHECKS = 3;
 const manifestIntervalLabel = () =>
   MANIFEST_CHECK_INTERVAL_MS >= 3_600_000
     ? `${+(MANIFEST_CHECK_INTERVAL_MS / 3_600_000).toFixed(1)} h`
@@ -415,9 +415,9 @@ async function portnetKeepAliveIfDue(page = sharedPortnetPage) {
 // re-check and no session refresh. This watcher covers every path: any LTA that
 // ends "waiting_manifest" is registered; while such LTAs exist and the app is
 // otherwise IDLE it keeps BADR (45 s) and Portnet (5 min) alive and re-runs the
-// LTA once its interval (MANIFEST_CHECK_INTERVAL_MS) has elapsed — up to
-// MAX_MANIFEST_CHECKS. It never runs while any automation is in flight (a reload
-// mid-declaration would be destructive): `appBusy` counts user/watcher runs.
+// LTA once its interval (MANIFEST_CHECK_INTERVAL_MS) has elapsed — indefinitely,
+// never giving up automatically. It never runs while any automation is in flight
+// (a reload mid-declaration would be destructive): `appBusy` counts user/watcher runs.
 const MANIFEST_WATCH_TICK_MS = 45_000;
 const manifestWatch = new Map(); // folderPath → { ach }
 let manifestWatchTimer = null;
@@ -464,17 +464,12 @@ async function manifestWatchTick() {
   if (manifestWatchTickRunning) return;
   manifestWatchTickRunning = true;
   try {
-    // Drop LTAs that are no longer waiting (progressed, deleted, or out of checks).
+    // Drop LTAs that are no longer waiting (progressed past waiting_manifest, or
+    // their folder was deleted). NEVER drop one just for having been checked many
+    // times — keep re-checking every MANIFEST_CHECK_INTERVAL_MS indefinitely.
     for (const [fp] of [...manifestWatch]) {
       const st = fs.existsSync(fp) ? getAutomationState(fp) : null;
       if (!st || st.phase !== "waiting_manifest") {
-        manifestWatch.delete(fp);
-      } else if ((st.manifestCheckCount || 0) >= MAX_MANIFEST_CHECKS) {
-        sendLog(
-          "info",
-          "BADR",
-          `"${path.basename(fp)}": manifeste toujours absent après ${st.manifestCheckCount} vérifications — arrêt du suivi automatique (relançable).`,
-        );
         manifestWatch.delete(fp);
       }
     }
@@ -509,7 +504,7 @@ async function manifestWatchTick() {
       sendLog(
         "info",
         "BADR",
-        `Re-vérification automatique du manifeste pour "${ach.id}" (vérification ${(st.manifestCheckCount || 0) + 1}/${MAX_MANIFEST_CHECKS})…`,
+        `Re-vérification automatique du manifeste pour "${ach.id}" (vérification ${(st.manifestCheckCount || 0) + 1})…`,
       );
       watcherRunning = true;
       try {
@@ -524,6 +519,46 @@ async function manifestWatchTick() {
     }
   } finally {
     manifestWatchTickRunning = false;
+  }
+}
+
+// Force-recheck every OTHER currently-tracked waiting-manifest LTA (used only on
+// the NO-ACTIVE-BATCH path — see automation:run). The operator clicking Lancer on
+// one LTA is treated as "check BADR now" for every waiting-manifest LTA the app
+// knows about, not just the one clicked. `excludeFolderPath` is the LTA already
+// just handled directly by the caller (skip it — don't double-run it).
+// Runs sequentially (one BADR session) and best-effort: one failure logs and
+// continues to the next rather than aborting the whole sweep.
+async function sweepManifestWatchExcept(excludeFolderPath) {
+  const others = [...manifestWatch.entries()].filter(
+    ([fp]) => fp !== excludeFolderPath,
+  );
+  if (others.length === 0) return;
+  sendLog(
+    "info",
+    "BADR",
+    `Re-vérification manifeste demandée — ${others.length} autre(s) LTA(s) en attente également re-vérifiée(s)…`,
+  );
+  for (const [fp, entry] of others) {
+    const st = fs.existsSync(fp) ? getAutomationState(fp) : null;
+    if (!st || st.phase !== "waiting_manifest") {
+      manifestWatch.delete(fp); // progressed/deleted meanwhile — drop it
+      continue;
+    }
+    const ach = mergeSavedIntoAch(entry.ach, readAcheminementFile(fp));
+    try {
+      await withBusy(() =>
+        ach.partiel
+          ? runPartielDumFlow(ach)
+          : runAutomationTask(ach, { forceManifestRecheck: true }),
+      );
+    } catch (err) {
+      sendLog(
+        "error",
+        "Automation",
+        `Re-vérification "${ach.id}" échouée: ${err.message}`,
+      );
+    }
   }
 }
 
@@ -842,8 +877,8 @@ async function prepareLotAndWeightCheck(acheminement) {
 
       if (lotInfo.isEmpty) {
         // NOT a hard error — the manifest just isn't in BADR yet. Retryable
-        // "waiting_manifest" state; the monitor re-checks it (throttled to once
-        // per MANIFEST_CHECK_INTERVAL_MS, max MAX_MANIFEST_CHECKS) and picks it up as soon as it appears.
+        // "waiting_manifest" state; the monitor re-checks it (throttled to once per
+        // MANIFEST_CHECK_INTERVAL_MS, indefinitely) and picks it up as soon as it appears.
         const checks = (priorState?.manifestCheckCount || 0) + 1;
         updateAutomationState(folderPath, {
           phase: "waiting_manifest",
@@ -1506,12 +1541,15 @@ async function monitorPendingPortnetRequests(
 
   if (pending.size === 0 && manifestRetry.length === 0) return;
 
-  // ── Re-check "pas encore manifest" LTAs (throttled) ────────────────────────
-  // Their manifest wasn't in BADR yet. Re-run the lot lookup (+ submit) — but at
-  // most once per MANIFEST_CHECK_INTERVAL_MS (manifestCheckThrottled) and only until the check count
-  // reaches MAX_MANIFEST_CHECKS, then drop it from the retry list so the batch can
-  // end (it stays "waiting_manifest", re-launchable later — e.g. tomorrow).
-  async function retryWaitingManifest() {
+  // ── Re-check "pas encore manifest" LTAs ─────────────────────────────────────
+  // Their manifest wasn't in BADR yet. Re-run the lot lookup (+ submit) — at most
+  // once per MANIFEST_CHECK_INTERVAL_MS (manifestCheckThrottled) — and NEVER give
+  // up: it stays in manifestRetry indefinitely, re-checked every interval for as
+  // long as this monitor runs. `force=true` (passed from drainInjectionQueue when
+  // the operator just queued a Lancer/Tout lancer/Ajouter au traitement) bypasses
+  // the interval for THIS pass only, so a manual click re-checks every
+  // waiting-manifest LTA right away instead of waiting out the hour.
+  async function retryWaitingManifest(force = false) {
     if (manifestRetry.length === 0) return 0;
     let submitted = 0;
     const stillWaiting = [];
@@ -1531,24 +1569,26 @@ async function monitorPendingPortnetRequests(
         if (!pending.has(ach.id)) pending.set(ach.id, ach);
         continue;
       }
-      if ((st?.manifestCheckCount || 0) >= MAX_MANIFEST_CHECKS) {
-        sendLog(
-          "info",
-          "BADR",
-          `"${ach.id}": manifeste toujours absent après ${st?.manifestCheckCount} vérifications — arrêt du suivi (relançable plus tard).`,
-        );
-        continue; // drop — no more retries this session
-      }
-      if (manifestCheckThrottled(st)) {
+      if (!force && manifestCheckThrottled(st)) {
         stillWaiting.push(ach); // interval not elapsed since last check — wait, no BADR work
         continue;
       }
-      sendLog("info", "BADR", `Vérification manifeste pour "${ach.id}"…`);
+      sendLog(
+        "info",
+        "BADR",
+        force
+          ? `Vérification manifeste pour "${ach.id}" (demandée par l'utilisateur)…`
+          : `Vérification manifeste pour "${ach.id}"…`,
+      );
       let r;
       try {
+        // Pass `force` through: retryWaitingManifest's own throttle check above was
+        // already bypassed for a forced sweep, but runAutomationTask has its OWN
+        // independent throttle guard — without this it would silently re-block here.
         r = await runAutomationTask(ach, {
           stopAfterSubmit: true,
           sharedPortnetPage: portnetPage,
+          forceManifestRecheck: force,
         });
       } catch (e) {
         sendLog("error", "Automation", `Nouvelle tentative "${ach.id}" échouée: ${e.message}`);
@@ -1584,6 +1624,11 @@ async function monitorPendingPortnetRequests(
     if (injectionQueue.length === 0) return 0;
     const reqs = injectionQueue.splice(0);
     let submitted = 0;
+    // The operator just clicked Lancer / Tout lancer / Ajouter au traitement — that
+    // IS a "check BADR now" request. Opportunistically force-recheck EVERY
+    // currently-waiting-manifest LTA in this batch (not just the one(s) queued),
+    // bypassing the 1 h interval for this one pass.
+    submitted += await retryWaitingManifest(/* force */ true);
     for (const ach of reqs) {
       // Use the ach exactly as the UI sent it — it carries the operator's edits
       // (e.g. a corrected totalValue). Re-scanning would let PDF extraction
@@ -1670,14 +1715,13 @@ async function monitorPendingPortnetRequests(
   }, 45000); // 45 seconds — frequent enough to keep BADR session alive
 
   const maxAttempts = 240;
-  // While only waiting-manifest LTAs remain the loop ticks once a minute, so the
-  // cap must outlast the re-check schedule: checks happen at t=0 then every
-  // MANIFEST_CHECK_INTERVAL_MS, the last one at (MAX_MANIFEST_CHECKS-1)×interval.
-  // (A flat 240 cycles = 4 h would quit before the first 6 h re-check ever ran.)
-  const MANIFEST_ONLY_MAX_CYCLES =
-    Math.ceil(
-      ((MAX_MANIFEST_CHECKS - 1) * MANIFEST_CHECK_INTERVAL_MS) / 60_000,
-    ) + 60;
+  // While only waiting-manifest LTAs remain the loop ticks once a minute and keeps
+  // re-checking every MANIFEST_CHECK_INTERVAL_MS FOREVER (no automatic give-up —
+  // the operator can always force an immediate re-check sooner via Lancer / Tout
+  // lancer / Ajouter au traitement). This cap is only a crash-safety backstop
+  // against a genuinely stuck/runaway loop, set far beyond any realistic wait
+  // (~30 days of 1-min cycles) so it never fires in normal use.
+  const MANIFEST_ONLY_MAX_CYCLES = 30 * 24 * 60;
   let manifestOnlyCycles = 0;
   monitorActive = true;
   try {
@@ -3539,9 +3583,17 @@ ipcMain.handle("automation:run", async (_event, acheminement) => {
   // The background manifest watcher is mid re-check on the shared BADR page.
   if (watcherRunning) return { success: false, busy: true, error: WATCHER_BUSY_MSG };
   // Explicit "Lancer" click — re-check the manifest now, don't wait out the interval.
-  return await withBusy(() =>
+  const result = await withBusy(() =>
     runAutomationTask(acheminement, { forceManifestRecheck: true }),
   );
+  // No batch/monitor is running here (we'd have been queued above otherwise) — the
+  // operator clicking Lancer is treated as "check BADR now" for every OTHER
+  // waiting-manifest LTA too (the idle background watcher's registry), not just
+  // this one. Best-effort; failures here don't affect the result already computed.
+  await sweepManifestWatchExcept(acheminement?.folderPath).catch((err) =>
+    sendLog("warn", "BADR", `Balayage manifeste échoué: ${err.message}`),
+  );
+  return result;
 });
 
 ipcMain.handle("automation:run-all", async (_event, acheminements) => {
