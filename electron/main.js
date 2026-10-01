@@ -1405,6 +1405,63 @@ async function monitorPendingPortnetRequests(
   const dsCombine = new PortnetDsCombine(portnetPage);
   // LTAs whose manifest wasn't in BADR yet — re-checked each poll cycle.
   const manifestRetry = [...(waitingManifestAchs || [])];
+  // LTAs whose BADR finalization (PDF download + scellés) failed once — retried
+  // automatically a few times with a cooldown (e.g. a slow BADR PDF render or a
+  // missed click; see badrDsCombineFinalize.js). folderPath → { ach, attempts, nextAttemptAt }.
+  const finalizeRetry = new Map();
+  const FINALIZE_MAX_ATTEMPTS = 3;
+  const FINALIZE_RETRY_COOLDOWN_MS = 60_000;
+
+  /** finalizeAcceptedOnBadr wrapped with the badrBusy guard (keepalive-safe). */
+  async function attemptFinalize(ach, badrRef) {
+    badrBusy = true;
+    try {
+      return await finalizeAcceptedOnBadr(ach, badrRef);
+    } finally {
+      badrBusy = false;
+    }
+  }
+
+  /** Re-attempt finalizations that failed, once their cooldown has elapsed. */
+  async function retryFailedFinalizations() {
+    if (finalizeRetry.size === 0) return 0;
+    let done = 0;
+    const now = Date.now();
+    for (const [fp, entry] of [...finalizeRetry]) {
+      if (!fs.existsSync(fp)) {
+        finalizeRetry.delete(fp);
+        continue;
+      }
+      const st = getAutomationState(fp);
+      // Already resolved elsewhere (e.g. a manual "Réessayer" click) → stop.
+      if (!st?.badrRef || st.phase === "badr_done") {
+        finalizeRetry.delete(fp);
+        continue;
+      }
+      if (now < entry.nextAttemptAt) continue; // cooldown not elapsed yet
+      sendLog(
+        "info",
+        "BADR",
+        `Nouvelle tentative de finalisation BADR (${entry.attempts + 1}/${FINALIZE_MAX_ATTEMPTS}) pour "${entry.ach.id}"…`,
+      );
+      const res = await attemptFinalize(entry.ach, st.badrRef);
+      if (res?.success) {
+        finalizeRetry.delete(fp);
+        done++;
+      } else if (entry.attempts + 1 >= FINALIZE_MAX_ATTEMPTS) {
+        finalizeRetry.delete(fp);
+        sendLog(
+          "warn",
+          "BADR",
+          `Finalisation BADR toujours en échec pour "${entry.ach.id}" après ${FINALIZE_MAX_ATTEMPTS} tentatives — relance manuelle requise (bouton Réessayer).`,
+        );
+      } else {
+        entry.attempts++;
+        entry.nextAttemptAt = Date.now() + FINALIZE_RETRY_COOLDOWN_MS;
+      }
+    }
+    return done;
+  }
 
   const pending = new Map();
   const claimedAcceptedRefs = new Set();
@@ -1431,7 +1488,14 @@ async function monitorPendingPortnetRequests(
     // Only resume BADR finalization for accepted-but-not-completed LTAs.
     // LTAs already marked as badr_done must never run finalization again.
     if (state.badrRef && state.phase !== "badr_done") {
-      await finalizeAcceptedOnBadr(ach, state.badrRef);
+      const res = await finalizeAcceptedOnBadr(ach, state.badrRef);
+      if (!res?.success) {
+        finalizeRetry.set(ach.folderPath, {
+          ach,
+          attempts: 1,
+          nextAttemptAt: Date.now() + FINALIZE_RETRY_COOLDOWN_MS,
+        });
+      }
       continue;
     }
 
@@ -1556,9 +1620,12 @@ async function monitorPendingPortnetRequests(
       }
       sendLog("info", "Automation", `Traitement du LTA "${id}" ajouté au suivi en cours…`);
       try {
+        // User explicitly clicked Lancer/Tout lancer (queued here because a batch
+        // was already running) — re-check the manifest now, don't wait out the interval.
         const res = await runAutomationTask(ach, {
           stopAfterSubmit: true,
           sharedPortnetPage: portnetPage,
+          forceManifestRecheck: true,
         });
         if (!ach.partiel && res?.success) {
           const s2 = getAutomationState(ach.folderPath);
@@ -1614,7 +1681,11 @@ async function monitorPendingPortnetRequests(
   let manifestOnlyCycles = 0;
   monitorActive = true;
   try {
-    while (pending.size > 0 || manifestRetry.length > 0) {
+    while (
+      pending.size > 0 ||
+      manifestRetry.length > 0 ||
+      finalizeRetry.size > 0
+    ) {
       // Inject operator-launched LTAs AND re-check waiting-manifest LTAs.
       // Guard with badrBusy so the keepalive timer doesn't touch BADR mid-submit.
       badrBusy = true;
@@ -1623,6 +1694,7 @@ async function monitorPendingPortnetRequests(
         changed += await drainInjectionQueue();
         changed += await retryWaitingManifest();
         changed += await drainDeclarationQueue();
+        changed += await retryFailedFinalizations();
       } finally {
         badrBusy = false;
       }
@@ -1630,7 +1702,21 @@ async function monitorPendingPortnetRequests(
         // Submitting navigated the Portnet page off consultation — reopen it.
         await dsCombine.openConsultationPage();
       }
-      if (pending.size === 0 && manifestRetry.length === 0) break;
+      if (
+        pending.size === 0 &&
+        manifestRetry.length === 0 &&
+        finalizeRetry.size === 0
+      )
+        break;
+
+      if (pending.size === 0 && manifestRetry.length === 0) {
+        // Only failed-finalization retries remain (rare: happens when the LTA that
+        // just failed to finalize was the sole item left in this batch). Their own
+        // cooldown (FINALIZE_RETRY_COOLDOWN_MS) already gates retryFailedFinalizations()
+        // above — just idle briefly and loop back, no manifest-specific bookkeeping.
+        await portnetPage.waitForTimeout(5000);
+        continue;
+      }
 
       if (pending.size === 0) {
         // Nothing submitted to poll yet — only waiting-manifest LTAs remain. Wait,
@@ -1871,11 +1957,13 @@ async function monitorPendingPortnetRequests(
             declarationRef: shortRef,
           });
           pending.delete(ach.id);
-          badrBusy = true;
-          try {
-            await finalizeAcceptedOnBadr(ach, shortRef);
-          } finally {
-            badrBusy = false;
+          const finalizeRes = await attemptFinalize(ach, shortRef);
+          if (!finalizeRes?.success) {
+            finalizeRetry.set(ach.folderPath, {
+              ach,
+              attempts: 1,
+              nextAttemptAt: Date.now() + FINALIZE_RETRY_COOLDOWN_MS,
+            });
           }
         } else if (isRejectedStatus(statusText)) {
           const error = `DS Combinée request was REJECTED for ${state.portnetRef}! Please check manually.`;
@@ -2340,7 +2428,18 @@ async function runPartielDumFlow(acheminement) {
 
 async function runAutomationTask(
   acheminement,
-  { stopAfterSubmit = false, sharedPortnetPage = null } = {},
+  {
+    stopAfterSubmit = false,
+    sharedPortnetPage = null,
+    // true for every USER-initiated launch (Lancer, Tout lancer, Ajouter au
+    // traitement) — bypasses the manifest re-check interval below. The operator
+    // clicking the button IS the "check now" request; the interval exists only to
+    // stop unattended background loops (the watcher, the monitor's own
+    // retryWaitingManifest) from hammering BADR, and those call sites already
+    // pre-filter on manifestCheckThrottled before ever reaching this function, so
+    // they are unaffected by this flag.
+    forceManifestRecheck = false,
+  } = {},
 ) {
   const { id, folderPath } = acheminement;
 
@@ -2365,14 +2464,24 @@ async function runAutomationTask(
   }
 
   // Manifest re-check throttle: if this LTA is waiting for its manifest and the
-  // last BADR check was < MANIFEST_CHECK_INTERVAL_MS ago, don't hit BADR (or email) again yet. This
-  // also guards the restart path — relaunching won't immediately re-check.
+  // last BADR check was < MANIFEST_CHECK_INTERVAL_MS ago, don't hit BADR (or email)
+  // again yet. This guards the PASSIVE paths (app restart, the background watcher's
+  // own call already pre-filtered — this is belt-and-suspenders there) — but an
+  // explicit user click (forceManifestRecheck) always re-checks right away.
   if (
     checkpoint?.phase === "waiting_manifest" &&
+    !forceManifestRecheck &&
     manifestCheckThrottled(checkpoint)
   ) {
     sendProgress(id, "waiting-manifest");
     return { success: false, waitingManifest: true, throttled: true };
+  }
+  if (checkpoint?.phase === "waiting_manifest" && forceManifestRecheck) {
+    sendLog(
+      "info",
+      "BADR",
+      `"${id}": re-vérification du manifeste demandée — nouvel essai immédiat (sans attendre l'intervalle).`,
+    );
   }
 
   // ── Partiel DUM Normale path ──────────────────────────────────────────────
@@ -2560,9 +2669,11 @@ async function runAllAutomationTasks(acheminements) {
         continue;
       }
 
+      // "Tout lancer" is an explicit user click — re-check the manifest now.
       const r = await runAutomationTask(ach, {
         stopAfterSubmit: true,
         sharedPortnetPage: portnetPage,
+        forceManifestRecheck: true,
       });
       if (r?.waitingManifest) waitingManifest.push(ach);
       await new Promise((r) => setTimeout(r, 1500));
@@ -3427,7 +3538,10 @@ ipcMain.handle("automation:run", async (_event, acheminement) => {
   if (queued) return queued;
   // The background manifest watcher is mid re-check on the shared BADR page.
   if (watcherRunning) return { success: false, busy: true, error: WATCHER_BUSY_MSG };
-  return await withBusy(() => runAutomationTask(acheminement));
+  // Explicit "Lancer" click — re-check the manifest now, don't wait out the interval.
+  return await withBusy(() =>
+    runAutomationTask(acheminement, { forceManifestRecheck: true }),
+  );
 });
 
 ipcMain.handle("automation:run-all", async (_event, acheminements) => {

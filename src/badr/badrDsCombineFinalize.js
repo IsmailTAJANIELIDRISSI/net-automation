@@ -1,4 +1,5 @@
 const { createLogger } = require("../utils/logger");
+const config = require("../config/config");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -162,6 +163,11 @@ class BADRDsCombineFinalize {
       );
     }
 
+    // A popup page is a fresh Playwright Page — it does NOT inherit
+    // setDefaultTimeout(config.timeout) from `this.page`; without this it silently
+    // falls back to Playwright's built-in 30s default, which is too short for a
+    // slow BADR server-side render (see the download retry below).
+    popup.setDefaultTimeout(config.timeout);
     await popup.waitForLoadState("domcontentloaded");
     log.info("Opened Déclaration search popup.");
 
@@ -221,6 +227,7 @@ class BADRDsCombineFinalize {
       targetLink.click(),
     ]);
 
+    detailPopup.setDefaultTimeout(config.timeout); // see popup.setDefaultTimeout above
     await detailPopup.waitForLoadState("domcontentloaded");
     await detailPopup.waitForTimeout(2000);
     log.info("Opened Declaration détail popup.");
@@ -259,14 +266,32 @@ class BADRDsCombineFinalize {
       );
     }
 
-    // Now click 'Imprimer autorisation entrée marchandise' and handle download
+    // Now click 'Imprimer autorisation entrée marchandise' and handle download.
+    // Retry a few times with a generous per-attempt timeout: BADR occasionally
+    // takes a while to render the PDF server-side, or a click gets swallowed by a
+    // PrimeFaces redraw. Re-clicking is safe — it just re-triggers the same print,
+    // no declaration state changes.
     log.info(
       "Clicking 'Imprimer autorisation entrée marchandise' and intercepting download...",
     );
-    const [download] = await Promise.all([
-      detailPopup.waitForEvent("download"),
-      imprimerButton.click(),
-    ]);
+    const DOWNLOAD_TIMEOUT_MS = 90_000;
+    const MAX_DOWNLOAD_ATTEMPTS = 3;
+    let download = null;
+    for (let attempt = 1; attempt <= MAX_DOWNLOAD_ATTEMPTS; attempt++) {
+      try {
+        [download] = await Promise.all([
+          detailPopup.waitForEvent("download", { timeout: DOWNLOAD_TIMEOUT_MS }),
+          imprimerButton.click(),
+        ]);
+        break;
+      } catch (err) {
+        if (attempt >= MAX_DOWNLOAD_ATTEMPTS) throw err;
+        log.warn(
+          `Téléchargement non reçu (tentative ${attempt}/${MAX_DOWNLOAD_ATTEMPTS}): ${err.message} — nouvel essai…`,
+        );
+        await detailPopup.waitForTimeout(2000);
+      }
+    }
 
     // Rename PDF with LTA rank and lot reference if provided
     let pdfFileName = download.suggestedFilename(); // default: "DS_acheminement_entree_marchdandise.pdf"
@@ -532,6 +557,7 @@ class BADRDsCombineFinalize {
       }
     }
     if (!popup) throw new Error("Popup 'Rechercher par référence' non ouverte");
+    popup.setDefaultTimeout(config.timeout); // see the other popup.setDefaultTimeout above
     await popup.waitForLoadState("domcontentloaded");
     log.info("Popup 'Rechercher par référence' ouverte.");
 

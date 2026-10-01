@@ -5,6 +5,34 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-10-01 — Fix: "Ajouter au traitement" silently did nothing for a waiting-manifest LTA
+
+**Bug (from the log):** with 3 LTAs sitting at `waiting_manifest` (manifest re-check interval 1 h), the operator clicked "Ajouter au traitement" / "Tout lancer" to force an immediate re-check. The log showed `Starting automation for: 2EME …` — the very first line inside `runAutomationTask` — then nothing: no BADR activity, no error, no further log line. The card just stayed on "waiting-manifest". From the operator's side, the click visibly did nothing.
+
+**Root cause:** `runAutomationTask`'s own manifest-recheck throttle (`manifestCheckThrottled`, added for the background watcher/restart case) sits at the very top of the function and returns immediately — `sendProgress(id, "waiting-manifest")`, no `sendLog` — whenever the last check was less than `MANIFEST_CHECK_INTERVAL_MS` ago. It didn't distinguish a PASSIVE re-check (background watcher, app restart — where waiting out the interval is the whole point) from an EXPLICIT user click (Lancer / Tout lancer / Ajouter au traitement — where "check now" is exactly what was asked for), so a deliberate click 8 minutes after the last check was silently swallowed.
+
+**Fix (`electron/main.js`):** new `runAutomationTask(ach, { forceManifestRecheck })` option — bypasses the throttle (and logs "re-vérification du manifeste demandée — nouvel essai immédiat") when true. Set `true` at the three user-initiated call sites: `drainInjectionQueue` (Ajouter au traitement while a batch runs), the `runAllAutomationTasks` per-LTA loop (fresh Tout lancer), and the `automation:run` IPC (single Lancer). Left `false` (default) at the two background call sites — `retryWaitingManifest` and `manifestWatchTick` — which already pre-filter on `manifestCheckThrottled` before ever calling `runAutomationTask`, so they're unaffected and keep respecting the interval as designed.
+
+**Files changed:** `electron/main.js`
+
+---
+
+## 2026-09-28 — Fix: "Timeout 30000ms exceeded while waiting for event download" during BADR finalize
+
+**Root cause:** `waitForEvent("download")` on the two BADR popups (`popup`, `detailPopup` in `badrDsCombineFinalize.js`) never got `config.timeout` (120 s) applied — a popup opened via `window.open` is a fresh Playwright Page that does NOT inherit `setDefaultTimeout` from `this.page` (only the original BADR page had it set, in `badrConnection.js`). So the download wait silently used Playwright's built-in 30 s default, which a slow BADR server-side PDF render (or an occasional swallowed click) can exceed — not a network/connection problem.
+
+**Fix (`src/badr/badrDsCombineFinalize.js`):**
+- `popup.setDefaultTimeout(config.timeout)` / `detailPopup.setDefaultTimeout(config.timeout)` right after each popup is created (3 sites, incl. `printRegisteredDumByRef`'s popup).
+- The "Imprimer autorisation entrée marchandise" click + download wait is now retried up to 3× with a 90 s timeout per attempt (re-clicking is safe — no declaration state changes).
+
+**Also added — automatic finalize retry in the batch monitor (`electron/main.js`):** previously, if `finalizeAcceptedOnBadr` failed once (checkpoint left at `badrRef` set + `phase: "portnet_accepted"`, not `badr_done`), nothing retried it automatically within that monitor run — it dropped out of `pending` and just sat there until the operator clicked "Réessayer". Added `finalizeRetry` (folderPath → `{ach, attempts, nextAttemptAt}`) + `attemptFinalize` (the existing `badrBusy` guard, factored out) + `retryFailedFinalizations()`, wired into the monitor's per-cycle drain block and its `while`/break conditions (a dedicated short-wait branch handles the rare case where a failed finalize is the only thing left in the batch). Up to `FINALIZE_MAX_ATTEMPTS = 3`, 60 s cooldown between attempts; both the initial resume-loop and the live "Acceptée" detection now register failures into it. After 3 failures it still requires a manual "Réessayer" (logged clearly). Single-LTA paths (`runAutomationTask`'s `hasAcceptedPortnet`, one-off "Lancer") are unchanged — they return promptly and rely on the existing manual-retry UI, consistent with how other single-run IPCs behave.
+
+Not yet run against live BADR — the timeout/retry fix directly targets the exact symptom in the log; the auto-retry queue is a new, additive code path (guarded to never fire when the checkpoint has already progressed) but should be watched on the next real occurrence.
+
+**Files changed:** `src/badr/badrDsCombineFinalize.js`, `electron/main.js`
+
+---
+
 ## 2026-09-25 — Fix: real run hung after the early pré-contrôle (must go back to BADR Accueil)
 
 **Bug (from the 16EME log):** the early lot pré-contrôle worked ("lots complets"), but the real run's Step 1 then sat on "Opening Créer une déclaration…" forever. The pre-check left BADR inside its throw-away declaration; while a declaration is open BADR swaps the left menu (SAUVEGARDER / VALIDER / SUPPRIMER…), so DEDOUANEMENT → "Créer une déclaration" (`#_2001`) didn't exist.
