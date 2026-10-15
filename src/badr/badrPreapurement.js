@@ -183,21 +183,13 @@ class BADRPreapurement {
       await this.page.waitForTimeout(500);
       log.info("Préapurement DS form opened");
 
-      // Type DS: DS(01)
-      await iframe
-        .locator(
-          "div#mainTab\\:form3\\:typeDsId div.ui-selectonemenu-trigger",
-        )
-        .click();
-      await iframe
-        .locator("li[data-label='DS(01)']")
-        .waitFor({ state: "visible", timeout: 5000 })
-        .catch(() => {});
-      await iframe
-        .locator("li[data-label='DS(01)']")
-        .click()
-        .catch(() => {});
-      await this.page.waitForTimeout(200);
+      // Type DS: DS(01) — verify it stuck, or BADR rejects the lot with
+      // "E13532: Type DS: Information obligatoire".
+      const typeDsOk = await this._selectTypeDs(iframe, "DS(01)");
+      if (!typeDsOk) {
+        lastFailReason = "Type DS non sélectionné";
+        continue;
+      }
 
       const fields = [
         { selector: "input[id*='bureauId']", value: lotInfo.bureau, label: "Bureau" },
@@ -337,6 +329,49 @@ class BADRPreapurement {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Selects a PrimeFaces selectonemenu option (Type DS = "DS(01)") and
+   * verifies the label actually shows it afterwards. See
+   * badrDumNormalPartiel.js's _selectTypeDs for the full rationale (slow
+   * BADR AJAX renders can leave Type DS unset, which BADR then rejects with
+   * "E13532: Type DS: Information obligatoire").
+   */
+  async _selectTypeDs(iframe, label) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const container = iframe
+        .locator("div#mainTab\\:form3\\:typeDsId")
+        .first();
+      const trigger = container.locator(".ui-selectonemenu-trigger").first();
+      const visible = await trigger
+        .isVisible({ timeout: 3000 })
+        .catch(() => false);
+      if (!visible) {
+        log.warn(`Type DS trigger non visible (tentative ${attempt}/3)`);
+        await this.page.waitForTimeout(500);
+        continue;
+      }
+      await trigger.click().catch(() => {});
+      const item = iframe.locator(`li[data-label='${label}']`);
+      const appeared = await item
+        .first()
+        .waitFor({ state: "visible", timeout: 5000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!appeared) {
+        log.warn(`Liste Type DS non ouverte (tentative ${attempt}/3)`);
+        await this.page.waitForTimeout(500);
+        continue;
+      }
+      await item.first().click().catch(() => {});
+      await this.page.waitForTimeout(300);
+      const containerText = await container.textContent().catch(() => "");
+      if (String(containerText).includes(label)) return true;
+      log.warn(`Type DS non confirmé après sélection (tentative ${attempt}/3)`);
+      await this.page.waitForTimeout(500);
+    }
+    return false;
   }
 
   /**

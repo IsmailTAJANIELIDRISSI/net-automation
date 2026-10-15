@@ -15,6 +15,8 @@ User-reported bug: in the partiel DUM flow's Step 5 (Préapurement DS), on slow 
 
 **Also applied to DS Combinée** (`src/badr/badrPreapurement.js` `_fillPreapurementAndRead`), which had the exact same shape of bug (plain `.fill()` with no verification, no error-banner check after OK) even though the user hadn't observed it there yet — same `_fillAndVerify`/`_checkBadrError`/retry-the-lot pattern, adapted to its single-lot (non-loop) structure.
 
+**Follow-up same day:** a live run still hit `E13532: Type DS: Information obligatoire, non communiquée!` — the Bureau/Régime/etc. fields above were covered by `_fillAndVerify`, but the Type DS *selectonemenu* (PrimeFaces dropdown, not a plain input) was still a single unguarded `isVisible().catch(() => false)` + click + click, with no wait and no check that the selection actually landed. Added `_selectTypeDs(iframe, label)` in both files: waits for the trigger (retried), opens the dropdown, clicks "DS(01)", then reads the container's text back to confirm it actually shows "DS(01)" before returning — retried up to 3× like the other fields, and wired into the same per-lot retry loop (a failed Type DS selection now retries the whole lot instead of clicking OK with it unset).
+
 ---
 
 ## 2026-10-14 — CRITICAL fix: BADR's own taux de change was NEVER actually used (always silently fell back to live fetch)

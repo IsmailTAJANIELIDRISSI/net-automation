@@ -673,21 +673,12 @@ class BADRDumNormalPartiel {
         await nouveauBtn.click();
         await this.page.waitForTimeout(500);
 
-        // Type DS = DS(01)
-        const typeTrigger = iframe
-          .locator("[id*='typeDsId'] .ui-selectonemenu-trigger")
-          .first();
-        if (await typeTrigger.isVisible().catch(() => false)) {
-          await typeTrigger.click();
-          await iframe
-            .locator("li[data-label='DS(01)']")
-            .waitFor({ state: "visible", timeout: 5000 })
-            .catch(() => {});
-          await iframe
-            .locator("li[data-label='DS(01)']")
-            .click()
-            .catch(() => {});
-          await this.page.waitForTimeout(200);
+        // Type DS = DS(01) — BADR rejects the lot with "E13532: Type DS:
+        // Information obligatoire" if this doesn't stick, so verify it.
+        const typeDsOk = await this._selectTypeDs(iframe, "DS(01)");
+        if (!typeDsOk) {
+          lastFailReason = `Type DS non sélectionné`;
+          continue;
         }
 
         const fields = [
@@ -1576,6 +1567,52 @@ class BADRDumNormalPartiel {
         // try next
       }
     }
+  }
+
+  /**
+   * Selects a PrimeFaces selectonemenu option (e.g. Type DS = "DS(01)") and
+   * verifies the label actually shows it afterwards — the trigger can be
+   * unclickable or the dropdown item can fail to register a click while
+   * BADR's panel is still re-rendering (same slow-AJAX issue as the plain
+   * inputs), which previously left Type DS unset and got the whole lot
+   * rejected by BADR with "E13532: Type DS: Information obligatoire".
+   */
+  async _selectTypeDs(iframe, label) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const container = iframe.locator("[id*='typeDsId']").first();
+      const trigger = container.locator(".ui-selectonemenu-trigger").first();
+      const visible = await trigger
+        .isVisible({ timeout: 3000 })
+        .catch(() => false);
+      if (!visible) {
+        log.warn(`Step 5 — Type DS trigger non visible (tentative ${attempt}/3)`);
+        await this.page.waitForTimeout(500);
+        continue;
+      }
+      await trigger.click().catch(() => {});
+      const item = iframe.locator(`li[data-label='${label}']`);
+      const appeared = await item
+        .first()
+        .waitFor({ state: "visible", timeout: 5000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!appeared) {
+        log.warn(
+          `Step 5 — liste Type DS non ouverte (tentative ${attempt}/3)`,
+        );
+        await this.page.waitForTimeout(500);
+        continue;
+      }
+      await item.first().click().catch(() => {});
+      await this.page.waitForTimeout(300);
+      const containerText = await container.textContent().catch(() => "");
+      if (String(containerText).includes(label)) return true;
+      log.warn(
+        `Step 5 — Type DS non confirmé après sélection (tentative ${attempt}/3)`,
+      );
+      await this.page.waitForTimeout(500);
+    }
+    return false;
   }
 
   /**
