@@ -493,9 +493,20 @@ class BADRDumNormalPartiel {
       .locator("#mainTab\\:form0\\:id_tauxChange")
       .textContent({ timeout: 2000 })
       .catch(() => "");
-    const tauxNum = parseFloat(String(tauxText).replace(",", "."));
-    if (tauxNum > 0) return tauxNum;
+    // BADR renders this field as "<label>: 9.75440" — strip everything up to and
+    // including the colon (BUG FIXED 2026-10-14: parseFloat(": 9.75440") is NaN,
+    // so the leading ": " silently made this ALWAYS fail and fall through to the
+    // live fetch below, even though BADR's own rate was right there in the DOM).
+    const numericPart = String(tauxText).replace(/^[^0-9-]*/, "");
+    const tauxNum = parseFloat(numericPart.replace(",", "."));
+    if (tauxNum > 0) {
+      log.info(
+        `Taux USD→MAD: ${tauxNum} (source: BADR — champ taux de change affiché à l'écran)`,
+      );
+      return tauxNum;
+    }
     try {
+      // fetchMADRate logs its own provider (BAM / frankfurter / openexchangerates).
       return await fetchMADRate("USD");
     } catch (e) {
       log.warn("Could not fetch USD rate — using fallback 10", e.message);
@@ -629,90 +640,168 @@ class BADRDumNormalPartiel {
       const p = partiels[i];
       log.info(`Step 5 — Adding lot ${i + 1}/${partiels.length}`, p);
 
-      // Click Nouveau
-      const nouveauBtn = iframe
-        .locator(
-          "button[name*='btnNouveauPreap'], button[id*='btnNouveauPreap']",
-        )
-        .first();
-      await nouveauBtn.click();
-      await this.page.waitForTimeout(500);
-
-      // Type DS = DS(01)
-      const typeTrigger = iframe
-        .locator("[id*='typeDsId'] .ui-selectonemenu-trigger")
-        .first();
-      if (await typeTrigger.isVisible().catch(() => false)) {
-        await typeTrigger.click();
-        await iframe
-          .locator("li[data-label='DS(01)']")
-          .waitFor({ state: "visible", timeout: 5000 });
-        await iframe.locator("li[data-label='DS(01)']").click();
-        await this.page.waitForTimeout(200);
-      }
-
-      // Bureau
-      await this._fillInputIfVisible(
-        iframe,
-        "input[id*='referencePreap_bureauId']",
-        "301",
-      );
-      // Régime
-      await this._fillInputIfVisible(
-        iframe,
-        "input[id*='referencePreap_regimeId']",
-        "000",
-      );
-      // Année
-      await this._fillInputIfVisible(
-        iframe,
-        "input[id*='referencePreap_anneeId']",
-        "2026",
-      );
-      // Série
-      await this._fillInputIfVisible(
-        iframe,
-        "input[id*='referencePreap_serieId']",
-        p.serie,
-      );
-      // Clé
-      await this._fillInputIfVisible(
-        iframe,
-        "input[id*='referencePreap_cleId']",
-        p.cle,
-      );
-
-      // Lieu de chargement autocomplete
-      const lieuInput = iframe
-        .locator("input[id*='lieuChargCmb_INPUT_input']")
-        .first();
-      if (await lieuInput.isVisible().catch(() => false)) {
-        await lieuInput.click();
-        await lieuInput.pressSequentially(p.lieu || "", { delay: 80 });
-        // Wait for the dropdown panel to appear, then pick the item whose
-        // label contains p.lieu (avoids selecting a wrong airport code).
-        const lieuItem = iframe
-          .locator("li.ui-autocomplete-item")
-          .filter({ hasText: p.lieu });
-        await lieuItem.first().waitFor({ state: "visible", timeout: 10000 });
-        await lieuItem.first().click();
-        await this.page.waitForTimeout(400);
-      }
-
       // Référence lot — strip scraped whitespace/ETAT lines, keep first line only
       const refClean = String(p.ref || "")
         .split(/[\r\n]/)[0]
         .trim();
-      await this._fillInputIfVisible(
-        iframe,
-        "input[id*='preapurement_ref_lot']",
-        refClean,
-      );
+
+      // Fill the lot fields, verifying each one actually stuck before clicking
+      // OK. BADR's panels can render slowly (slow network/AJAX), so a plain
+      // fill can silently land on nothing — retry the WHOLE lot (fresh
+      // "Nouveau") up to 3 times rather than clicking OK with blanks.
+      const maxLotAttempts = 3;
+      let lotFilled = false;
+      let lastFailReason = "";
+
+      for (
+        let lotAttempt = 1;
+        lotAttempt <= maxLotAttempts && !lotFilled;
+        lotAttempt++
+      ) {
+        if (lotAttempt > 1) {
+          log.warn(
+            `Step 5 — Lot ${i + 1}: nouvelle tentative ${lotAttempt}/${maxLotAttempts} (${lastFailReason})`,
+          );
+        }
+
+        // Click Nouveau
+        const nouveauBtn = iframe
+          .locator(
+            "button[name*='btnNouveauPreap'], button[id*='btnNouveauPreap']",
+          )
+          .first();
+        await nouveauBtn.click();
+        await this.page.waitForTimeout(500);
+
+        // Type DS = DS(01)
+        const typeTrigger = iframe
+          .locator("[id*='typeDsId'] .ui-selectonemenu-trigger")
+          .first();
+        if (await typeTrigger.isVisible().catch(() => false)) {
+          await typeTrigger.click();
+          await iframe
+            .locator("li[data-label='DS(01)']")
+            .waitFor({ state: "visible", timeout: 5000 })
+            .catch(() => {});
+          await iframe
+            .locator("li[data-label='DS(01)']")
+            .click()
+            .catch(() => {});
+          await this.page.waitForTimeout(200);
+        }
+
+        const fields = [
+          {
+            selector: "input[id*='referencePreap_bureauId']",
+            value: "301",
+            label: "Bureau",
+          },
+          {
+            selector: "input[id*='referencePreap_regimeId']",
+            value: "000",
+            label: "Régime",
+          },
+          {
+            selector: "input[id*='referencePreap_anneeId']",
+            value: "2026",
+            label: "Année",
+          },
+          {
+            selector: "input[id*='referencePreap_serieId']",
+            value: p.serie,
+            label: "Série",
+          },
+          {
+            selector: "input[id*='referencePreap_cleId']",
+            value: p.cle,
+            label: "Clé",
+          },
+        ];
+
+        let allFilled = true;
+        for (const f of fields) {
+          const ok = await this._fillAndVerify(
+            iframe,
+            f.selector,
+            f.value,
+            f.label,
+          );
+          if (!ok) {
+            lastFailReason = `champ "${f.label}" vide/non confirmé`;
+            allFilled = false;
+            break;
+          }
+        }
+        if (!allFilled) continue;
+
+        // Lieu de chargement autocomplete
+        const lieuInput = iframe
+          .locator("input[id*='lieuChargCmb_INPUT_input']")
+          .first();
+        if (await lieuInput.isVisible().catch(() => false)) {
+          await lieuInput.click();
+          await lieuInput.fill("").catch(() => {});
+          await lieuInput.pressSequentially(p.lieu || "", { delay: 80 });
+          // Wait for the dropdown panel to appear, then pick the item whose
+          // label contains p.lieu (avoids selecting a wrong airport code).
+          const lieuItem = iframe
+            .locator("li.ui-autocomplete-item")
+            .filter({ hasText: p.lieu });
+          const lieuAppeared = await lieuItem
+            .first()
+            .waitFor({ state: "visible", timeout: 10000 })
+            .then(() => true)
+            .catch(() => false);
+          if (!lieuAppeared) {
+            lastFailReason = "lieu de chargement non trouvé dans la liste";
+            continue;
+          }
+          await lieuItem.first().click();
+          await this.page.waitForTimeout(400);
+          const lieuVal = await lieuInput.inputValue().catch(() => "");
+          if (!lieuVal.trim()) {
+            lastFailReason = "lieu de chargement vide après sélection";
+            continue;
+          }
+        }
+
+        const refOk = await this._fillAndVerify(
+          iframe,
+          "input[id*='preapurement_ref_lot']",
+          refClean,
+          "Référence lot",
+        );
+        if (!refOk) {
+          lastFailReason = `champ "Référence lot" vide/non confirmé`;
+          continue;
+        }
+
+        lotFilled = true;
+      }
+
+      if (!lotFilled) {
+        throw new Error(
+          `Step 5 — Lot ${i + 1}/${partiels.length}: impossible de remplir les champs après ${maxLotAttempts} tentatives (${lastFailReason}) — abandon (réseau lent ou BADR instable)`,
+        );
+      }
 
       // Click OK
       const okBtn = iframe.locator("button[id*='btnRefPreapOk']").first();
       await okBtn.click();
       await this.page.waitForTimeout(2000);
+
+      // Don't silently accept poids=0/nbrContenant=0 as if it were a valid
+      // reading — if BADR shows its error banner here, the lot was rejected
+      // (e.g. fields that looked filled but didn't match a real lot).
+      if (await this._checkBadrError()) {
+        const errText = await this.page
+          .locator("#rapportMsgForm .ui-messages-error")
+          .textContent()
+          .catch(() => "");
+        throw new Error(
+          `Step 5 — Lot ${i + 1}/${partiels.length}: BADR a renvoyé une erreur après clic OK ("${(errText || "").trim() || "message vide"}")`,
+        );
+      }
 
       // Read poids + nbrContenant
       const poidsText = await iframe
@@ -1301,6 +1390,11 @@ class BADRDumNormalPartiel {
     // was added as-is — mixing USD into a MAD total when the manifest was in USD.)
     let valDec = 0;
     try {
+      // Fret conversion ALWAYS uses a live fetch (never BADR's on-screen taux —
+      // that field is about the manifest total in Entête, a separate rate query).
+      log.info(
+        `Récupération du taux ${ach.mawbCurrency || "USD"}→MAD pour le fret…`,
+      );
       const fretRate = await fetchMADRate(ach.mawbCurrency || "USD");
       const fretMAD = parseFloat(ach.fretValue || "0") * fretRate;
 
@@ -1482,6 +1576,38 @@ class BADRDumNormalPartiel {
         // try next
       }
     }
+  }
+
+  /**
+   * Stricter fill for Step 5's lot fields: waits for the field, fills it, then
+   * reads the value BACK and confirms it stuck before returning true. BADR's
+   * PrimeFaces panels sometimes render slowly (slow network / AJAX re-render),
+   * so a plain `.fill()` can silently land on nothing — this is what let the
+   * code click "OK" with blank Série/Clé/Référence and get a blank BADR error.
+   * Retries a few times instead of giving up after one attempt.
+   */
+  async _fillAndVerify(iframe, selector, value, label) {
+    const want = String(value ?? "").trim();
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const el = iframe.locator(selector).first();
+      const visible = await el.isVisible({ timeout: 3000 }).catch(() => false);
+      if (!visible) {
+        log.warn(`Step 5 — champ "${label}" non visible (tentative ${attempt}/3)`);
+        await this.page.waitForTimeout(500);
+        continue;
+      }
+      await el.fill(want).catch(() => {});
+      const actual = await el
+        .inputValue()
+        .then((v) => String(v).trim())
+        .catch(() => "");
+      if (actual === want) return true;
+      log.warn(
+        `Step 5 — champ "${label}" non confirmé ("${actual}" ≠ "${want}"), tentative ${attempt}/3`,
+      );
+      await this.page.waitForTimeout(500);
+    }
+    return false;
   }
 
   async _fillClearType(iframe, selector, value) {

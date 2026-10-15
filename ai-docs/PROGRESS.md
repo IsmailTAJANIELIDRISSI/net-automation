@@ -5,6 +5,44 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-10-15 — Préapurement DS: detect blank-fields-then-OK instead of hanging until restart
+
+User-reported bug: in the partiel DUM flow's Step 5 (Préapurement DS), on slow network/BADR AJAX re-renders, the lot form sometimes clicked "OK" with blank Série/Clé/Référence — BADR then showed its error banner (`#rapportMsgForm .ui-messages-error`, empty detail text) but the app never detected it: `poidLotId`/`nbrContenantLotId` were read as empty → parsed as `0`/`0` via `|| 0` fallback → silently accepted as a "valid" lot, and the run got stuck requiring a full app restart.
+
+**Root cause:** `_fillInputIfVisible()` silently does nothing (no throw, no log) if its selector doesn't become visible within a 2s timeout — exactly what a slow PrimeFaces re-render triggers. Nothing downstream ever checked whether the fields that were supposedly just filled actually held a value before clicking OK, and nothing checked for BADR's error banner after OK either (the existing `_checkBadrError()`/`_guardStep()` only wraps whole top-level steps, not each lot inside Step 5's loop).
+
+**Fix (`src/badr/badrDumNormalPartiel.js` `_step5_preapurement`):** added `_fillAndVerify()` — fills a field then reads its value back, retrying up to 3× if it doesn't match what was intended. Each lot's fields (Bureau/Régime/Année/Série/Clé/Lieu/Référence) are now verified before "OK" is clicked; if any field won't stick after 3 attempts, the whole lot (fresh "Nouveau") is retried up to 3×. If BADR's error banner appears right after clicking OK, the code now throws immediately instead of reading poids=0 as valid — this propagates to the existing `_guardStep`/`BadrSessionError` recovery path, so `main.js`'s retry loop can recover automatically instead of the app hanging.
+
+**Also applied to DS Combinée** (`src/badr/badrPreapurement.js` `_fillPreapurementAndRead`), which had the exact same shape of bug (plain `.fill()` with no verification, no error-banner check after OK) even though the user hadn't observed it there yet — same `_fillAndVerify`/`_checkBadrError`/retry-the-lot pattern, adapted to its single-lot (non-loop) structure.
+
+---
+
+## 2026-10-14 — CRITICAL fix: BADR's own taux de change was NEVER actually used (always silently fell back to live fetch)
+
+Found immediately via the new source-logging below: the log showed `[ExchangeRate] ... (source: BAM officiel...)` with **no** `(source: BADR — champ affiché à l'écran)` line — meaning `_getUsdMadRate()` was ALWAYS falling through to the live fetch, never BADR's own rate, contradicting the requirement that the taux MUST come from BADR.
+
+**Root cause:** BADR renders `#mainTab:form0:id_tauxChange` as `": 9.75440"` (leading colon + space, confirmed from the live DOM). The code did `parseFloat(tauxText)` directly — `parseFloat(": 9.75440")` is `NaN` (a string can't start with `:` and parse as a number) — so `tauxNum > 0` was always `false`, and it silently fell through to `fetchMADRate("USD")` on every single run. The two rates only *looked* consistent in the log because BAM's rate happened to match BADR's that day — this would silently diverge on a day they don't.
+
+**Fix (`src/badr/badrDumNormalPartiel.js` `_getUsdMadRate`):** strip everything before the first digit (`/^[^0-9-]*/`) before parsing, so `": 9.75440"` → `9.75440` correctly. Verified against the exact BADR text, a comma-decimal variant, and the empty/unreadable case (still correctly falls through to fetch).
+
+**Files changed:** `src/badr/badrDumNormalPartiel.js`
+
+---
+
+## 2026-10-14 — Log the source of every USD/MAD exchange rate used (BADR screen vs. live fetch)
+
+Operators asking "where did this fret/montant number come from" couldn't tell from the log whether a rate came from BADR's own on-screen taux or a live fetch — `fetchMADRate()` was silent about which of its 3 providers answered, and `_getUsdMadRate()` didn't log which of its 2 sources (BADR span vs. fetch fallback) it used.
+
+- `src/utils/exchangeRate.js`: `fetchMADRate()` now logs one line per successful lookup — `Taux <CUR>→MAD: <rate> (source: BAM officiel, via frankfurter.dev, <date>)`, or the `frankfurter.dev marché` / `openexchangerates.org` fallback equivalents.
+- `src/badr/badrDumNormalPartiel.js` `_getUsdMadRate()`: logs `Taux USD→MAD: <rate> (source: BADR — champ taux de change affiché à l'écran)` when it successfully reads BADR's own span (no network call in that case); otherwise falls through to `fetchMADRate`'s own log line.
+- Step 8's fret conversion (`fretRate = await fetchMADRate(ach.mawbCurrency)`) always goes straight to the live-fetch chain (never BADR's screen) — added a short "Récupération du taux … pour le fret…" line right before it, since Step 8 can also separately call `_getUsdMadRate` for the manifest-total conversion (when the manifest is in USD) and the two would otherwise look identical in the log.
+
+Verified live: `fetchMADRate("USD")` → `Taux USD→MAD: 9.7544 (source: BAM officiel, via frankfurter.dev, 2026-10-13)`.
+
+**Files changed:** `src/utils/exchangeRate.js`, `src/badr/badrDumNormalPartiel.js`
+
+---
+
 ## 2026-10-01 — Manifest re-check: never give up automatically + a manual click sweeps ALL waiting LTAs
 
 Follow-up to the same-day "Ajouter au traitement silently did nothing" fix (below) — the log from that fix working (`forceManifestRecheck`) also showed a SEPARATE problem: after `MAX_MANIFEST_CHECKS = 3` checks, both the monitor (`retryWaitingManifest`) and the idle background watcher (`manifestWatchTick`) dropped the LTA entirely — `"manifeste toujours absent après N vérifications — arrêt du suivi"` — even while OTHER LTAs in the same batch were still being actively polled for "Acceptée" on Portnet. From then on nothing re-checked it automatically; it needed a fresh manual relaunch.

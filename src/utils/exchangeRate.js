@@ -1,11 +1,18 @@
 "use strict";
 
+const { createLogger } = require("./logger");
+const log = createLogger("ExchangeRate");
+
 /**
  * Fetch the MAD exchange rate for a given currency.
  * Three-provider fallback chain:
  *   1. frankfurter.dev BAM provider (official Moroccan customs rate)
  *   2. frankfurter.dev blended rate
  *   3. openexchangerates.org cross-rate via USD base
+ *
+ * Logs which provider actually answered — a LIVE fetch here is the only rate
+ * source for the fret conversion (Step 8); it's also the fallback whenever
+ * badrDumNormalPartiel.js's _getUsdMadRate can't read BADR's own on-screen taux.
  *
  * @param {string} fromCurrency  - ISO 4217 code, e.g. "USD", "EUR", "HKD"
  * @returns {Promise<number>}    - MAD rate (1 unit of fromCurrency = X MAD)
@@ -26,6 +33,9 @@ async function fetchMADRate(fromCurrency) {
     if (r.ok) {
       const data = await r.json();
       if (typeof data?.rate === "number" && data.rate > 0) {
+        log.info(
+          `Taux ${currency}→MAD: ${data.rate} (source: BAM officiel, via frankfurter.dev, ${data.date || "date inconnue"})`,
+        );
         return data.rate;
       }
     }
@@ -42,6 +52,9 @@ async function fetchMADRate(fromCurrency) {
     if (r.ok) {
       const data = await r.json();
       if (typeof data?.rate === "number" && data.rate > 0) {
+        log.info(
+          `Taux ${currency}→MAD: ${data.rate} (source: frankfurter.dev, taux de marché — BAM indisponible, ${data.date || "date inconnue"})`,
+        );
         return data.rate;
       }
     }
@@ -60,7 +73,11 @@ async function fetchMADRate(fromCurrency) {
       const fromRate = data?.rates?.[currency];
       const madRate = data?.rates?.MAD;
       if (fromRate && madRate && fromRate > 0) {
-        return madRate / fromRate;
+        const rate = madRate / fromRate;
+        log.info(
+          `Taux ${currency}→MAD: ${rate} (source: openexchangerates.org — BAM et frankfurter.dev indisponibles)`,
+        );
+        return rate;
       }
     }
   } catch {
