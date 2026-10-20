@@ -5,6 +5,12 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-10-20 — Startup check: surface missing/incomplete .env loudly instead of a buried warning
+
+A second PC silently lost email notifications ("Email skipped (EMAIL_ENABLED/USER/TO not configured)") even though it had worked there before. `.env` is gitignored (never travels with `git pull`/clone — only `.env.example` is tracked), so a reinstall/update on any machine can leave `.env` missing or incomplete with no obvious signal — the only trace was that one buried mailer warning line mid-run.
+
+**Fix (`electron/main.js`):** added `checkEnvConfig()`, run once right after the renderer's log listener attaches (`did-finish-load`), so it reaches both the terminal/log file (via the logger, always) and the app's own log pane. It checks: `.env` exists at all; `EMAIL_ENABLED`/`EMAIL_USER`/`EMAIL_TO` (the exact gap that caused this); `BADR_USERNAME`/`BADR_PASSWORD`; `PORTNET_USERNAME`/`PORTNET_PASSWORD` — logging a clear `error`/`warn` line per missing piece at launch instead of only failing later, confusingly, deep in a run.
+
 ## 2026-10-15 — Préapurement DS: detect blank-fields-then-OK instead of hanging until restart
 
 User-reported bug: in the partiel DUM flow's Step 5 (Préapurement DS), on slow network/BADR AJAX re-renders, the lot form sometimes clicked "OK" with blank Série/Clé/Référence — BADR then showed its error banner (`#rapportMsgForm .ui-messages-error`, empty detail text) but the app never detected it: `poidLotId`/`nbrContenantLotId` were read as empty → parsed as `0`/`0` via `|| 0` fallback → silently accepted as a "valid" lot, and the run got stuck requiring a full app restart.

@@ -14,6 +14,56 @@ const { sendNotification } = require("../src/utils/mailer");
 
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
+const config = require("../src/config/config");
+const { createLogger } = require("../src/utils/logger");
+const envLog = createLogger("StartupCheck");
+
+// ── Startup config sanity check ──────────────────────────────────────────────
+// .env is gitignored (never travels with git pull/clone), so a machine can
+// silently lose its configuration after an update/reinstall — the only sign
+// was a buried "Email skipped (EMAIL_ENABLED/USER/TO not configured)" line in
+// the middle of a run. Surface every critical gap loudly, once, at launch.
+function checkEnvConfig() {
+  const envPath = path.join(__dirname, "..", ".env");
+  if (!fs.existsSync(envPath)) {
+    envLog.error(
+      `.env introuvable (${envPath}) — BADR, Portnet et les emails ne sont pas configurés. Copiez .env.example vers .env et remplissez-le.`,
+    );
+    return;
+  }
+
+  // ── Email notifications ────────────────────────────────────────────────
+  const { email } = config;
+  if (!email.enabled) {
+    envLog.warn(
+      'Notifications email désactivées (EMAIL_ENABLED n\'est pas "true" dans .env).',
+    );
+  } else if (!email.user || !email.to) {
+    const missing = [!email.user && "EMAIL_USER", !email.to && "EMAIL_TO"]
+      .filter(Boolean)
+      .join(", ");
+    envLog.error(
+      `EMAIL_ENABLED=true mais ${missing} manquant(e) dans .env — les emails ne partiront PAS.`,
+    );
+  } else {
+    envLog.info(`Notifications email actives → ${email.to}`);
+  }
+
+  // ── BADR credentials ────────────────────────────────────────────────────
+  if (!process.env.BADR_USERNAME || !process.env.BADR_PASSWORD) {
+    envLog.error(
+      "BADR_USERNAME/BADR_PASSWORD manquant(s) dans .env — la connexion BADR échouera.",
+    );
+  }
+
+  // ── Portnet credentials ─────────────────────────────────────────────────
+  if (!process.env.PORTNET_USERNAME || !process.env.PORTNET_PASSWORD) {
+    envLog.error(
+      "PORTNET_USERNAME/PORTNET_PASSWORD manquant(s) dans .env — la connexion Portnet échouera.",
+    );
+  }
+}
+
 // ── Dev / Prod detection ─────────────────────────────────────────────────────
 const isDev = process.env.NODE_ENV === "development" || !app.isPackaged;
 
@@ -90,6 +140,9 @@ function createWindow() {
   mainWindow.webContents.on("did-finish-load", () =>
     applyZoom(currentZoom),
   );
+  // Run once the renderer's log listener (preload.js) is attached, so the
+  // result also lands in the app's own log pane, not just the terminal/file.
+  mainWindow.webContents.once("did-finish-load", () => checkEnvConfig());
   mainWindow.webContents.on("before-input-event", (event, input) => {
     if (!input.control || input.type !== "keyDown") return;
     if (input.key === "=" || input.key === "+") {
