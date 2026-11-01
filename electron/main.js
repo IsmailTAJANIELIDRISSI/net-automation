@@ -3857,7 +3857,24 @@ ipcMain.handle(
   },
 );
 
-app.on("before-quit", async () => {
+let portnetClosedForQuit = false;
+
+app.on("before-quit", async (event) => {
+  // Electron doesn't wait for async handlers, and Portnet's Edge no longer exits
+  // with the app, so hold the quit until it has closed.
+  if (sharedPortnetApp && !portnetClosedForQuit) {
+    portnetClosedForQuit = true;
+    event.preventDefault();
+    await Promise.race([
+      sharedPortnetApp.close().catch(() => {}),
+      new Promise((r) => setTimeout(r, 5000)),
+    ]);
+    sharedPortnetApp = null;
+    sharedPortnetPage = null;
+    app.quit();
+    return;
+  }
+
   if (folderWatcher) {
     try {
       folderWatcher.close();

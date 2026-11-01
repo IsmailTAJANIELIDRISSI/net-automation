@@ -9,10 +9,31 @@
  */
 
 const { chromium } = require("playwright");
+const { spawn } = require("child_process");
 const config = require("../config/config");
 const { createLogger } = require("../utils/logger");
 
 const log = createLogger("PortnetLogin");
+
+const CAPTCHA_TIMEOUT_MS = 15 * 60 * 1000;
+const EDGE_START_TIMEOUT_MS = 30_000;
+
+// Playwright's own launch adds --enable-automation, which announces the browser
+// as automated and makes reCAPTCHA serve endless image rounds. So Edge is started
+// as a normal browser (like badrConnection.js) and Playwright only attaches to it.
+// These are the switches from Playwright's default set that the run depends on.
+const EDGE_ARGS = [
+  "--no-first-run",
+  "--no-default-browser-check",
+  "--start-maximized",
+  "--disable-popup-blocking",
+  "--disable-prompt-on-repost",
+  "--disable-hang-monitor",
+  // Keep automating at full speed while the window is behind the app.
+  "--disable-background-timer-throttling",
+  "--disable-backgrounding-occluded-windows",
+  "--disable-renderer-backgrounding",
+];
 
 class PortnetLogin {
   constructor() {
@@ -21,33 +42,66 @@ class PortnetLogin {
     this.page = null;
   }
 
+  async _attach() {
+    const { debuggingPort } = config.portnet;
+    this.browser = await chromium.connectOverCDP(
+      `http://127.0.0.1:${debuggingPort}`,
+      { slowMo: config.slowMo, timeout: 5000 },
+    );
+    this.context = this.browser.contexts()[0];
+  }
+
+  /** Reuse a Portnet Edge that is already open, otherwise start one. */
+  async _openEdge() {
+    if (this.browser?.isConnected()) return;
+
+    try {
+      await this._attach();
+      log.info("Edge Portnet déjà ouvert — reconnexion.");
+      return;
+    } catch {
+      // not running — start it below
+    }
+
+    const { browserPath, debuggingPort, userDataDir } = config.portnet;
+    log.info(`Launching Edge for Portnet on port ${debuggingPort}…`);
+    const args = [
+      `--remote-debugging-port=${debuggingPort}`,
+      `--user-data-dir=${userDataDir}`,
+      ...EDGE_ARGS,
+    ];
+    if (config.headless) args.push("--headless=new");
+    const edge = spawn(browserPath, args, { stdio: "ignore" });
+    edge.on("error", (err) =>
+      log.error("Edge process error", { message: err.message }),
+    );
+
+    const deadline = Date.now() + EDGE_START_TIMEOUT_MS;
+    for (;;) {
+      try {
+        await this._attach();
+        return;
+      } catch (err) {
+        if (Date.now() > deadline) {
+          throw new Error(
+            `Edge Portnet injoignable sur le port ${debuggingPort} (${err.message}). Fermez toutes les fenêtres Edge Portnet puis relancez.`,
+          );
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+  }
+
   /**
-   * Launch Chromium and log into Portnet.
+   * Open Edge and log into Portnet.
    * Pauses for manual CAPTCHA resolution then waits for the cargo home URL.
    *
    * @returns {import('playwright').Page} the authenticated Portnet page
    */
   async login() {
-    log.info("Launching Edge (persistent profile) for Portnet…");
-
-    // Persistent context (like BADR): reuses a real on-disk Edge profile so the
-    // Portnet session cookie survives app restarts. viewport: null → the page
-    // fills the actual (maximized) window instead of Playwright's 1280×720
-    // emulated viewport, which otherwise clips Portnet's content.
-    this.context = await chromium.launchPersistentContext(
-      config.portnet.userDataDir,
-      {
-        // Use the installed Microsoft Edge (BADR runs in Chrome — see badrConnection.js).
-        channel: "msedge",
-        headless: config.headless,
-        slowMo: config.slowMo,
-        viewport: null,
-        // Open the window maximized so the page can use the full screen.
-        args: ["--start-maximized"],
-      },
-    );
-    // browser() is null for a persistent context; keep the field for close().
-    this.browser = this.context.browser();
+    // The on-disk profile keeps Portnet's login token (localStorage) between
+    // launches, so a still-valid session skips the login form and the CAPTCHA.
+    await this._openEdge();
 
     // Apply a 90% zoom on every page Portnet loads (re-runs on each navigation,
     // top frame only to avoid double-zooming the cross-origin DS form iframe).
@@ -89,8 +143,12 @@ class PortnetLogin {
       }
     });
 
-    // A persistent context opens with one blank page — reuse it.
-    this.page = this.context.pages()[0] || (await this.context.newPage());
+    // Edge opens with one tab — reuse it, or the Portnet tab of a window left open.
+    const pages = this.context.pages();
+    this.page =
+      pages.find((p) => p.url().includes("portnet.ma")) ||
+      pages[0] ||
+      (await this.context.newPage());
     this.page.setDefaultTimeout(config.timeout);
 
     log.info("Navigating to Portnet…");
@@ -117,6 +175,8 @@ class PortnetLogin {
     if (alreadyLoggedIn) {
       log.info("Portnet: session réutilisée — déjà connecté, CAPTCHA ignoré.");
     } else {
+      log.info("Portnet: session expirée ou absente — connexion manuelle requise.");
+
       // Fill credentials
       const { username, password } = config.portnet;
       await this.page.locator("#auth-username").fill(username);
@@ -141,11 +201,20 @@ class PortnetLogin {
       console.log("  Automation will continue automatically.");
       console.log("========================================\n");
 
-      // Wait up to 3 minutes for the authenticated URL (slow networks need more time).
-      await this.page.waitForURL(
-        (url) => url.toString().includes("cargo.portnet.ma/home"),
-        { timeout: 180_000 },
-      );
+      // A person is working here: a slow CAPTCHA must not fail the whole batch.
+      // "commit" returns on the URL change; the networkidle wait below handles the
+      // page load, which on a bad connection could otherwise use up this timeout.
+      await this.page
+        .waitForURL((url) => url.toString().includes("cargo.portnet.ma/home"), {
+          timeout: CAPTCHA_TIMEOUT_MS,
+          waitUntil: "commit",
+        })
+        .catch((err) => {
+          if (err.name !== "TimeoutError") throw err;
+          throw new Error(
+            `Connexion Portnet non terminée après ${CAPTCHA_TIMEOUT_MS / 60_000} min (CAPTCHA non résolu).`,
+          );
+        });
     }
 
     // Extra safety: wait for the page to fully settle before handing it back.
@@ -164,14 +233,20 @@ class PortnetLogin {
    * Close the browser session.
    */
   async close() {
-    // Close the persistent context (flushes the profile — incl. the session
-    // cookie — to disk so the next launch can reuse it and skip the CAPTCHA).
-    if (this.context) {
-      await this.context.close();
-      this.context = null;
-      this.browser = null;
-      log.info("Portnet browser closed");
+    if (!this.browser) return;
+
+    // browser.close() only disconnects from an attached Edge, and killing the
+    // process can lose the saved login. Browser.close is a normal Edge shutdown.
+    try {
+      const session = await this.browser.newBrowserCDPSession();
+      await session.send("Browser.close");
+    } catch {
+      // the connection drops as Edge exits
     }
+    await this.browser.close().catch(() => {});
+    this.browser = null;
+    this.context = null;
+    log.info("Portnet browser closed");
   }
 }
 

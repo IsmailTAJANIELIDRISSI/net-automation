@@ -112,7 +112,7 @@ portnet-automation-playwright/
 │   │   ├── badrPreapurement.js      ← BADR weight/poids check via DS form
 │   │   └── badrDsCombineFinalize.js ← Download Autorisation d'Entrée + declare scellés
 │   ├── portnet/
-│   │   ├── portnetLogin.js    ← Launch Chromium + CAPTCHA wait + return page
+│   │   ├── portnetLogin.js    ← Start Edge, attach over CDP + CAPTCHA wait + return page
 │   │   └── portnetDsCombine.js ← All 9+ steps of DS Combinée form
 │   ├── utils/
 │   │   ├── logger.js              ← Structured logger, EventEmitter, file+IPC output
@@ -235,5 +235,5 @@ These are NOT in `.env` — they are hardcoded business constants in source:
 | Caution type           | 1                       | `portnetDsCombine.js`                |
 | Caution numeroDecision | 821                     | `portnetDsCombine.js`                |
 | Max annex size         | 2 MB                    | `compressPdfChain.js`                |
-| CAPTCHA wait timeout   | 120s                    | `portnetLogin.js`                    |
+| CAPTCHA wait timeout   | 15 min                  | `portnetLogin.js`                    |
 | Portnet poll backoff   | 60/120/180s             | `electron/main.js` getPollIntervalMs |

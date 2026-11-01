@@ -33,9 +33,14 @@ const config = {
     cargoUrl: "https://cargo.portnet.ma",
     username: process.env.PORTNET_USERNAME || "",
     password: process.env.PORTNET_PASSWORD || "",
+    browserPath:
+      process.env.PORTNET_BROWSER_PATH ||
+      "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    // Must differ from BADR_CDP_PORT: each site has its own Edge instance.
+    debuggingPort: parseInt(process.env.PORTNET_CDP_PORT || "9223", 10),
     // Persistent Edge profile (like BADR's). Keeping the profile between launches
-    // means Portnet's login session cookie survives an app restart — so if the
-    // session is still valid we land on /home directly and skip login + CAPTCHA.
+    // means Portnet's login token survives an app restart — so if the session is
+    // still valid we land on /home directly and skip login + CAPTCHA.
     // A real profile (cookies/history) also lowers reCAPTCHA challenge difficulty.
     userDataDir:
       process.env.PORTNET_PROFILE_DIR || "C:\\Temp\\portnet-edge-profile",

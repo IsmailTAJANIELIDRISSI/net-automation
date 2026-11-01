@@ -5,6 +5,29 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-11-01 — Portnet: start Edge as a normal browser so the manual reCAPTCHA stops looping
+
+**Problem:** in the Portnet window, reCAPTCHA kept serving image rounds and "invalide, veuillez réessayer" even with correct answers, while a normal Edge window passed in 2-3 steps. A slow CAPTCHA also killed the whole batch at the 180 s limit (`page.waitForURL: Timeout 180000ms exceeded`; 8 such failures in the logs).
+
+**Likely cause:** `launchPersistentContext` adds `--enable-automation`, so `navigator.webdriver` was `true` and the browser announced itself as automated. BADR's Edge never had this: it is spawned normally and Playwright attaches over CDP. Measured with real Edge: old launch `webdriver=true`, new launch `webdriver=false`. Whether this shortens the real CAPTCHA still has to be confirmed by an operator.
+
+**Fix (`src/portnet/portnetLogin.js`):**
+
+- Spawn Edge ourselves on its own port (`PORTNET_CDP_PORT`, default 9223, BADR uses 9222) and attach with `connectOverCDP`. An already-open Portnet Edge is reused. Same profile, so existing saved logins keep working. Only the Playwright default switches the run depends on are kept (popup blocking off, no background throttling while the window is covered, etc.).
+- The CAPTCHA is still solved by a person. No stealth patches or solving services.
+- CAPTCHA wait raised from 3 to 15 min, `waitUntil: "commit"` so a slow page load can't use up the timeout, and a readable French error if it does expire.
+- `close()` now sends CDP `Browser.close` (a normal Edge shutdown). `browser.close()` only disconnects from an attached Edge, and killing the process could lose the saved login.
+
+**`electron/main.js` `before-quit`:** Electron doesn't wait for async handlers, and Edge no longer exits with the app, so the quit is now held until Portnet's Edge has closed (5 s max). BADR's quit path is deliberately unchanged: its cleanup finished in only 2 of 117 launches, so its Edge normally stays open between runs, and making it reliable could add USB-code prompts.
+
+**Why the saved session isn't always reused:** not a code bug on this evidence. The login is a `token` in the site's localStorage (the only `cargo.portnet.ma` cookie is `cookiesession1`, not a login cookie). On the dev PC, reuse worked 24 h after a login and failed 7 days after, so the token expires on the server somewhere in between. A CAPTCHA is still expected after that, and on a brand-new login.
+
+**Verified:** 15/15 checks through the real module with real Edge and a throwaway profile: login form, zoom and Click2Connect scripts, reCAPTCHA present, viewport, attach to open Edge, clean shutdown, storage survives restart, `setInputFiles` upload. Real `electron/main.js` quit tested with and without a Portnet session (app exits, Edge closed).
+
+**Files changed:** `src/portnet/portnetLogin.js`, `src/config/config.js`, `electron/main.js`, `.env.example`, `ai-docs/STACK.md`
+
+---
+
 ## 2026-10-20 — Startup check: surface missing/incomplete .env loudly instead of a buried warning
 
 A second PC silently lost email notifications ("Email skipped (EMAIL_ENABLED/USER/TO not configured)") even though it had worked there before. `.env` is gitignored (never travels with `git pull`/clone — only `.env.example` is tracked), so a reinstall/update on any machine can leave `.env` missing or incomplete with no obvious signal — the only trace was that one buried mailer warning line mid-run.
