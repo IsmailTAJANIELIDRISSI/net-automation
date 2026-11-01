@@ -51,14 +51,17 @@ class PortnetLogin {
     this.context = this.browser.contexts()[0];
   }
 
-  /** Reuse a Portnet Edge that is already open, otherwise start one. */
+  /**
+   * Reuse a Portnet Edge that is already open, otherwise start one.
+   * @returns {Promise<boolean>} true when Edge was started here
+   */
   async _openEdge() {
-    if (this.browser?.isConnected()) return;
+    if (this.browser?.isConnected()) return false;
 
     try {
       await this._attach();
       log.info("Edge Portnet déjà ouvert — reconnexion.");
-      return;
+      return false;
     } catch {
       // not running — start it below
     }
@@ -80,7 +83,7 @@ class PortnetLogin {
     for (;;) {
       try {
         await this._attach();
-        return;
+        return true;
       } catch (err) {
         if (Date.now() > deadline) {
           throw new Error(
@@ -101,7 +104,7 @@ class PortnetLogin {
   async login() {
     // The on-disk profile keeps Portnet's login token (localStorage) between
     // launches, so a still-valid session skips the login form and the CAPTCHA.
-    await this._openEdge();
+    const startedEdge = await this._openEdge();
 
     // Apply a 90% zoom on every page Portnet loads (re-runs on each navigation,
     // top frame only to avoid double-zooming the cross-origin DS form iframe).
@@ -143,12 +146,18 @@ class PortnetLogin {
       }
     });
 
-    // Edge opens with one tab — reuse it, or the Portnet tab of a window left open.
+    // Never drive Edge's startup tab: it is still loading the new-tab page, which
+    // interrupts our navigation. Use the Portnet tab of a window left open, or a
+    // tab of our own. Other tabs are only closed if we just started Edge ourselves.
     const pages = this.context.pages();
     this.page =
       pages.find((p) => p.url().includes("portnet.ma")) ||
-      pages[0] ||
       (await this.context.newPage());
+    if (startedEdge) {
+      for (const p of pages) {
+        if (p !== this.page) await p.close().catch(() => {});
+      }
+    }
     this.page.setDefaultTimeout(config.timeout);
 
     log.info("Navigating to Portnet…");

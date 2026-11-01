@@ -24,6 +24,8 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 **Verified:** 15/15 checks through the real module with real Edge and a throwaway profile: login form, zoom and Click2Connect scripts, reCAPTCHA present, viewport, attach to open Edge, clean shutdown, storage survives restart, `setInputFiles` upload. Real `electron/main.js` quit tested with and without a Portnet session (app exits, Edge closed).
 
+**Follow-up same day:** first run on the production PC failed with `page.goto ... interrupted by another navigation to https://ntp.msn.com/...`, before the login form was reached. The app was driving Edge's startup tab, which was still loading its new-tab page. The first test used an empty profile and a PC where Edge attaches more slowly, so it missed the race. Fix: never use the startup tab. The app opens its own tab, or reuses a Portnet tab of a window left open, and closes the startup tab only when it started Edge itself. Forcing the same navigation on a copy of a real profile: old code 0/3 reached the login form, fixed code 5/5, and an operator's other tab survives a reattach. The reCAPTCHA checkbox renders in the new tab with the tab visible and focused.
+
 **Files changed:** `src/portnet/portnetLogin.js`, `src/config/config.js`, `electron/main.js`, `.env.example`, `ai-docs/STACK.md`
 
 ---
