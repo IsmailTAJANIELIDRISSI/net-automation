@@ -1174,33 +1174,9 @@ async function prepareLotAndWeightCheck(acheminement) {
         }).catch(() => {});
       };
 
-      if (diff > 20) {
-        updateAutomationState(folderPath, {
-          phase: "partiel_skip",
-          error: "Partiel skip – weight diff > 20 kg",
-          badrWeight: poidsBadr,
-          userWeight: poidsUser,
-          diff,
-        });
-        sendLog(
-          "warn",
-          "WeightCheck",
-          `Écart de poids > 20 kg (${diff.toFixed(2)} kg) — traitement arrêté (LTA partielle)`,
-        );
-        await notifyWeightMismatch("critique > 20 kg");
-        sendProgress(id, "partiel-skip", {
-          badrWeight: poidsBadr,
-          userWeight: poidsUser,
-          diff,
-        });
-        return {
-          success: false,
-          error: "Partiel skip – weight diff > 20 kg",
-          poidsBadr,
-          poidsUser,
-        };
-      }
-
+      // Same colis and a weight far off (over 20 kg, case D) is NOT a partiel (owner, 2026-11-23, in every mode since 2026-11-24): with the same colis no vol is missing, so a document's
+      // weight is wrong. It stops here like the 5 to 20 kg gap: « weight_mismatch », the checkpoint the hub expects for case D (hub/shared/ltaValidation/badrCases.js). Before, it
+      // stopped as a partiel (« partiel_skip », « LTA partielle »).
       if (diff > 5) {
         updateAutomationState(folderPath, {
           phase: "weight_mismatch",
@@ -1214,7 +1190,7 @@ async function prepareLotAndWeightCheck(acheminement) {
           "WeightCheck",
           `Écart de poids ${diff.toFixed(2)} kg (> 5 kg) (BADR: ${poidsBadr} kg / saisie: ${poidsUser} kg) — arrêt et vérification requise`,
         );
-        await notifyWeightMismatch("> 5 kg");
+        await notifyWeightMismatch(diff > 20 ? "critique > 20 kg" : "> 5 kg");
         sendProgress(id, "weight-mismatch", {
           badrWeight: poidsBadr,
           userWeight: poidsUser,
