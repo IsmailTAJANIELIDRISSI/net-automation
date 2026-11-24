@@ -128,7 +128,7 @@ function createWindow() {
   });
 
   if (isDev) {
-    const port = process.env.VITE_PORT || "8081";
+    const port = process.env.VITE_PORT || "5173"; // same default as vite.config.js
     mainWindow.loadURL(`http://localhost:${port}`);
     // mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
