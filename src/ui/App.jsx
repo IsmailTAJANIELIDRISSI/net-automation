@@ -353,6 +353,7 @@ export default function App() {
           nombreContenant: pick("nombreContenant"),
           poidTotal: pick("poidTotal"),
           sequenceNumber: pick("sequenceNumber"),
+          partielSequences: pick("partielSequences"),
           lieuChargement: pick("lieuChargement"),
           currency,
           totalValue,

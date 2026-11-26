@@ -1,0 +1,4045 @@
+"use strict";
+/**
+ * Electron Main Process
+ * - Creates the BrowserWindow
+ * - Handles all IPC between the React UI and the Node.js automation layer
+ * - Streams automation logs to the renderer in real-time
+ */
+
+const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
+const path = require("path");
+const fs = require("fs");
+const os = require("os");
+const { sendNotification } = require("../src/utils/mailer");
+
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
+
+const config = require("../src/config/config");
+const { createLogger } = require("../src/utils/logger");
+const envLog = createLogger("StartupCheck");
+
+// ── Startup config sanity check ──────────────────────────────────────────────
+// .env is gitignored (never travels with git pull/clone), so a machine can
+// silently lose its configuration after an update/reinstall — the only sign
+// was a buried "Email skipped (EMAIL_ENABLED/USER/TO not configured)" line in
+// the middle of a run. Surface every critical gap loudly, once, at launch.
+function checkEnvConfig() {
+  const envPath = path.join(__dirname, "..", ".env");
+  if (!fs.existsSync(envPath)) {
+    envLog.error(
+      `.env introuvable (${envPath}) — BADR, Portnet et les emails ne sont pas configurés. Copiez .env.example vers .env et remplissez-le.`,
+    );
+    return;
+  }
+
+  // ── Email notifications ────────────────────────────────────────────────
+  const { email } = config;
+  if (!email.enabled) {
+    envLog.warn(
+      'Notifications email désactivées (EMAIL_ENABLED n\'est pas "true" dans .env).',
+    );
+  } else if (!email.user || !email.to) {
+    const missing = [!email.user && "EMAIL_USER", !email.to && "EMAIL_TO"]
+      .filter(Boolean)
+      .join(", ");
+    envLog.error(
+      `EMAIL_ENABLED=true mais ${missing} manquant(e) dans .env — les emails ne partiront PAS.`,
+    );
+  } else {
+    envLog.info(`Notifications email actives → ${email.to}`);
+  }
+
+  // ── BADR credentials ────────────────────────────────────────────────────
+  if (!process.env.BADR_USERNAME || !process.env.BADR_PASSWORD) {
+    envLog.error(
+      "BADR_USERNAME/BADR_PASSWORD manquant(s) dans .env — la connexion BADR échouera.",
+    );
+  }
+
+  // ── Portnet credentials ─────────────────────────────────────────────────
+  if (!process.env.PORTNET_USERNAME || !process.env.PORTNET_PASSWORD) {
+    envLog.error(
+      "PORTNET_USERNAME/PORTNET_PASSWORD manquant(s) dans .env — la connexion Portnet échouera.",
+    );
+  }
+}
+
+// ── Dev / Prod detection ─────────────────────────────────────────────────────
+const isDev = process.env.NODE_ENV === "development" || !app.isPackaged;
+
+console.log("[ELECTRON] Main process starting", {
+  pid: process.pid,
+  isPackaged: app.isPackaged,
+  nodeEnv: process.env.NODE_ENV || "(not set)",
+  isDev,
+  vitePortFromEnv: process.env.VITE_PORT || "(not set)",
+});
+
+let mainWindow = null;
+
+// ── Zoom ──────────────────────────────────────────────────────────────────────
+// One place owns the zoom level: the footer buttons (IPC), Ctrl +/-/0, Ctrl+wheel
+// and the on-load re-apply all go through applyZoom(), and the new level is pushed
+// to the renderer ("zoom-changed") so the control shows the current percentage.
+// The level is deliberately NOT saved to disk: it lives only for this run of the
+// app (so a dev-HMR reload keeps it), and every app restart starts at DEFAULT_ZOOM.
+const DEFAULT_ZOOM = 0.9; // compact default so tall cards (Lancer) fit
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 1.5;
+const ZOOM_STEP = 0.1;
+let currentZoom = DEFAULT_ZOOM;
+
+const clampZoom = (z) =>
+  Math.round(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z)) * 100) / 100;
+
+function applyZoom(z) {
+  currentZoom = clampZoom(z);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.setZoomFactor(currentZoom);
+    mainWindow.webContents.send("zoom-changed", currentZoom);
+  }
+  return currentZoom;
+}
+
+/** action: "in" | "out" | "reset" */
+function stepZoom(action) {
+  if (action === "in") return applyZoom(currentZoom + ZOOM_STEP);
+  if (action === "out") return applyZoom(currentZoom - ZOOM_STEP);
+  return applyZoom(DEFAULT_ZOOM); // "reset"
+}
+
+ipcMain.handle("zoom:get", () => currentZoom);
+ipcMain.handle("zoom:step", (_event, action) => stepZoom(action));
+
+// ── Window ────────────────────────────────────────────────────────────────────
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1400,
+    height: 900,
+    minWidth: 1000,
+    minHeight: 700,
+    backgroundColor: "#020617", // slate-950
+    titleBarStyle: "hidden",
+    titleBarOverlay: {
+      color: "#0f172a",
+      symbolColor: "#94a3b8",
+      height: 32,
+    },
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+    icon: path.join(__dirname, "..", "assets", "icon.png"),
+    show: false,
+  });
+
+  if (isDev) {
+    // Keep this fallback aligned with vite.config.js (5173).
+    const port = process.env.VITE_PORT || "5173";
+    const devUrl = `http://localhost:${port}/`;
+
+    console.log("[ELECTRON] Loading development renderer:", devUrl);
+
+    mainWindow.loadURL(devUrl).catch((err) => {
+      console.error("[ELECTRON] loadURL rejected:", err);
+    });
+
+    // mainWindow.webContents.openDevTools({ mode: "detach" });
+  } else {
+    const productionFile = path.join(__dirname, "..", "dist", "index.html");
+
+    console.log("[ELECTRON] Loading production renderer:", productionFile);
+
+    mainWindow.loadFile(productionFile).catch((err) => {
+      console.error("[ELECTRON] loadFile rejected:", err);
+    });
+  }
+
+  mainWindow.webContents.on("did-finish-load", () => {
+    console.log(
+      "[ELECTRON] did-finish-load:",
+      mainWindow && !mainWindow.isDestroyed()
+        ? mainWindow.webContents.getURL()
+        : "(window destroyed)",
+    );
+
+    applyZoom(currentZoom);
+
+    // Force the window to appear after the renderer loads.
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      console.log("[ELECTRON] Forcing window visibility");
+
+      if (!mainWindow.isVisible()) {
+        mainWindow.show();
+      }
+
+      mainWindow.focus();
+
+      console.log("[ELECTRON] Window visibility:", mainWindow.isVisible());
+    }
+  });
+
+  // Diagnose renderer loading failures.
+  mainWindow.webContents.on(
+    "did-fail-load",
+    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      console.error("[ELECTRON] did-fail-load:", {
+        errorCode,
+        errorDescription,
+        validatedURL,
+        isMainFrame,
+      });
+    },
+  );
+
+  // Diagnose renderer crashes.
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    console.error("[ELECTRON] render-process-gone:", details);
+  });
+
+  mainWindow.on("unresponsive", () => {
+    console.error("[ELECTRON] BrowserWindow became unresponsive");
+  });
+  // Run once the renderer's log listener (preload.js) is attached, so the
+  // result also lands in the app's own log pane, not just the terminal/file.
+  mainWindow.webContents.once("did-finish-load", () => checkEnvConfig());
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    if (!input.control || input.type !== "keyDown") return;
+    if (input.key === "=" || input.key === "+") {
+      stepZoom("in");
+      event.preventDefault();
+    } else if (input.key === "-") {
+      stepZoom("out");
+      event.preventDefault();
+    } else if (input.key === "0") {
+      stepZoom("reset");
+      event.preventDefault();
+    }
+  });
+
+  mainWindow.once("ready-to-show", () => {
+    console.log("[ELECTRON] Window ready-to-show");
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show();
+      mainWindow.focus();
+
+      console.log("[ELECTRON] Window shown and focused");
+    }
+  });
+  mainWindow.on("closed", () => {
+    mainWindow = null;
+  });
+}
+
+app
+  .whenReady()
+  .then(() => {
+    console.log("[ELECTRON] app.whenReady — creating main window");
+
+    createWindow();
+
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        console.log("[ELECTRON] activate — recreating main window");
+        createWindow();
+      }
+    });
+  })
+  .catch((err) => {
+    console.error("[ELECTRON] Failed during app startup:", err);
+  });
+
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") app.quit();
+});
+
+// ── Forward automation logs to renderer ───────────────────────────────────────
+function setupLogForwarding() {
+  try {
+    const { logEmitter } = require("../src/utils/logger");
+    logEmitter.on("log", (entry) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("log", entry);
+      }
+    });
+  } catch (e) {
+    console.error("Could not attach log emitter:", e.message);
+  }
+}
+setupLogForwarding();
+
+// ── Helper: send log directly (for Electron-level messages) ──────────────────
+function sendLog(level, context, message) {
+  try {
+    const { write } = require("../src/utils/logger");
+    write(level, context, message); // writes to file + console + emits to logEmitter → renderer
+  } catch (e) {
+    // Fallback if logger unavailable
+    console.log(`[${level.toUpperCase()}] [${context}] ${message}`);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("log", {
+        level,
+        context,
+        message,
+        ts: new Date().toISOString(),
+      });
+    }
+  }
+}
+
+function sendProgress(acheminementId, status, extra = {}) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("progress", {
+      acheminementId,
+      status,
+      ...extra,
+    });
+  }
+}
+
+// Tell the renderer the acheminements list changed on disk (e.g. the monitor
+// discovered a newly-added LTA folder mid-run) so it re-scans and shows it.
+function notifyAcheminementsChanged() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("acheminements-changed");
+  }
+}
+
+// Watch the acheminements root folder so a folder dropped in at ANY time (app
+// idle or processing) makes its card appear live — the operator can then fill /
+// edit its fields. fs.watch is non-recursive, so it fires on subfolder add/remove
+// but NOT on the nested acheminement.json writes our own scan does (no feedback
+// loop). Events are debounced into one refresh.
+let folderWatcher = null;
+let watchedFolderPath = null;
+let watchDebounceTimer = null;
+
+function watchAcheminementsFolder(folderPath) {
+  if (watchedFolderPath === folderPath && folderWatcher) return; // already on it
+  if (folderWatcher) {
+    try {
+      folderWatcher.close();
+    } catch {
+      /* ignore */
+    }
+    folderWatcher = null;
+  }
+  watchedFolderPath = folderPath || null;
+  if (!folderPath || !fs.existsSync(folderPath)) return;
+  try {
+    folderWatcher = fs.watch(folderPath, { persistent: false }, () => {
+      if (watchDebounceTimer) clearTimeout(watchDebounceTimer);
+      watchDebounceTimer = setTimeout(() => {
+        watchDebounceTimer = null;
+        notifyAcheminementsChanged();
+      }, 800);
+    });
+    folderWatcher.on("error", (err) =>
+      sendLog(
+        "warn",
+        "Scan",
+        `Surveillance du dossier interrompue: ${err.message}`,
+      ),
+    );
+    sendLog("info", "Scan", `Surveillance du dossier activée: ${folderPath}`);
+  } catch (err) {
+    sendLog(
+      "warn",
+      "Scan",
+      `Impossible de surveiller le dossier: ${err.message}`,
+    );
+  }
+}
+
+let sharedPortnetApp = null;
+let sharedPortnetPage = null;
+let sharedBadrConn = null;
+
+// "Pas encore manifest" throttling. A waiting-manifest LTA is re-checked in BADR
+// at most once every MANIFEST_CHECK_INTERVAL_MS (persisted via manifestLastCheckAt
+// — survives app restarts, so a relaunch after the interval re-checks). It is
+// NEVER dropped automatically — the app keeps re-checking every interval for as
+// long as it runs (the operator can always force an immediate re-check sooner by
+// clicking Lancer / Tout lancer / Ajouter au traitement, which also sweeps every
+// OTHER currently-waiting LTA — see forceManifestRecheck, retryWaitingManifest's
+// `force` param, and sweepManifestWatchExcept). The "pas encore manifest" email
+// fires only once per LTA (manifestNotified). This kills the previous
+// once-a-minute re-check + mail spam.
+const MANIFEST_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 h
+const manifestIntervalLabel = () =>
+  MANIFEST_CHECK_INTERVAL_MS >= 3_600_000
+    ? `${+(MANIFEST_CHECK_INTERVAL_MS / 3_600_000).toFixed(1)} h`
+    : `${Math.round(MANIFEST_CHECK_INTERVAL_MS / 60_000)} min`;
+
+/** True when it's too soon (< MANIFEST_CHECK_INTERVAL_MS) to re-check this LTA's manifest again. */
+function manifestCheckThrottled(checkpoint) {
+  const lastAt = checkpoint?.manifestLastCheckAt
+    ? Date.parse(checkpoint.manifestLastCheckAt)
+    : 0;
+  return !!lastAt && Date.now() - lastAt < MANIFEST_CHECK_INTERVAL_MS;
+}
+
+// Sanity bounds for the declared "Valeur totale", by currency. Mirror of
+// VALUE_RANGE_LIMITS in src/ui/requiredFields.js — keep the two in sync. A value
+// outside the range must be confirmed by the operator (ach.valueRangeAck) before
+// the LTA is processed; this is a backend safety net behind the UI gate.
+const VALUE_RANGE_LIMITS = {
+  MAD: { min: 150000, max: 450000 },
+  USD: { min: 4000, max: 40000 },
+};
+
+/** True if the operator explicitly edited `key` (tracked by the UI). When false,
+ *  re-extracted manifest data is authoritative for that field. */
+function userEdited(ach, key) {
+  return Array.isArray(ach?._editedFields) && ach._editedFields.includes(key);
+}
+
+/** Returns an error message if Valeur totale is out of range, else null. */
+function valueRangeError(ach) {
+  const currency = String(ach?.currency || "MAD").toUpperCase();
+  const limits = VALUE_RANGE_LIMITS[currency];
+  if (!limits) return null;
+  const raw = ach?.totalValue;
+  if (raw === undefined || raw === null || String(raw).trim() === "")
+    return null;
+  const value = Number(String(raw).replace(/\s/g, "").replace(",", "."));
+  if (!Number.isFinite(value)) return null;
+  if (value >= limits.min && value <= limits.max) return null;
+  return `Valeur totale ${value} ${currency} hors de la plage attendue (${limits.min} – ${limits.max} ${currency}) — à confirmer par l'opérateur.`;
+}
+
+// A batch is running (submit → monitor). While it is, a "Tout lancer" / "Lancer"
+// from the UI must NOT start a second concurrent batch (that would race on the
+// shared browser pages). Instead, if a Portnet monitor is actively polling
+// (monitorActive), the request is queued and the running monitor injects it on
+// its next poll cycle — checkpoints skip LTAs already submitted/done, so only
+// genuinely new LTAs get processed, and the browsers stay open.
+let batchRunning = false;
+let monitorActive = false;
+const injectionQueue = []; // [{ id, folderPath }] awaiting the running monitor
+// [{ folderPath, signedSerie }] partiel scellés declarations awaiting the running
+// monitor — declaring uses BADR, so it must be serialized with the monitor's own
+// BADR work (see drainDeclarationQueue).
+const declarationQueue = [];
+
+// Drain queued partiel scellés declarations on the shared BADR session (called
+// inside the monitor loop, guarded by badrBusy so it can't race the keepalive).
+async function drainDeclarationQueue() {
+  if (declarationQueue.length === 0) return 0;
+  const reqs = declarationQueue.splice(0);
+  let done = 0;
+  for (const { folderPath, signedSerie } of reqs) {
+    try {
+      const res = await declareScellesPartielFlow(folderPath, signedSerie);
+      if (res?.ok) done++;
+    } catch (e) {
+      sendLog("error", "Scellés", `Déclaration en file échouée: ${e.message}`);
+    }
+  }
+  return done;
+}
+
+async function ensurePortnetSession() {
+  const PortnetLogin = require("../src/portnet/portnetLogin");
+
+  if (sharedPortnetPage && !sharedPortnetPage.isClosed()) {
+    return sharedPortnetPage;
+  }
+
+  if (!sharedPortnetApp) {
+    sharedPortnetApp = new PortnetLogin();
+    sendLog("info", "Portnet", "Launching shared Portnet session…");
+    sendLog(
+      "info",
+      "Portnet",
+      ">>> Résolvez le CAPTCHA dans la fenêtre du navigateur <<<",
+    );
+  }
+
+  sharedPortnetPage = await sharedPortnetApp.login();
+  sendLog("info", "Portnet", "Shared Portnet session ready.");
+  return sharedPortnetPage;
+}
+
+async function ensureBadrSession() {
+  const BADRConnection = require("../src/badr/badrConnection");
+
+  if (sharedBadrConn?.page && !sharedBadrConn.page.isClosed()) {
+    return sharedBadrConn;
+  }
+
+  if (!sharedBadrConn) {
+    sharedBadrConn = new BADRConnection();
+  }
+
+  try {
+    await sharedBadrConn.connect();
+  } catch (err) {
+    sendLog(
+      "warn",
+      "BADR",
+      `Shared BADR connect failed (${err.message}) — retrying with reconnect...`,
+    );
+    await sharedBadrConn.reconnect();
+  }
+
+  sendLog("info", "BADR", "Shared BADR session ready.");
+  return sharedBadrConn;
+}
+
+async function closeSharedSessions() {
+  if (sharedPortnetApp) {
+    await sharedPortnetApp.close().catch(() => {});
+    sharedPortnetApp = null;
+    sharedPortnetPage = null;
+  }
+  if (sharedBadrConn) {
+    await sharedBadrConn.disconnect().catch(() => {});
+    sharedBadrConn.kill();
+    sharedBadrConn = null;
+  }
+}
+
+// ── Session keepalives ─────────────────────────────────────────────────────────
+// BADR expires an idle session after ~15 min and Portnet after a while too; both
+// need a real HTTP request to reset the server-side idle timer.
+
+/** One BADR keepalive: real page reload (sends a request) then back to Accueil. */
+async function badrKeepAliveOnce() {
+  const badrConn = await ensureBadrSession();
+  // A real reload — merely checking the URL (navigateToAccueil when already on
+  // Accueil) sends NO request, so the JSF session would still silently expire.
+  await badrConn.page
+    .reload({ waitUntil: "domcontentloaded", timeout: 30_000 })
+    .catch((reloadErr) =>
+      sendLog(
+        "warn",
+        "BADR",
+        `BADR keepalive reload failed: ${reloadErr.message} — trying navigateToAccueil`,
+      ),
+    );
+  // Ends on Accueil (also handles session-expiry redirects after the reload).
+  await badrConn.navigateToAccueil();
+}
+
+const PORTNET_KEEPALIVE_MS = 5 * 60 * 1000;
+let lastPortnetKeepAlive = 0;
+
+/**
+ * Refresh the Portnet session (throttled to PORTNET_KEEPALIVE_MS). Only touches an
+ * EXISTING session — never opens one (that would demand a CAPTCHA). Uses a goto of
+ * the consultation page (what the monitor's polling does) so it's a real request.
+ */
+async function portnetKeepAliveIfDue(page = sharedPortnetPage) {
+  if (Date.now() - lastPortnetKeepAlive < PORTNET_KEEPALIVE_MS) return;
+  if (!page || page.isClosed()) return;
+  lastPortnetKeepAlive = Date.now();
+  try {
+    sendLog(
+      "info",
+      "Portnet",
+      "Rafraîchissement de la session Portnet (attente du manifeste)…",
+    );
+    await page.goto("https://cargo.portnet.ma/dsCombine/consultation", {
+      waitUntil: "domcontentloaded",
+      timeout: 30_000,
+    });
+  } catch (err) {
+    sendLog("warn", "Portnet", `Keepalive Portnet échoué: ${err.message}`);
+  }
+}
+
+// ── Background "pas encore manifest" watcher ──────────────────────────────────
+// The batch monitor waits for + re-checks missing manifests, but it only exists in
+// a batch that opened a Portnet session (≥ 1 non-partiel LTA). A partiel-only
+// batch, a single "Lancer", or an LTA added mid-run left the LTA parked with no
+// re-check and no session refresh. This watcher covers every path: any LTA that
+// ends "waiting_manifest" is registered; while such LTAs exist and the app is
+// otherwise IDLE it keeps BADR (45 s) and Portnet (5 min) alive and re-runs the
+// LTA once its interval (MANIFEST_CHECK_INTERVAL_MS) has elapsed — indefinitely,
+// never giving up automatically. It never runs while any automation is in flight
+// (a reload mid-declaration would be destructive): `appBusy` counts user/watcher runs.
+const MANIFEST_WATCH_TICK_MS = 45_000;
+const manifestWatch = new Map(); // folderPath → { ach }
+let manifestWatchTimer = null;
+let manifestWatchTickRunning = false;
+let appBusy = 0; // in-flight automations (IPC-launched, declare-scellés, watcher)
+let watcherRunning = false; // the watcher's own re-check is in flight
+
+async function withBusy(fn) {
+  appBusy++;
+  try {
+    return await fn();
+  } finally {
+    appBusy--;
+  }
+}
+
+function registerManifestWatch(ach) {
+  if (!ach?.folderPath) return;
+  manifestWatch.set(ach.folderPath, { ach: { ...ach } });
+  if (!manifestWatchTimer) {
+    manifestWatchTimer = setInterval(manifestWatchTick, MANIFEST_WATCH_TICK_MS);
+  }
+}
+
+function stopManifestWatchTimer() {
+  if (manifestWatchTimer) {
+    clearInterval(manifestWatchTimer);
+    manifestWatchTimer = null;
+  }
+}
+
+/** Latest saved (operator-edited) fields win over the registered snapshot. */
+function mergeSavedIntoAch(ach, saved) {
+  const merged = { ...ach };
+  for (const [k, v] of Object.entries(saved || {})) {
+    if (k === CHECKPOINT_KEY) continue;
+    if (v !== null && v !== undefined && String(v).trim() !== "") merged[k] = v;
+  }
+  merged.automationState = saved?.[CHECKPOINT_KEY] || null;
+  return merged;
+}
+
+async function manifestWatchTick() {
+  if (manifestWatchTickRunning) return;
+  manifestWatchTickRunning = true;
+  try {
+    // Drop LTAs that are no longer waiting (progressed past waiting_manifest, or
+    // their folder was deleted). NEVER drop one just for having been checked many
+    // times — keep re-checking every MANIFEST_CHECK_INTERVAL_MS indefinitely.
+    for (const [fp] of [...manifestWatch]) {
+      const st = fs.existsSync(fp) ? getAutomationState(fp) : null;
+      if (!st || st.phase !== "waiting_manifest") {
+        manifestWatch.delete(fp);
+      }
+    }
+    if (manifestWatch.size === 0) {
+      stopManifestWatchTimer();
+      return;
+    }
+
+    // Active work owns the sessions (and keeps them alive by using them; a batch
+    // monitor also runs its own keepalive + re-checks) — stay out of its way.
+    if (appBusy > 0 || batchRunning || monitorActive) return;
+
+    // 1. Keep BADR alive.
+    try {
+      await badrKeepAliveOnce();
+    } catch (err) {
+      sendLog(
+        "warn",
+        "BADR",
+        `Keepalive BADR (attente manifeste) échoué: ${err.message}`,
+      );
+    }
+
+    // 2. Keep Portnet alive — only if a non-partiel LTA will need it on submit.
+    if ([...manifestWatch.values()].some((e) => !e.ach.partiel)) {
+      await portnetKeepAliveIfDue();
+    }
+
+    // 3. Re-check LTAs whose interval has elapsed.
+    for (const [fp, entry] of [...manifestWatch]) {
+      if (appBusy > 0 || batchRunning || monitorActive) break; // user started work
+      const st = getAutomationState(fp);
+      if (!st || st.phase !== "waiting_manifest") continue;
+      if (manifestCheckThrottled(st)) continue; // not due yet
+      const ach = mergeSavedIntoAch(entry.ach, readAcheminementFile(fp));
+      sendLog(
+        "info",
+        "BADR",
+        `Re-vérification automatique du manifeste pour "${ach.id}" (vérification ${(st.manifestCheckCount || 0) + 1})…`,
+      );
+      watcherRunning = true;
+      try {
+        await withBusy(() =>
+          ach.partiel ? runPartielDumFlow(ach) : runAutomationTask(ach),
+        );
+      } catch (err) {
+        sendLog(
+          "error",
+          "Automation",
+          `Re-vérification "${ach.id}" échouée: ${err.message}`,
+        );
+      } finally {
+        watcherRunning = false;
+      }
+    }
+  } finally {
+    manifestWatchTickRunning = false;
+  }
+}
+
+// Force-recheck every OTHER currently-tracked waiting-manifest LTA (used only on
+// the NO-ACTIVE-BATCH path — see automation:run). The operator clicking Lancer on
+// one LTA is treated as "check BADR now" for every waiting-manifest LTA the app
+// knows about, not just the one clicked. `excludeFolderPath` is the LTA already
+// just handled directly by the caller (skip it — don't double-run it).
+// Runs sequentially (one BADR session) and best-effort: one failure logs and
+// continues to the next rather than aborting the whole sweep.
+async function sweepManifestWatchExcept(excludeFolderPath) {
+  const others = [...manifestWatch.entries()].filter(
+    ([fp]) => fp !== excludeFolderPath,
+  );
+  if (others.length === 0) return;
+  sendLog(
+    "info",
+    "BADR",
+    `Re-vérification manifeste demandée — ${others.length} autre(s) LTA(s) en attente également re-vérifiée(s)…`,
+  );
+  for (const [fp, entry] of others) {
+    const st = fs.existsSync(fp) ? getAutomationState(fp) : null;
+    if (!st || st.phase !== "waiting_manifest") {
+      manifestWatch.delete(fp); // progressed/deleted meanwhile — drop it
+      continue;
+    }
+    const ach = mergeSavedIntoAch(entry.ach, readAcheminementFile(fp));
+    try {
+      await withBusy(() =>
+        ach.partiel
+          ? runPartielDumFlow(ach)
+          : runAutomationTask(ach, { forceManifestRecheck: true }),
+      );
+    } catch (err) {
+      sendLog(
+        "error",
+        "Automation",
+        `Re-vérification "${ach.id}" échouée: ${err.message}`,
+      );
+    }
+  }
+}
+
+const CHECKPOINT_KEY = "automationState";
+
+function readAcheminementFile(folderPath) {
+  const savePath = path.join(folderPath, "acheminement.json");
+  if (!fs.existsSync(savePath)) return {};
+
+  try {
+    return JSON.parse(fs.readFileSync(savePath, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+/** JSON may contain "" for empty fields — treat as missing so manifest PDF can fill. */
+function pickSavedOrExtracted(savedVal, extractedVal, fallback = "") {
+  if (savedVal != null && String(savedVal).trim() !== "") {
+    return savedVal;
+  }
+  if (extractedVal != null && String(extractedVal).trim() !== "") {
+    return extractedVal;
+  }
+  return fallback;
+}
+
+function writeAcheminementFile(folderPath, data) {
+  // The operator can delete an acheminement folder from disk mid-run. Don't crash
+  // (ENOENT) trying to persist into a directory that no longer exists — just skip.
+  if (!folderPath || !fs.existsSync(folderPath)) return false;
+  const savePath = path.join(folderPath, "acheminement.json");
+  fs.writeFileSync(savePath, JSON.stringify(data, null, 2), "utf8");
+  return true;
+}
+
+function normalizeLotReference(value) {
+  if (!value) return "";
+  const text = String(value).trim();
+  const match = text.match(/^(\d+)-(\d+)$/);
+  if (!match) return text;
+
+  const left = String(parseInt(match[1], 10));
+  const right = match[2];
+  return `${Number.isNaN(Number(left)) ? match[1] : left}-${right}`;
+}
+
+const {
+  extractLotReferenceFromFilename,
+  extractManifestMetricsFromPdfFile,
+  pickManifestPdf,
+  pickMawbPdf,
+} = require("../src/utils/manifestPdfExtract");
+const {
+  extractShipperName,
+  extractMawbMeta,
+} = require("../src/utils/mawbShipperExtract");
+
+function extractLotReferenceFromFolder(folderPath) {
+  try {
+    const fileNames = fs
+      .readdirSync(folderPath, { withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name);
+
+    const mawbFile = fileNames.find((name) => /\bmawb\b/i.test(name));
+    const manifesteFile = fileNames.find((name) => /\bmanifeste\b/i.test(name));
+
+    const mawbRef = mawbFile ? extractLotReferenceFromFilename(mawbFile) : "";
+    if (mawbRef) return mawbRef;
+
+    const manifesteRef = manifesteFile
+      ? extractLotReferenceFromFilename(manifesteFile)
+      : "";
+    if (manifesteRef) return manifesteRef;
+
+    for (const name of fileNames) {
+      const ref = extractLotReferenceFromFilename(name);
+      if (ref) return ref;
+    }
+  } catch {
+    return "";
+  }
+
+  return "";
+}
+
+function getAutomationState(folderPath) {
+  return readAcheminementFile(folderPath)[CHECKPOINT_KEY] || null;
+}
+
+function updateAutomationState(folderPath, patch) {
+  const current = readAcheminementFile(folderPath);
+  current[CHECKPOINT_KEY] = {
+    ...(current[CHECKPOINT_KEY] || {}),
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  writeAcheminementFile(folderPath, current);
+  return current[CHECKPOINT_KEY];
+}
+
+function mapCheckpointToStatus(state) {
+  switch (state?.phase) {
+    case "portnet_sent_waiting":
+      return "submitting-portnet";
+    case "portnet_submitted":
+      return "portnet-submitted";
+    case "portnet_accepted":
+      return "portnet-accepted";
+    case "badr_done":
+    case "partiel_done":
+      return "done";
+    case "weight_mismatch":
+    case "partiel_poids_mismatch":
+      return "weight-mismatch";
+    case "partiel_skip":
+      return "partiel-skip";
+    case "partiel_waiting_lots":
+      return "partiel-waiting-lots";
+    case "partiel_lots_found":
+    case "partiel_declaration_opened":
+    case "partiel_entete_saved":
+    case "partiel_transport_saved":
+    case "partiel_caution_saved":
+    case "partiel_preapurement_done":
+    case "partiel_documents_saved":
+    case "partiel_demandes_saved":
+    case "partiel_articles_saved":
+      return "running";
+    case "error":
+      return "error";
+    default:
+      return "idle";
+  }
+}
+
+function getPollIntervalMs(attempts) {
+  if (attempts < 5) return 60_000;
+  if (attempts < 20) return 120_000;
+  return 180_000;
+}
+
+function normalizePortnetStatus(statusText) {
+  return String(statusText || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function isEnvoyeeStatus(statusText) {
+  return normalizePortnetStatus(statusText).startsWith("envoye");
+}
+
+function isAcceptedStatus(statusText) {
+  return normalizePortnetStatus(statusText).startsWith("acceptee");
+}
+
+function isRejectedStatus(statusText) {
+  return normalizePortnetStatus(statusText).startsWith("rejetee");
+}
+
+function isNouveauStatus(statusText) {
+  return normalizePortnetStatus(statusText).startsWith("nouveau");
+}
+
+async function prepareLotAndWeightCheck(acheminement) {
+  const {
+    id,
+    folderPath,
+    refNumber: refFromInput,
+    poidTotal: poidFromInput,
+    sequenceNumber,
+    lieuChargement,
+    partiel,
+  } = acheminement;
+
+  if (partiel) {
+    updateAutomationState(folderPath, {
+      phase: "partiel_skip",
+      reason: "partiel",
+    });
+    sendLog("warn", "Automation", `"${id}" marqué LTA Partielle – ignoré`);
+    sendProgress(id, "partiel-skip");
+    return { success: false, skipped: true, reason: "partiel" };
+  }
+
+  // Cross-check manifest vs MAWB (all LTAs). Only a colis discrepancy blocks;
+  // a weight gap is a non-blocking warning (the operator rectifies the poids
+  // input and launches). partiels are also checked in runPartielDumFlow.
+  const mawbCheck = computeMawbVsManifestMismatch({
+    manifestNbr: acheminement.nombreContenant,
+    manifestPoids: acheminement.poidTotal,
+    mawbNbr: acheminement.mawbNbrPieces,
+    mawbPoids: acheminement.mawbGrossWeight,
+  });
+  if (mawbCheck.warning) {
+    sendLog("warn", "MAWB", `[${id}] ${mawbCheck.warning}`);
+  }
+  const mawbMismatch = acheminement.mawbMismatch || mawbCheck.blocking;
+  if (mawbMismatch) {
+    updateAutomationState(folderPath, { phase: "error", error: mawbMismatch });
+    sendLog("warn", "MAWB", `[${id}] ${mawbMismatch} — traitement bloqué`);
+    sendProgress(id, "error", { error: mawbMismatch });
+    return { success: false, error: mawbMismatch };
+  }
+
+  const folderLotReference = extractLotReferenceFromFolder(folderPath);
+
+  let manifestPdfMetrics = null;
+  const manifestPath = acheminement.manifeste
+    ? path.join(folderPath, acheminement.manifeste)
+    : null;
+  if (manifestPath && fs.existsSync(manifestPath)) {
+    try {
+      manifestPdfMetrics =
+        await extractManifestMetricsFromPdfFile(manifestPath);
+      if (manifestPdfMetrics?.ok) {
+        sendLog(
+          "info",
+          "BADR",
+          "Manifeste PDF: en-tête lu (réf. / Pcs / kg / devise si présents).",
+        );
+      }
+    } catch (e) {
+      console.error("[manifest pdf]", e.message);
+    }
+  }
+
+  const resolvedRef =
+    normalizeLotReference(acheminement.manifestRef) ||
+    normalizeLotReference(refFromInput) ||
+    normalizeLotReference(folderLotReference) ||
+    normalizeLotReference(manifestPdfMetrics?.refNumber) ||
+    "";
+
+  if (!resolvedRef) {
+    sendLog(
+      "error",
+      "BADR",
+      "Référence LTA introuvable — vérifiez les noms de fichiers (ex. MAWB 157-54440131 (002).pdf) ou le texte du manifeste.",
+    );
+    sendProgress(id, "error", { error: "Référence LTA introuvable" });
+    return { success: false, error: "Référence LTA introuvable" };
+  }
+
+  const nombreMerged =
+    String(acheminement.nombreContenant || "").trim() ||
+    String(manifestPdfMetrics?.nombreContenant || "").trim();
+  const poidMerged =
+    String(poidFromInput || "").trim() ||
+    String(manifestPdfMetrics?.poidTotal || "").trim();
+  // Currency & total: the manifest PDF is the source of truth. Use the freshly
+  // re-extracted value unless the operator explicitly edited the field — this
+  // prevents a stale default (e.g. "MAD" persisted before the PDF was fully
+  // parsed) from being submitted to Portnet when the manifest actually says USD.
+  const extractedCurrency = String(manifestPdfMetrics?.currency || "").trim();
+  const savedCurrency = String(acheminement.currency || "").trim();
+  if (
+    !userEdited(acheminement, "currency") &&
+    extractedCurrency &&
+    extractedCurrency.toUpperCase() !== savedCurrency.toUpperCase()
+  ) {
+    sendLog(
+      "warn",
+      "Manifeste",
+      `[${id}] Devise manifeste "${extractedCurrency}" ≠ valeur enregistrée "${savedCurrency || "—"}" — utilisation de la devise du manifeste (source de vérité).`,
+    );
+  }
+  const currencyMerged =
+    (userEdited(acheminement, "currency")
+      ? savedCurrency
+      : extractedCurrency || savedCurrency) || "MAD";
+  const totalMerged = userEdited(acheminement, "totalValue")
+    ? String(acheminement.totalValue || "").trim()
+    : String(manifestPdfMetrics?.totalValue || "").trim() ||
+      String(acheminement.totalValue || "").trim();
+
+  // Value-range safety net — evaluated on the MERGED (source-of-truth) currency
+  // and value, not the possibly-stale saved ones. UI already blocks this; this
+  // guards edge cases (e.g. a corrected currency the UI hadn't re-validated).
+  if (!acheminement.valueRangeAck) {
+    const vErr = valueRangeError({
+      currency: currencyMerged,
+      totalValue: totalMerged,
+    });
+    if (vErr) {
+      updateAutomationState(folderPath, { phase: "error", error: vErr });
+      sendLog("warn", "Value", `[${id}] ${vErr} — traitement bloqué`);
+      sendProgress(id, "error", { error: vErr });
+      return { success: false, error: vErr };
+    }
+  }
+
+  const BADRLotLookup = require("../src/badr/badrLotLookup");
+  const BADRPreapurement = require("../src/badr/badrPreapurement");
+
+  let lotInfo = null;
+
+  try {
+    const badrConn = await ensureBadrSession();
+    await badrConn.navigateToAccueil();
+
+    if (!sequenceNumber || sequenceNumber.trim() === "") {
+      sendLog("info", "BADR", "No sequence number – looking up in BADR…");
+      const priorState = getAutomationState(folderPath);
+      const lotLookup = new BADRLotLookup(badrConn.page);
+      await lotLookup.openLotPopup();
+      // Only email "Pas encore manifest" the first time — not on every retry.
+      lotInfo = await lotLookup.searchLot(resolvedRef, {
+        emailOnEmpty: !priorState?.manifestNotified,
+        subjectPrefix: acheminementOrdinal(id),
+      });
+      await lotLookup.close();
+
+      if (lotInfo.isEmpty) {
+        // NOT a hard error — the manifest just isn't in BADR yet. Retryable
+        // "waiting_manifest" state; the monitor re-checks it (throttled to once per
+        // MANIFEST_CHECK_INTERVAL_MS, indefinitely) and picks it up as soon as it appears.
+        const checks = (priorState?.manifestCheckCount || 0) + 1;
+        updateAutomationState(folderPath, {
+          phase: "waiting_manifest",
+          error: null,
+          manifestCheckCount: checks,
+          manifestLastCheckAt: new Date().toISOString(),
+          manifestNotified: true,
+        });
+        sendLog(
+          "warn",
+          "BADR",
+          `Pas encore manifest pour ${resolvedRef} (vérification ${checks}) — nouvelle vérification dans ~${manifestIntervalLabel()}.`,
+        );
+        sendProgress(id, "waiting-manifest");
+        // Background watcher keeps sessions alive + re-checks after the interval,
+        // whichever launch path (batch, single Lancer, injected) brought us here.
+        registerManifestWatch(acheminement);
+        return { success: false, waitingManifest: true };
+      }
+
+      if (lotInfo.isPartiel) {
+        updateAutomationState(folderPath, {
+          phase: "partiel_skip",
+          reason: "partiel",
+          rowCount: lotInfo.rowCount,
+        });
+        sendLog(
+          "warn",
+          "BADR",
+          `DS Partiel détecté pour ${resolvedRef} (${lotInfo.rowCount} lignes) – ignoré`,
+        );
+        sendProgress(id, "partiel-skip");
+        return { success: false, skipped: true, reason: "partiel" };
+      }
+
+      sendLog(
+        "info",
+        "BADR",
+        `Lot trouvé: ${lotInfo.declarationRef} | Lieu: ${lotInfo.lieuChargement}`,
+      );
+
+      lotInfo.lotReference =
+        normalizeLotReference(folderLotReference) ||
+        normalizeLotReference(lotInfo.lotReference) ||
+        normalizeLotReference(resolvedRef) ||
+        "";
+
+      const seqDisplay =
+        String(parseInt(lotInfo.sequenceNum, 10)) +
+        (lotInfo.cle ? ` ${lotInfo.cle}` : "");
+      lotInfo.sequenceNum = seqDisplay;
+
+      try {
+        const existing = readAcheminementFile(folderPath);
+        existing.sequenceNumber = seqDisplay;
+        existing.lieuChargement = lotInfo.lieuChargement || "";
+        existing.lotReference =
+          lotInfo.lotReference || existing.lotReference || "";
+        writeAcheminementFile(folderPath, existing);
+      } catch (e) {
+        console.error("[sequenceNumber save] Failed:", e.message);
+      }
+
+      sendProgress(id, "running", {
+        sequenceNumber: seqDisplay,
+        lieuChargement: lotInfo.lieuChargement || "",
+      });
+    } else {
+      const parts = sequenceNumber.trim().split(/[\s-]+/);
+      const serie = parts[0].padStart(7, "0");
+      const cle = parts[1] || "";
+      sendLog("info", "BADR", `Using provided sequence: ${serie} ${cle}`);
+
+      const existingData = readAcheminementFile(folderPath);
+      const persistedLotReference =
+        normalizeLotReference(folderLotReference) ||
+        normalizeLotReference(
+          existingData?.automationState?.lotInfo?.lotReference,
+        ) ||
+        normalizeLotReference(existingData?.automationState?.lotReference) ||
+        normalizeLotReference(existingData?.lotReference) ||
+        normalizeLotReference(resolvedRef) ||
+        "";
+
+      lotInfo = {
+        declarationRef: resolvedRef
+          ? `301-000-${new Date().getFullYear()}-${serie}-${cle}`
+          : "",
+        bureau: "301",
+        regime: "000",
+        annee: String(new Date().getFullYear()),
+        serie,
+        cle,
+        sequenceNum: `${String(parseInt(serie, 10))}${cle ? ` ${cle}` : ""}`,
+        lieuChargement: lieuChargement || "",
+        lotReference: persistedLotReference,
+      };
+    }
+
+    sendLog(
+      "info",
+      "BADR",
+      "Restarting with MISE EN DOUANE for preapurement check…",
+    );
+    const preap = new BADRPreapurement(badrConn.page);
+    const poidsInfo = await preap.getPoidsBrut(lotInfo, resolvedRef);
+
+    const poidsBadr = parseFloat(String(poidsInfo.poidsBrut).replace(",", "."));
+    const poidsUser = parseFloat(String(poidMerged).replace(",", "."));
+
+    // Nombre de colis check — STOP if BADR's count differs from the user's entry,
+    // notify the operator, and let them rectify the acheminement data and retry.
+    const colisBadr = parseInt(
+      String(poidsInfo.nombreContenants || "").replace(/\D/g, ""),
+      10,
+    );
+    const colisUser = parseInt(
+      String(nombreMerged || "").replace(/\D/g, ""),
+      10,
+    );
+    if (!isNaN(colisBadr) && !isNaN(colisUser) && colisBadr !== colisUser) {
+      // When the colis count differs, the WEIGHT decides which case it is:
+      //  • weight ALSO differs (beyond a tiny rounding tolerance — even ~5 kg) →
+      //    part of the shipment is missing → partiel LTA / next vol not yet arrived
+      //    (to declare in DUM Normale Partiel), NOT a DS Combinée.
+      //  • weight MATCHES (within rounding) → the full shipment arrived but the
+      //    colis count is off → a genuine data mismatch the operator must rectify.
+      // NB: this tolerance is deliberately tight — unlike the colis-MATCH weight
+      // check below, here even a small weight gap means part of the lot is absent.
+      const POIDS_MATCH_TOLERANCE = 2; // kg — only rounding; more than this = partiel
+      const poidsDiffKg =
+        !isNaN(poidsBadr) && !isNaN(poidsUser)
+          ? Math.abs(poidsBadr - poidsUser)
+          : null;
+      const weightAlsoDiffers =
+        poidsDiffKg != null && poidsDiffKg > POIDS_MATCH_TOLERANCE;
+
+      const shot = await captureBadrPreapShot(
+        badrConn.page,
+        resolvedRef,
+        folderPath,
+      );
+
+      if (weightAlsoDiffers) {
+        // Colis AND weight differ → partiel LTA, not DS Combinée.
+        const error = `LTA partielle probable — colis (BADR=${colisBadr} ≠ saisie=${colisUser}) et poids (BADR=${poidsBadr} ≠ saisie=${poidsUser} kg) diffèrent`;
+        updateAutomationState(folderPath, {
+          phase: "partiel_skip",
+          error,
+          badrColis: colisBadr,
+          userColis: colisUser,
+          badrWeight: poidsBadr,
+          userWeight: poidsUser,
+          diff: poidsDiffKg,
+        });
+        sendLog(
+          "warn",
+          "ColisCheck",
+          `${error} pour ${resolvedRef} — à traiter en DUM Normale Partiel`,
+        );
+        await sendNotification({
+          subject: subjectWithOrdinal(
+            id,
+            `LTA partielle (à traiter en Partiel, pas en DS Combinée) — LTA N° ${resolvedRef}`,
+          ),
+          text:
+            `Bonjour,\n\n` +
+            `La LTA N° ${resolvedRef} est une LTA partielle (colis ET poids partiels dans BADR — ` +
+            `tous les vols ne sont pas encore arrivés) — à traiter en DUM Normale Partiel, ` +
+            `pas en DS Combinée.\n\n` +
+            `Nombre de colis — BADR : ${colisBadr} / saisi : ${colisUser}\n` +
+            `Poids brut — BADR : ${poidsBadr} kg / saisi : ${poidsUser} kg (écart ${poidsDiffKg.toFixed(2)} kg)\n\n` +
+            `Voir la capture des lots ci-jointe.\n\n-- MedAfrica --`,
+          attachments: shot ? [{ path: shot }] : [],
+        }).catch(() => {});
+        sendProgress(id, "partiel-skip", {
+          badrWeight: poidsBadr,
+          userWeight: poidsUser,
+          diff: poidsDiffKg,
+        });
+        return { success: false, error };
+      }
+
+      // Colis differ but weight matches → genuine colis mismatch, rectify.
+      const error = `Nombre de colis différent (BADR=${colisBadr}, saisie=${colisUser}) — rectification requise`;
+      updateAutomationState(folderPath, {
+        phase: "error",
+        error,
+        badrColis: colisBadr,
+        userColis: colisUser,
+      });
+      sendLog(
+        "warn",
+        "ColisCheck",
+        `${error} pour ${resolvedRef} (poids identique) — traitement arrêté, notification envoyée`,
+      );
+      await sendNotification({
+        subject: subjectWithOrdinal(
+          id,
+          `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${resolvedRef}`,
+        ),
+        text:
+          `Bonjour,\n\n` +
+          `Merci de rectifier le nombre de colis de la LTA N° ${resolvedRef}.\n\n` +
+          `Nombre trouvé dans BADR : ${colisBadr}\n` +
+          `Nombre saisi : ${colisUser}\n\n` +
+          `Voir la capture des lots ci-jointe.\n\n-- MedAfrica --`,
+        attachments: shot ? [{ path: shot }] : [],
+      }).catch(() => {});
+      sendProgress(id, "error", { error });
+      return { success: false, error };
+    }
+
+    if (!isNaN(poidsBadr) && !isNaN(poidsUser)) {
+      const diff = Math.abs(poidsBadr - poidsUser);
+
+      // Screenshot the préapurement lots section → Downloads, then email it.
+      const notifyWeightMismatch = async (kind) => {
+        const shotPath = await captureBadrPreapShot(
+          badrConn.page,
+          resolvedRef,
+          folderPath,
+        );
+        if (shotPath) {
+          sendLog(
+            "info",
+            "WeightCheck",
+            `Capture d'écran enregistrée: ${shotPath}`,
+          );
+        }
+        await sendNotification({
+          subject: subjectWithOrdinal(
+            id,
+            `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${resolvedRef}`,
+          ),
+          text:
+            `Bonjour,\n\n` +
+            `Merci de régler le poids de la LTA N° ${resolvedRef} (écart ${kind}).\n\n` +
+            `Poids BADR : ${poidsBadr} kg\n` +
+            `Poids saisi : ${poidsUser} kg\n` +
+            `Écart : ${diff.toFixed(2)} kg\n\n` +
+            `Voir la capture des lots ci-jointe.\n\n-- MedAfrica --`,
+          attachments: shotPath ? [{ path: shotPath }] : [],
+        }).catch(() => {});
+      };
+
+      if (diff > 20) {
+        updateAutomationState(folderPath, {
+          phase: "partiel_skip",
+          error: "Partiel skip – weight diff > 20 kg",
+          badrWeight: poidsBadr,
+          userWeight: poidsUser,
+          diff,
+        });
+        sendLog(
+          "warn",
+          "WeightCheck",
+          `Écart de poids > 20 kg (${diff.toFixed(2)} kg) — traitement arrêté (LTA partielle)`,
+        );
+        await notifyWeightMismatch("critique > 20 kg");
+        sendProgress(id, "partiel-skip", {
+          badrWeight: poidsBadr,
+          userWeight: poidsUser,
+          diff,
+        });
+        return {
+          success: false,
+          error: "Partiel skip – weight diff > 20 kg",
+          poidsBadr,
+          poidsUser,
+        };
+      }
+
+      if (diff > 5) {
+        updateAutomationState(folderPath, {
+          phase: "weight_mismatch",
+          error: "Weight mismatch > 5kg – verify with Abdelhak",
+          badrWeight: poidsBadr,
+          userWeight: poidsUser,
+          diff,
+        });
+        sendLog(
+          "warn",
+          "WeightCheck",
+          `Écart de poids ${diff.toFixed(2)} kg (> 5 kg) (BADR: ${poidsBadr} kg / saisie: ${poidsUser} kg) — arrêt et vérification requise`,
+        );
+        await notifyWeightMismatch("> 5 kg");
+        sendProgress(id, "weight-mismatch", {
+          badrWeight: poidsBadr,
+          userWeight: poidsUser,
+          diff,
+        });
+        return {
+          success: false,
+          error: "Weight mismatch > 5kg – verify with Abdelhak",
+          poidsBadr,
+          poidsUser,
+        };
+      }
+
+      if (diff > 0) {
+        sendLog(
+          "info",
+          "WeightCheck",
+          `Écart de poids ${diff.toFixed(2)} kg (<= 5 kg) — continuation vers Portnet`,
+        );
+      }
+    }
+
+    sendLog("info", "WeightCheck", `Poids OK: ${poidsBadr} kg`);
+
+    // Always use BADR weight as the authoritative value for Portnet submission.
+    // If the user entered a different value it is ignored — only the BADR-confirmed
+    // weight is forwarded downstream.
+    lotInfo.poidsBrut = poidsBadr;
+
+    // Persist the corrected weight back to acheminement.json so the UI reflects it.
+    try {
+      const existingData = readAcheminementFile(folderPath);
+      existingData.poidTotal = String(poidsBadr);
+      writeAcheminementFile(folderPath, existingData);
+    } catch (e) {
+      console.error("[poidsBrut persist] Failed:", e.message);
+    }
+
+    if (!isNaN(poidsBadr)) {
+      sendProgress(id, "running", { badrWeight: poidsBadr });
+    }
+
+    updateAutomationState(folderPath, {
+      phase: "badr_checked",
+      lotInfo,
+      badrWeight: poidsBadr,
+      userWeight: poidMerged,
+    });
+
+    return {
+      success: true,
+      lotInfo,
+      formFields: {
+        refNumber: resolvedRef,
+        nombreContenant: nombreMerged,
+        currency: currencyMerged,
+        totalValue: totalMerged,
+      },
+    };
+  } catch (err) {
+    sendLog(
+      "error",
+      "BADR",
+      `prepareLotAndWeightCheck failed for "${id}": ${err.message}`,
+    );
+    throw err;
+  }
+}
+
+async function submitPortnetPhase(acheminement, lotInfo, portnetPage) {
+  const {
+    id,
+    folderPath,
+    refNumber,
+    scelle1,
+    scelle2,
+    nombreContenant,
+    poidTotal,
+    lieuChargement,
+    currency,
+    totalValue,
+  } = acheminement;
+
+  const PortnetDsCombine = require("../src/portnet/portnetDsCombine");
+
+  sendLog("info", "Portnet", `Preparing Portnet submission for "${id}"…`);
+  sendProgress(id, "filling-form");
+
+  const dsCombine = new PortnetDsCombine(portnetPage);
+  const fillResult = await dsCombine.fillEntete({
+    sequenceNum: lotInfo.sequenceNum,
+    // clé + année pin the exact DS de référence row (séquence alone repeats
+    // across years). année defaults to the current year in the finalizer.
+    cle: lotInfo.cle || undefined,
+    annee: lotInfo.annee || undefined,
+    refNumber: refNumber || undefined,
+    lieuChargement: lieuChargement || undefined,
+    montant: totalValue || undefined,
+    deviseId: currency || undefined,
+    folderPath: folderPath || undefined,
+    scelle1: scelle1 || undefined,
+    scelle2: scelle2 || undefined,
+    nombreContenant: nombreContenant || undefined,
+    // Prefer BADR-confirmed weight; fall back to user-entered poidTotal only if
+    // no BADR weight was resolved (e.g. checkpoint resume path).
+    poidsBrut:
+      (lotInfo.poidsBrut != null ? String(lotInfo.poidsBrut) : null) ||
+      poidTotal ||
+      undefined,
+  });
+
+  if (fillResult?.stoppedAfterAnnexCompression) {
+    updateAutomationState(folderPath, {
+      phase: "annexe_compression_debug_stop",
+      error: null,
+      compressedOutputDir: fillResult.compressedOutputDir || null,
+      updatedAt: new Date().toISOString(),
+    });
+    sendLog(
+      "warn",
+      "Portnet",
+      `Debug stop after annexe compression for "${id}". Files available in "${fillResult.compressedOutputDir || folderPath}". Submission intentionally skipped.`,
+    );
+    sendProgress(id, "running", {
+      debugStop: true,
+      compressedOutputDir: fillResult.compressedOutputDir || folderPath,
+    });
+    return {
+      success: true,
+      skipped: true,
+      debugStop: true,
+      compressedOutputDir: fillResult.compressedOutputDir || folderPath,
+    };
+  }
+
+  sendLog("info", "Portnet", `Submitting request for "${id}"…`);
+  sendProgress(id, "submitting-portnet");
+
+  const portnetRef = await dsCombine.submitRequest(lotInfo.sequenceNum);
+  await dsCombine.openConsultationPage();
+
+  const submittedAnchor = await dsCombine.captureSubmittedRowAnchor(
+    portnetRef,
+    {
+      timeoutMs: 45000,
+      pollEveryMs: 1500,
+    },
+  );
+
+  if (submittedAnchor?.found && submittedAnchor.createdAtRaw) {
+    sendLog(
+      "info",
+      "Portnet",
+      `Captured submission anchor for "${id}": createdAt=${submittedAnchor.createdAtRaw}, manifeste=${submittedAnchor.numeroManifesteRaw || "N/A"}, status=${submittedAnchor.statusText || "N/A"}, matches=${submittedAnchor.matchesCount}.`,
+    );
+  } else {
+    sendLog(
+      "warn",
+      "Portnet",
+      `Could not capture Date de creation anchor immediately for "${id}" (${portnetRef}). Polling will fallback to submittedAt matching until anchor appears.`,
+    );
+  }
+
+  const initialPhase = isEnvoyeeStatus(submittedAnchor?.statusText)
+    ? "portnet_submitted"
+    : "portnet_sent_waiting";
+
+  updateAutomationState(folderPath, {
+    // Prefer Date de creation anchor captured right after submit (per-LTA identity).
+    phase: initialPhase,
+    portnetRef,
+    submittedAt: new Date().toISOString(),
+    consultationCreatedAtRaw: submittedAnchor?.createdAtRaw || null,
+    consultationNumeroManifeste: submittedAnchor?.numeroManifesteRaw || null,
+    attempts: 0,
+    lotInfo,
+    error: null,
+  });
+  sendProgress(id, "monitoring-portnet", { portnetRef, attempts: 0 });
+  sendLog(
+    "info",
+    "Portnet",
+    `Submit clicked for "${id}" (${portnetRef}). Waiting consultation status = Envoyee before marking as submitted.`,
+  );
+
+  return { success: true, portnetRef };
+}
+
+async function finalizeAcceptedOnBadr(acheminement, badrRef) {
+  const { id, folderPath, scelle1, scelle2 } = acheminement;
+  const BADRDsCombineFinalize = require("../src/badr/badrDsCombineFinalize");
+
+  try {
+    const badrConn = await ensureBadrSession();
+    await badrConn.navigateToAccueil();
+
+    sendLog("info", "BADR", `Proceeding to finalize on BADR for "${id}"...`);
+    sendProgress(id, "badr-downloading", { declarationRef: badrRef });
+
+    // Extract LTA rank from folder name (e.g., "1er LTA" → "1er")
+    const folderName = path.basename(folderPath);
+    const ltaRankMatch = folderName.match(/^(\d+(?:er|eme|éme|ème))/i);
+    const ltaRank = ltaRankMatch ? ltaRankMatch[1] : "";
+
+    // Get lot reference from acheminement file if available
+    const achData = readAcheminementFile(folderPath);
+    const lotReference =
+      normalizeLotReference(extractLotReferenceFromFolder(folderPath)) ||
+      normalizeLotReference(achData?.automationState?.lotInfo?.lotReference) ||
+      normalizeLotReference(achData?.automationState?.lotReference) ||
+      normalizeLotReference(achData?.lotReference) ||
+      normalizeLotReference(acheminement?.lotReference) ||
+      "";
+
+    const finalizer = new BADRDsCombineFinalize(
+      badrConn.page,
+      undefined,
+      badrConn,
+    );
+    const parsedSerie = badrRef.slice(0, -1);
+    const parsedCle = badrRef.slice(-1);
+
+    const dsPdfPath = await finalizer.processFinalization(
+      "301",
+      "000",
+      parsedSerie,
+      parsedCle,
+      scelle1,
+      scelle2,
+      ltaRank,
+      lotReference,
+    );
+
+    updateAutomationState(folderPath, {
+      phase: "badr_done",
+      badrRef,
+      completedAt: new Date().toISOString(),
+      error: null,
+    });
+
+    // Email the downloaded DS PDF to the configured recipients.
+    // lotReference is the LTA/MAWB reference (from the manifest/MAWB filename),
+    // NOT the scellés — that is the number we want in the subject.
+    const dsRef = lotReference || badrRef;
+    await sendNotification({
+      subject: buildAcheminementSubject(folderName, "DS Combinée", dsRef),
+      text:
+        `Bonjour,\n\n` +
+        `Veuillez trouver ci-joint la déclaration DS Combinée (entrée marchandise) pour la LTA N° ${dsRef}.\n\n` +
+        `-- MedAfrica --`,
+      attachments: dsPdfPath ? [{ path: dsPdfPath }] : [],
+    }).catch(() => {});
+
+    sendProgress(id, "done", { declarationRef: badrRef });
+    sendLog("info", "Process", `Workflow fully complete for "${id}"!`);
+    return { success: true, declarationRef: badrRef };
+  } catch (err) {
+    updateAutomationState(folderPath, {
+      phase: "portnet_accepted",
+      badrRef,
+      badrFinalizeError: err.message,
+      error: err.message,
+    });
+    sendProgress(id, "error", { error: err.message });
+    sendLog("error", "Automation", `Failed for "${id}": ${err.message}`);
+    return { success: false, error: err.message };
+  }
+}
+
+async function monitorPendingPortnetRequests(
+  acheminements,
+  portnetPage,
+  waitingManifestAchs = [],
+) {
+  const PortnetDsCombine = require("../src/portnet/portnetDsCombine");
+  const dsCombine = new PortnetDsCombine(portnetPage);
+  // LTAs whose manifest wasn't in BADR yet — re-checked each poll cycle.
+  const manifestRetry = [...(waitingManifestAchs || [])];
+  // LTAs whose BADR finalization (PDF download + scellés) failed once — retried
+  // automatically a few times with a cooldown (e.g. a slow BADR PDF render or a
+  // missed click; see badrDsCombineFinalize.js). folderPath → { ach, attempts, nextAttemptAt }.
+  const finalizeRetry = new Map();
+  const FINALIZE_MAX_ATTEMPTS = 3;
+  const FINALIZE_RETRY_COOLDOWN_MS = 60_000;
+
+  /** finalizeAcceptedOnBadr wrapped with the badrBusy guard (keepalive-safe). */
+  async function attemptFinalize(ach, badrRef) {
+    badrBusy = true;
+    try {
+      return await finalizeAcceptedOnBadr(ach, badrRef);
+    } finally {
+      badrBusy = false;
+    }
+  }
+
+  /** Re-attempt finalizations that failed, once their cooldown has elapsed. */
+  async function retryFailedFinalizations() {
+    if (finalizeRetry.size === 0) return 0;
+    let done = 0;
+    const now = Date.now();
+    for (const [fp, entry] of [...finalizeRetry]) {
+      if (!fs.existsSync(fp)) {
+        finalizeRetry.delete(fp);
+        continue;
+      }
+      const st = getAutomationState(fp);
+      // Already resolved elsewhere (e.g. a manual "Réessayer" click) → stop.
+      if (!st?.badrRef || st.phase === "badr_done") {
+        finalizeRetry.delete(fp);
+        continue;
+      }
+      if (now < entry.nextAttemptAt) continue; // cooldown not elapsed yet
+      sendLog(
+        "info",
+        "BADR",
+        `Nouvelle tentative de finalisation BADR (${entry.attempts + 1}/${FINALIZE_MAX_ATTEMPTS}) pour "${entry.ach.id}"…`,
+      );
+      const res = await attemptFinalize(entry.ach, st.badrRef);
+      if (res?.success) {
+        finalizeRetry.delete(fp);
+        done++;
+      } else if (entry.attempts + 1 >= FINALIZE_MAX_ATTEMPTS) {
+        finalizeRetry.delete(fp);
+        sendLog(
+          "warn",
+          "BADR",
+          `Finalisation BADR toujours en échec pour "${entry.ach.id}" après ${FINALIZE_MAX_ATTEMPTS} tentatives — relance manuelle requise (bouton Réessayer).`,
+        );
+      } else {
+        entry.attempts++;
+        entry.nextAttemptAt = Date.now() + FINALIZE_RETRY_COOLDOWN_MS;
+      }
+    }
+    return done;
+  }
+
+  const pending = new Map();
+  const claimedAcceptedRefs = new Set();
+  // Tracks "createdAtRaw::manifeste" row anchors already assigned to an LTA.
+  // Prevents two LTAs from locking onto the same consultation row when they share portnetRef.
+  const claimedRowAnchors = new Set();
+
+  for (const ach of acheminements) {
+    const state = getAutomationState(ach.folderPath);
+    if (state?.badrRef) {
+      claimedAcceptedRefs.add(String(state.badrRef));
+    }
+    // Pre-populate from already-anchored LTAs so new assignments avoid their rows.
+    if (state?.consultationCreatedAtRaw) {
+      const key = `${state.consultationCreatedAtRaw}::${state.consultationNumeroManifeste || ""}`;
+      claimedRowAnchors.add(key);
+    }
+  }
+
+  for (const ach of acheminements) {
+    const state = getAutomationState(ach.folderPath);
+    if (!state) continue;
+
+    // Only resume BADR finalization for accepted-but-not-completed LTAs.
+    // LTAs already marked as badr_done must never run finalization again.
+    if (state.badrRef && state.phase !== "badr_done") {
+      const res = await finalizeAcceptedOnBadr(ach, state.badrRef);
+      if (!res?.success) {
+        finalizeRetry.set(ach.folderPath, {
+          ach,
+          attempts: 1,
+          nextAttemptAt: Date.now() + FINALIZE_RETRY_COOLDOWN_MS,
+        });
+      }
+      continue;
+    }
+
+    if (state.portnetRef && !state.badrRef) {
+      pending.set(ach.id, ach);
+    }
+  }
+
+  if (pending.size === 0 && manifestRetry.length === 0) return;
+
+  // ── Re-check "pas encore manifest" LTAs ─────────────────────────────────────
+  // Their manifest wasn't in BADR yet. Re-run the lot lookup (+ submit) — at most
+  // once per MANIFEST_CHECK_INTERVAL_MS (manifestCheckThrottled) — and NEVER give
+  // up: it stays in manifestRetry indefinitely, re-checked every interval for as
+  // long as this monitor runs. `force=true` (passed from drainInjectionQueue when
+  // the operator just queued a Lancer/Tout lancer/Ajouter au traitement) bypasses
+  // the interval for THIS pass only, so a manual click re-checks every
+  // waiting-manifest LTA right away instead of waiting out the hour.
+  async function retryWaitingManifest(force = false) {
+    if (manifestRetry.length === 0) return 0;
+    let submitted = 0;
+    const stillWaiting = [];
+    for (const ach of manifestRetry) {
+      // Folder deleted from disk → stop re-checking it (no BADR lookup, no email).
+      if (!fs.existsSync(ach.folderPath)) {
+        sendLog(
+          "info",
+          "BADR",
+          `"${ach.id}": dossier supprimé — retiré du suivi.`,
+        );
+        sendProgress(ach.id, "deleted");
+        continue; // drop from the retry list
+      }
+      const st = getAutomationState(ach.folderPath);
+      // Progressed already (e.g. picked up elsewhere) → don't retry.
+      if (
+        st?.badrRef ||
+        st?.phase === "badr_done" ||
+        st?.phase === "partiel_done"
+      ) {
+        continue;
+      }
+      if (st?.portnetRef) {
+        if (!pending.has(ach.id)) pending.set(ach.id, ach);
+        continue;
+      }
+      if (!force && manifestCheckThrottled(st)) {
+        stillWaiting.push(ach); // interval not elapsed since last check — wait, no BADR work
+        continue;
+      }
+      sendLog(
+        "info",
+        "BADR",
+        force
+          ? `Vérification manifeste pour "${ach.id}" (demandée par l'utilisateur)…`
+          : `Vérification manifeste pour "${ach.id}"…`,
+      );
+      let r;
+      try {
+        // Pass `force` through: retryWaitingManifest's own throttle check above was
+        // already bypassed for a forced sweep, but runAutomationTask has its OWN
+        // independent throttle guard — without this it would silently re-block here.
+        r = await runAutomationTask(ach, {
+          stopAfterSubmit: true,
+          sharedPortnetPage: portnetPage,
+          forceManifestRecheck: force,
+        });
+      } catch (e) {
+        sendLog(
+          "error",
+          "Automation",
+          `Nouvelle tentative "${ach.id}" échouée: ${e.message}`,
+        );
+        stillWaiting.push(ach); // transient — keep retrying
+        continue;
+      }
+      if (r?.waitingManifest) {
+        stillWaiting.push(ach); // manifest still not there
+        continue;
+      }
+      if (r?.success && !ach.partiel) {
+        const s2 = getAutomationState(ach.folderPath);
+        if (s2?.portnetRef && !s2.badrRef) {
+          pending.set(ach.id, ach);
+          submitted++;
+          sendLog(
+            "info",
+            "Automation",
+            `Manifeste prêt — "${ach.id}" soumis à Portnet, ajouté au suivi.`,
+          );
+        }
+      }
+      // else: partiel handled, or a genuine error → drop from the retry list.
+    }
+    manifestRetry.length = 0;
+    manifestRetry.push(...stillWaiting);
+    return submitted;
+  }
+
+  // ── User-triggered injection while this monitor polls ──────────────────────
+  // The operator can edit a newly-added LTA's card during the (long) "waiting for
+  // Acceptée" phase and press Lancer / Tout lancer. That request is queued (see
+  // injectionQueue / the automation:run* IPCs); here we submit those LTAs on the
+  // live sessions and add them to this polling set. Already-submitted or done
+  // LTAs are skipped via `pending`/checkpoint, so only genuinely new ones run.
+  async function drainInjectionQueue() {
+    if (injectionQueue.length === 0) return 0;
+    const reqs = injectionQueue.splice(0);
+    let submitted = 0;
+    // The operator just clicked Lancer / Tout lancer / Ajouter au traitement — that
+    // IS a "check BADR now" request. Opportunistically force-recheck EVERY
+    // currently-waiting-manifest LTA in this batch (not just the one(s) queued),
+    // bypassing the 1 h interval for this one pass.
+    submitted += await retryWaitingManifest(/* force */ true);
+    for (const ach of reqs) {
+      // Use the ach exactly as the UI sent it — it carries the operator's edits
+      // (e.g. a corrected totalValue). Re-scanning would let PDF extraction
+      // overwrite those edits, which is the whole thing they came here to fix.
+      if (!ach?.folderPath) continue;
+      const id = ach.id || path.basename(ach.folderPath);
+      if (pending.has(id)) continue; // already being polled
+      const st = getAutomationState(ach.folderPath);
+      if (
+        st?.badrRef ||
+        st?.phase === "badr_done" ||
+        st?.phase === "partiel_done"
+      ) {
+        continue; // already finished
+      }
+      if (st?.phase === "error" && st?.portnetRef && !st?.badrRef) {
+        // Errored AFTER Portnet submission — the checkpoint keeps its portnetRef,
+        // so re-running would only re-confirm the rejection (no re-submit). Don't
+        // retry the submit; just resume monitoring its Portnet status.
+        if (!pending.has(id)) pending.set(id, ach);
+        sendProgress(id, "monitoring-portnet", { portnetRef: st.portnetRef });
+        sendLog(
+          "info",
+          "Automation",
+          `"${id}": déjà soumis puis en erreur — reprise du suivi Portnet.`,
+        );
+        continue;
+      }
+      // Any other error (BADR/partiel failure before submission) falls through and
+      // is retried below, exactly like the per-card "Réessayer".
+      if (ach.refMismatch && !ach.manifestRef) {
+        sendLog(
+          "warn",
+          "Automation",
+          `"${id}": référence manifeste/MAWB incohérente — ignoré.`,
+        );
+        continue;
+      }
+      if (ach.mawbMismatch) {
+        sendLog("warn", "Automation", `"${id}": ${ach.mawbMismatch} — ignoré.`);
+        continue;
+      }
+      sendLog(
+        "info",
+        "Automation",
+        `Traitement du LTA "${id}" ajouté au suivi en cours…`,
+      );
+      try {
+        // User explicitly clicked Lancer/Tout lancer (queued here because a batch
+        // was already running) — re-check the manifest now, don't wait out the interval.
+        const res = await runAutomationTask(ach, {
+          stopAfterSubmit: true,
+          sharedPortnetPage: portnetPage,
+          forceManifestRecheck: true,
+        });
+        if (!ach.partiel && res?.success) {
+          const s2 = getAutomationState(ach.folderPath);
+          if (s2?.portnetRef && !s2.badrRef) {
+            pending.set(id, ach);
+            submitted++;
+            sendLog(
+              "info",
+              "Automation",
+              `"${id}" soumis à Portnet — ajouté au suivi.`,
+            );
+          }
+        }
+      } catch (e) {
+        sendLog(
+          "error",
+          "Automation",
+          `Traitement de "${id}" échoué: ${e.message}`,
+        );
+      }
+    }
+    return submitted;
+  }
+
+  await dsCombine.openConsultationPage();
+
+  // ── BADR session refresh every 2 minutes (prevent logout during long polling) ──
+  let badrBusy = false;
+  let badrRefreshInProgress = false;
+  let badrRefreshInterval = setInterval(async () => {
+    if (badrBusy || badrRefreshInProgress) return;
+    badrRefreshInProgress = true;
+    try {
+      sendLog(
+        "info",
+        "BADR",
+        "Refreshing BADR session to prevent timeout during Portnet polling...",
+      );
+      await badrKeepAliveOnce(); // real reload + back to Accueil (shared helper)
+      sendLog(
+        "info",
+        "BADR",
+        "BADR session keepalive sent — session refreshed.",
+      );
+    } catch (err) {
+      sendLog("warn", "BADR", `Failed to refresh BADR session: ${err.message}`);
+    } finally {
+      badrRefreshInProgress = false;
+    }
+  }, 45000); // 45 seconds — frequent enough to keep BADR session alive
+
+  const maxAttempts = 240;
+  // While only waiting-manifest LTAs remain the loop ticks once a minute and keeps
+  // re-checking every MANIFEST_CHECK_INTERVAL_MS FOREVER (no automatic give-up —
+  // the operator can always force an immediate re-check sooner via Lancer / Tout
+  // lancer / Ajouter au traitement). This cap is only a crash-safety backstop
+  // against a genuinely stuck/runaway loop, set far beyond any realistic wait
+  // (~30 days of 1-min cycles) so it never fires in normal use.
+  const MANIFEST_ONLY_MAX_CYCLES = 30 * 24 * 60;
+  let manifestOnlyCycles = 0;
+  monitorActive = true;
+  try {
+    while (
+      pending.size > 0 ||
+      manifestRetry.length > 0 ||
+      finalizeRetry.size > 0
+    ) {
+      // Inject operator-launched LTAs AND re-check waiting-manifest LTAs.
+      // Guard with badrBusy so the keepalive timer doesn't touch BADR mid-submit.
+      badrBusy = true;
+      let changed = 0;
+      try {
+        changed += await drainInjectionQueue();
+        changed += await retryWaitingManifest();
+        changed += await drainDeclarationQueue();
+        changed += await retryFailedFinalizations();
+      } finally {
+        badrBusy = false;
+      }
+      if (changed > 0) {
+        // Submitting navigated the Portnet page off consultation — reopen it.
+        await dsCombine.openConsultationPage();
+      }
+      if (
+        pending.size === 0 &&
+        manifestRetry.length === 0 &&
+        finalizeRetry.size === 0
+      )
+        break;
+
+      if (pending.size === 0 && manifestRetry.length === 0) {
+        // Only failed-finalization retries remain (rare: happens when the LTA that
+        // just failed to finalize was the sole item left in this batch). Their own
+        // cooldown (FINALIZE_RETRY_COOLDOWN_MS) already gates retryFailedFinalizations()
+        // above — just idle briefly and loop back, no manifest-specific bookkeeping.
+        await portnetPage.waitForTimeout(5000);
+        continue;
+      }
+
+      if (pending.size === 0) {
+        // Nothing submitted to poll yet — only waiting-manifest LTAs remain. Wait,
+        // then re-check the manifest next cycle. Bounded so the batch can't hang
+        // forever if a manifest never arrives (the LTAs stay retryable via re-run).
+        if (++manifestOnlyCycles > MANIFEST_ONLY_MAX_CYCLES) {
+          sendLog(
+            "warn",
+            "BADR",
+            `Manifeste toujours absent pour ${manifestRetry.length} LTA(s) après ${MANIFEST_ONLY_MAX_CYCLES} min d'attente — arrêt du suivi (relançable).`,
+          );
+          break;
+        }
+        // Log once per ~30 min (not every minute) — with a multi-hour interval a
+        // per-minute line would flood the journal.
+        if (manifestOnlyCycles === 1 || manifestOnlyCycles % 30 === 0) {
+          sendLog(
+            "info",
+            "BADR",
+            `En attente du manifeste pour ${manifestRetry.length} LTA(s) — prochaine vérification BADR selon l'intervalle (${manifestIntervalLabel()}).`,
+          );
+        }
+        // Portnet is only refreshed by polling when something is submitted; while we
+        // just wait for a manifest nothing touches it, so keep it alive here.
+        await portnetKeepAliveIfDue(portnetPage);
+        const d = Date.now() + 60_000;
+        while (Date.now() < d) {
+          if (injectionQueue.length > 0) break;
+          await portnetPage.waitForTimeout(
+            Math.max(250, Math.min(2000, d - Date.now())),
+          );
+        }
+        continue;
+      }
+
+      let highestAttempts = 0;
+
+      for (const ach of pending.values()) {
+        // Folder deleted from disk → stop polling it.
+        if (!fs.existsSync(ach.folderPath)) {
+          sendLog(
+            "info",
+            "Portnet",
+            `"${ach.id}": dossier supprimé — suivi arrêté.`,
+          );
+          sendProgress(ach.id, "deleted");
+          pending.delete(ach.id);
+          continue;
+        }
+        const state = getAutomationState(ach.folderPath);
+        if (!state?.portnetRef) {
+          pending.delete(ach.id);
+          continue;
+        }
+
+        const attempts = (state.attempts || 0) + 1;
+        highestAttempts = Math.max(highestAttempts, attempts);
+        sendProgress(ach.id, "monitoring-portnet", {
+          portnetRef: state.portnetRef,
+          attempts,
+        });
+
+        sendLog(
+          "info",
+          "Portnet",
+          `Consultation check ${attempts}/${maxAttempts} for "${ach.id}" (${state.portnetRef})...`,
+        );
+
+        const {
+          found,
+          statusText,
+          refDsRaw,
+          createdAtRaw,
+          numeroManifesteRaw,
+        } = await dsCombine.getConsultationStatus(state.portnetRef, {
+          submittedAt: state.submittedAt || null,
+          excludeRefDs: Array.from(claimedAcceptedRefs),
+          excludeCreatedAt: Array.from(claimedRowAnchors)
+            .filter((k) => {
+              // Only exclude rows that are NOT this LTA's own anchor
+              const ownKey = `${state.consultationCreatedAtRaw || ""}::${state.consultationNumeroManifeste || ""}`;
+              return k !== ownKey;
+            })
+            .map((k) => {
+              const sepIdx = k.indexOf("::");
+              return {
+                createdAtRaw: k.substring(0, sepIdx),
+                manifeste: k.substring(sepIdx + 2),
+              };
+            }),
+          anchorCreatedAtRaw: state.consultationCreatedAtRaw || null,
+          anchorNumeroManifesteRaw: state.consultationNumeroManifeste || null,
+          preferNewest:
+            !state.consultationCreatedAtRaw &&
+            state.phase === "portnet_sent_waiting",
+        });
+
+        updateAutomationState(ach.folderPath, {
+          attempts,
+          lastCheckedAt: new Date().toISOString(),
+          lastSeenStatus: found ? statusText : "NOT_FOUND",
+        });
+
+        if (!found) {
+          sendLog(
+            "info",
+            "Portnet",
+            `Row for ${state.portnetRef} not found in consultation yet.`,
+          );
+          continue;
+        }
+
+        if (!state.consultationCreatedAtRaw && createdAtRaw) {
+          const anchorKey = `${createdAtRaw}::${numeroManifesteRaw || ""}`;
+          if (!claimedRowAnchors.has(anchorKey)) {
+            claimedRowAnchors.add(anchorKey);
+            updateAutomationState(ach.folderPath, {
+              consultationCreatedAtRaw: createdAtRaw,
+              consultationNumeroManifeste: numeroManifesteRaw || "",
+            });
+            sendLog(
+              "info",
+              "Portnet",
+              `Anchored consultation row for "${ach.id}" at createdAt=${createdAtRaw}, manifeste=${numeroManifesteRaw || "N/A"} (will use manifeste to disambiguate if multiple rows share timestamp).`,
+            );
+          } else {
+            sendLog(
+              "warn",
+              "Portnet",
+              `Row anchor ${anchorKey} already claimed by another LTA — skipping anchor lock for "${ach.id}", will retry with a different row next poll.`,
+            );
+          }
+        }
+
+        // Recovery: if anchor is set but the row's ref keeps coming back empty
+        // (because another LTA already claimed it), clear the anchor so this LTA
+        // can re-anchor to a different row on the next poll.
+        if (
+          state.consultationCreatedAtRaw &&
+          isAcceptedStatus(statusText) &&
+          !refDsRaw &&
+          attempts > 3
+        ) {
+          const staleKey = `${state.consultationCreatedAtRaw}::${state.consultationNumeroManifeste || ""}`;
+          claimedRowAnchors.delete(staleKey);
+          updateAutomationState(ach.folderPath, {
+            consultationCreatedAtRaw: null,
+            consultationNumeroManifeste: null,
+          });
+          sendLog(
+            "warn",
+            "Portnet",
+            `Cleared stale row anchor for "${ach.id}" (${staleKey}) — ref extraction was empty for ${attempts - 3} poll(s), anchor row likely claimed by another LTA. Will re-anchor next poll.`,
+          );
+          continue;
+        }
+
+        sendLog(
+          "info",
+          "Portnet",
+          `Current status for ${state.portnetRef}: ${statusText}`,
+        );
+
+        // One-time "still pending" email after 30 min without acceptance.
+        if (!isAcceptedStatus(statusText) && !state.pendingEmailSent) {
+          const submittedAtMs = state.submittedAt
+            ? Date.parse(state.submittedAt)
+            : null;
+          if (submittedAtMs && Date.now() - submittedAtMs >= 30 * 60 * 1000) {
+            const portnetRef = state.portnetRef || "";
+            // Subject uses the same acheminement format as the other mails (LTA
+            // reference, not the Portnet ref), plus the pending-validation marker.
+            const ltaRef = ach.refNumber || portnetRef || "";
+            const ordinal = acheminementOrdinal(ach.id);
+            await sendNotification({
+              subject: `${buildAcheminementSubject(ach.id, "DS Combinée", ltaRef)} — En cours validation Portnet`,
+              text:
+                `En cours validation Portnet\n\n` +
+                (ordinal ? `${ordinal}\n` : "") +
+                `Référence LTA : ${ltaRef}` +
+                `\n\n-- MedAfrica --`,
+            }).catch(() => {});
+            updateAutomationState(ach.folderPath, { pendingEmailSent: true });
+            sendLog(
+              "info",
+              "Mail",
+              `Notification "en cours validation Portnet" envoyée pour "${ach.id}" (>30 min sans acceptation).`,
+            );
+          }
+        }
+
+        if (
+          isEnvoyeeStatus(statusText) &&
+          state.phase !== "portnet_submitted"
+        ) {
+          updateAutomationState(ach.folderPath, {
+            phase: "portnet_submitted",
+            submittedConfirmedAt: new Date().toISOString(),
+            error: null,
+          });
+          sendProgress(ach.id, "portnet-submitted", {
+            portnetRef: state.portnetRef,
+          });
+          sendLog(
+            "info",
+            "Portnet",
+            `Submission confirmed on consultation (Envoyee) for "${ach.id}" (${state.portnetRef}).`,
+          );
+        }
+
+        if (isAcceptedStatus(statusText)) {
+          const fullRefDs = String(refDsRaw || "").trim();
+          const shortRef = fullRefDs.substring(10).replace(/^0+/, "");
+
+          if (!shortRef || !fullRefDs) {
+            sendLog(
+              "warn",
+              "Portnet",
+              `Acceptée found for ${state.portnetRef} but refDsMead extraction failed (raw="${fullRefDs}", createdAt=${createdAtRaw || "n/a"}, manifeste=${numeroManifesteRaw || "n/a"}). Waiting next poll...`,
+            );
+            continue;
+          }
+
+          if (claimedAcceptedRefs.has(shortRef)) {
+            sendLog(
+              "info",
+              "Portnet",
+              `Acceptée found for ${state.portnetRef} with refDsMead=${shortRef}, but already claimed by another LTA. Skipping...`,
+            );
+            continue;
+          }
+
+          claimedAcceptedRefs.add(shortRef);
+
+          updateAutomationState(ach.folderPath, {
+            phase: "portnet_accepted",
+            badrRef: shortRef,
+            acceptedAt: new Date().toISOString(),
+            error: null,
+          });
+          sendProgress(ach.id, "portnet-accepted", {
+            declarationRef: shortRef,
+          });
+          pending.delete(ach.id);
+          const finalizeRes = await attemptFinalize(ach, shortRef);
+          if (!finalizeRes?.success) {
+            finalizeRetry.set(ach.folderPath, {
+              ach,
+              attempts: 1,
+              nextAttemptAt: Date.now() + FINALIZE_RETRY_COOLDOWN_MS,
+            });
+          }
+        } else if (isRejectedStatus(statusText)) {
+          const error = `DS Combinée request was REJECTED for ${state.portnetRef}! Please check manually.`;
+          updateAutomationState(ach.folderPath, {
+            phase: "error",
+            error,
+            rejectedAt: new Date().toISOString(),
+          });
+          sendProgress(ach.id, "error", { error });
+          sendLog("error", "Automation", `Failed for "${ach.id}": ${error}`);
+          pending.delete(ach.id);
+        } else if (isNouveauStatus(statusText) && attempts > 2) {
+          // "Nouveau" means the form was saved as a draft — the Envoyer click did
+          // not actually send the request. Re-fill the entire Portnet form.
+          const MAX_NOUVEAU_RETRIES = 3;
+          const nouveauRetries = state.nouveauRetryCount || 0;
+
+          if (nouveauRetries >= MAX_NOUVEAU_RETRIES) {
+            const error = `DS Combinée for "${ach.id}" (${state.portnetRef}) is stuck at Nouveau status after ${MAX_NOUVEAU_RETRIES} retries — manual intervention required.`;
+            updateAutomationState(ach.folderPath, { phase: "error", error });
+            sendProgress(ach.id, "error", { error });
+            sendLog("error", "Automation", `Failed for "${ach.id}": ${error}`);
+            pending.delete(ach.id);
+          } else {
+            sendLog(
+              "warn",
+              "Portnet",
+              `Status "Nouveau" (draft, not sent) detected for "${ach.id}" (${state.portnetRef}) at attempt ${attempts}. Re-filling Portnet form from scratch (retry ${nouveauRetries + 1}/${MAX_NOUVEAU_RETRIES})...`,
+            );
+
+            // Release the claimed anchor so it won't block the re-submit
+            const staleKey = `${state.consultationCreatedAtRaw}::${state.consultationNumeroManifeste || ""}`;
+            claimedRowAnchors.delete(staleKey);
+
+            // Preserve lotInfo (BADR-confirmed data) before clearing submission fields
+            const savedLotInfo = state.lotInfo;
+
+            updateAutomationState(ach.folderPath, {
+              phase: "badr_checked",
+              portnetRef: null,
+              submittedAt: null,
+              consultationCreatedAtRaw: null,
+              consultationNumeroManifeste: null,
+              attempts: 0,
+              nouveauRetryCount: nouveauRetries + 1,
+              lotInfo: savedLotInfo,
+              error: null,
+            });
+
+            pending.delete(ach.id);
+
+            // Read the latest user-saved acheminement data for the retry
+            const freshAchData = readAcheminementFile(ach.folderPath);
+            const retryAch = { ...ach, ...(freshAchData || {}) };
+
+            const retryResult = await submitPortnetPhase(
+              retryAch,
+              savedLotInfo,
+              portnetPage,
+            );
+
+            if (retryResult?.success && !retryResult?.debugStop) {
+              pending.set(ach.id, ach);
+              sendLog(
+                "info",
+                "Portnet",
+                `Re-submission succeeded for "${ach.id}" after Nouveau retry ${nouveauRetries + 1} — resuming monitoring.`,
+              );
+            } else if (!retryResult?.success) {
+              const error =
+                retryResult?.error || "Re-submit after Nouveau status failed";
+              updateAutomationState(ach.folderPath, { phase: "error", error });
+              sendProgress(ach.id, "error", { error });
+              sendLog(
+                "error",
+                "Automation",
+                `Re-submit after Nouveau failed for "${ach.id}": ${error}`,
+              );
+            }
+          }
+        }
+      }
+
+      if (pending.size === 0) break;
+      if (highestAttempts >= maxAttempts) {
+        for (const ach of pending.values()) {
+          const state = getAutomationState(ach.folderPath);
+          const error = `Timed out waiting for Acceptée status for ${state?.portnetRef || ach.refNumber}`;
+          updateAutomationState(ach.folderPath, { phase: "error", error });
+          sendProgress(ach.id, "error", { error });
+          sendLog("error", "Automation", `Failed for "${ach.id}": ${error}`);
+        }
+        break;
+      }
+
+      const waitMs = getPollIntervalMs(highestAttempts);
+      sendLog(
+        "info",
+        "Portnet",
+        `Pending requests remain (${pending.size}). Waiting ${Math.round(waitMs / 60000)} minute(s) before refreshing consultation...`,
+      );
+      // Interruptible wait: poll the injection queue every 2 s so an LTA the
+      // operator just launched starts within seconds instead of at the end of
+      // the full poll interval. The next loop iteration then drains it.
+      const waitDeadline = Date.now() + waitMs;
+      while (Date.now() < waitDeadline) {
+        if (injectionQueue.length > 0) {
+          sendLog(
+            "info",
+            "Automation",
+            "Nouveau LTA en file — reprise immédiate du cycle.",
+          );
+          break;
+        }
+        await portnetPage.waitForTimeout(
+          Math.max(250, Math.min(2000, waitDeadline - Date.now())),
+        );
+      }
+      try {
+        // Use domcontentloaded to avoid timing out on slow networks;
+        // non-fatal networkidle wait follows as a best-effort.
+        await portnetPage.reload({
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        });
+        await portnetPage
+          .waitForLoadState("networkidle", { timeout: 30_000 })
+          .catch(() => {});
+        // Re-apply sort after reload (sort is lost when page reloads)
+        await dsCombine._ensureConsultationSortedByCreatedAtDesc();
+      } catch (reloadErr) {
+        sendLog(
+          "warn",
+          "Portnet",
+          `Consultation page reload failed (${reloadErr.message}) — will retry next poll cycle.`,
+        );
+        await portnetPage.waitForTimeout(5000);
+      }
+    }
+  } finally {
+    monitorActive = false;
+    clearInterval(badrRefreshInterval);
+    sendLog("info", "BADR", "BADR session refresh timer stopped.");
+  }
+}
+
+// ── Partiel DUM Normale — full BADR flow (no Portnet) ────────────────────────
+
+async function runPartielDumFlow(acheminement) {
+  const { id, folderPath } = acheminement;
+
+  // Folder deleted from disk → bail before any BADR work or email.
+  if (!folderPath || !fs.existsSync(folderPath)) {
+    sendLog("info", "Automation", `"${id}": dossier supprimé — ignoré.`);
+    return { success: false, deleted: true };
+  }
+
+  sendLog("info", "Automation", `Partiel DUM Normale flow for: ${id}`);
+  sendProgress(id, "running");
+
+  const checkpoint = getAutomationState(folderPath);
+  if (checkpoint?.phase === "partiel_done") {
+    sendProgress(id, "done");
+    return { success: true, skipped: true };
+  }
+  if (checkpoint?.phase === "partiel_waiting_signature") {
+    const dumSerie = checkpoint.dumSerie;
+    const dumCle = checkpoint.dumCle;
+    sendLog(
+      "info",
+      "BADR",
+      `"${id}" en attente de signature manuelle — série: ${dumSerie} clé: ${dumCle}`,
+    );
+    sendProgress(id, "partiel-waiting-signature", { dumSerie, dumCle });
+    return { success: false, waitingSignature: true };
+  }
+  if (checkpoint?.phase === "partiel_poids_mismatch") {
+    sendProgress(id, "weight-mismatch");
+    return { success: false, error: checkpoint.errorMessage };
+  }
+  // NOTE: no early-return for `partiel_waiting_lots`. An explicit "Lancer" must
+  // RE-CHECK the lots (the operator clicks it because the 2nd vol may have arrived).
+  // The lot lookup below re-evaluates: if both vols are now in BADR it proceeds;
+  // if still only one, it simply re-sets partiel_waiting_lots. (Previously it bailed
+  // with "rien à faire", so the LTA could only be relaunched by toggling Partiel.)
+
+  // Cross-check manifest vs MAWB. Only a colis discrepancy blocks; a weight gap
+  // is a non-blocking warning the operator can rectify before launching.
+  const mawbCheck = computeMawbVsManifestMismatch({
+    manifestNbr: acheminement.nombreContenant,
+    manifestPoids: acheminement.poidTotal,
+    mawbNbr: acheminement.mawbNbrPieces,
+    mawbPoids: acheminement.mawbGrossWeight,
+  });
+  if (mawbCheck.warning) {
+    sendLog("warn", "MAWB", `[${id}] ${mawbCheck.warning}`);
+  }
+  const mawbMismatch = acheminement.mawbMismatch || mawbCheck.blocking;
+  if (mawbMismatch) {
+    updateAutomationState(folderPath, { phase: "error", error: mawbMismatch });
+    sendLog("warn", "MAWB", `[${id}] ${mawbMismatch} — traitement bloqué`);
+    sendProgress(id, "error", { error: mawbMismatch });
+    return { success: false, error: mawbMismatch };
+  }
+
+  // Value-range safety net (UI already blocks this; guards edge cases).
+  if (!acheminement.valueRangeAck) {
+    const vErr = valueRangeError(acheminement);
+    if (vErr) {
+      updateAutomationState(folderPath, { phase: "error", error: vErr });
+      sendLog("warn", "Value", `[${id}] ${vErr} — traitement bloqué`);
+      sendProgress(id, "error", { error: vErr });
+      return { success: false, error: vErr };
+    }
+  }
+
+  // Block if the MAWB freight wasn't confidently extracted and the operator
+  // hasn't typed it — never submit a guessed customs freight value.
+  if (!String(acheminement.fretValue || "").trim()) {
+    const error =
+      "Valeur fret MAWB manquante (non vérifiée automatiquement) — saisissez-la manuellement avant de lancer.";
+    updateAutomationState(folderPath, { phase: "error", error });
+    sendLog("warn", "MAWB", `[${id}] ${error}`);
+    sendProgress(id, "error", { error });
+    return { success: false, error };
+  }
+
+  try {
+    const BADRLotLookup = require("../src/badr/badrLotLookup");
+    const BADRDumNormalPartiel = require("../src/badr/badrDumNormalPartiel");
+
+    const badrConn = await ensureBadrSession();
+    await badrConn.navigateToAccueil();
+
+    // ── Lot lookup
+    const resolvedRef = acheminement.refNumber || acheminement.id;
+    const priorState = getAutomationState(folderPath);
+    const lotLookup = new BADRLotLookup(badrConn.page);
+    await lotLookup.openLotPopup();
+    const lotResult = await lotLookup.searchLot(resolvedRef, {
+      emailOnEmpty: !priorState?.manifestNotified,
+      subjectPrefix: acheminementOrdinal(id),
+    });
+    await lotLookup.close();
+
+    if (lotResult.isEmpty) {
+      // Retryable — the manifest isn't in BADR yet (see prepareLotAndWeightCheck).
+      const checks = (priorState?.manifestCheckCount || 0) + 1;
+      updateAutomationState(folderPath, {
+        phase: "waiting_manifest",
+        error: null,
+        manifestCheckCount: checks,
+        manifestLastCheckAt: new Date().toISOString(),
+        manifestNotified: true,
+      });
+      sendProgress(id, "waiting-manifest");
+      sendLog(
+        "warn",
+        "BADR",
+        `Pas encore manifest pour ${resolvedRef} (vérification ${checks}) — nouvelle vérification dans ~${manifestIntervalLabel()}.`,
+      );
+      registerManifestWatch(acheminement); // background re-check + keepalive
+      return { success: false, waitingManifest: true };
+    }
+
+    if (lotResult.isPartiel && !lotResult.partiels) {
+      // rowCount >= 2 but partiels array not populated — should not happen with new code
+      updateAutomationState(folderPath, {
+        phase: "error",
+        error: "Partiels not collected",
+      });
+      sendProgress(id, "error", { error: "Partiels not collected" });
+      return { success: false, error: "Partiels not collected" };
+    }
+
+    if (!lotResult.isPartiel && lotResult.rowCount === 1) {
+      // Only 1 lot found — waiting for second flight
+      updateAutomationState(folderPath, {
+        phase: "partiel_waiting_lots",
+        nextVol: 2,
+      });
+      sendLog(
+        "warn",
+        "BADR",
+        `"${id}" — 1 seul lot trouvé, en attente du 2ème vol`,
+      );
+      sendProgress(id, "partiel-waiting-lots", { nextVol: 2 });
+      return { success: false, skipped: true, reason: "partiel_waiting_lots" };
+    }
+
+    // Persist partiels array + lots_found phase
+    const existing = readAcheminementFile(folderPath);
+    existing.partiels = lotResult.partiels;
+    writeAcheminementFile(folderPath, existing);
+    updateAutomationState(folderPath, { phase: "partiel_lots_found" });
+    sendLog(
+      "info",
+      "BADR",
+      `"${id}" — ${lotResult.partiels.length} lots collectés`,
+    );
+
+    // ── EARLY pré-apurement check ────────────────────────────────────────────
+    // 2+ lots in BADR ≠ complete: the LTA may be a 3/4/5-vol partiel whose next
+    // flight isn't registered yet. Check the lots' summed colis/poids against the
+    // manifest BEFORE filling Entête/Transport/Caution (in a throw-away
+    // declaration), so an incomplete LTA stops right away as "en attente du Nème
+    // vol" instead of after a half-filled declaration. Fail-open: if the check
+    // itself can't run, fall through to the normal flow (Step 5 still checks).
+    let preMismatch = null;
+    try {
+      sendLog(
+        "info",
+        "BADR",
+        `"${id}" — pré-contrôle pré-apurement des ${lotResult.partiels.length} lots (avant de remplir la déclaration)…`,
+      );
+      const pre = new BADRDumNormalPartiel(badrConn.page);
+      const preRes = await pre.precheckLots(
+        {
+          ...acheminement,
+          partiels: lotResult.partiels,
+          automationState: getAutomationState(folderPath),
+        },
+        badrConn,
+      );
+      if (preRes?.mismatch) {
+        preMismatch = { res: preRes, patch: pre.mismatchStatePatch(preRes) };
+      } else {
+        sendLog(
+          "info",
+          "BADR",
+          `"${id}" — lots complets (colis/poids conformes au manifeste) — remplissage de la déclaration…`,
+        );
+      }
+    } catch (preErr) {
+      sendLog(
+        "warn",
+        "BADR",
+        `"${id}" — pré-contrôle des lots indisponible (${preErr.message}) — poursuite avec le flux normal.`,
+      );
+    }
+    // LEAVE the throw-away declaration: back to the BADR Accueil home page. While
+    // a declaration is open BADR swaps the left menu (SAUVEGARDER / VALIDER / …),
+    // so the real run's "DEDOUANEMENT → Créer une déclaration" wouldn't be found
+    // and Step 1 hung. `force` because the draft lives in an iframe on the same
+    // Accueil URL, which the normal "already on Accueil" shortcut can't detect.
+    try {
+      await badrConn.navigateToAccueil({ force: true });
+      sendLog(
+        "info",
+        "BADR",
+        `"${id}" — retour à l'Accueil BADR (fin du pré-contrôle).`,
+      );
+    } catch (navErr) {
+      sendLog(
+        "warn",
+        "BADR",
+        `"${id}" — retour à l'Accueil échoué: ${navErr.message}`,
+      );
+    }
+    if (preMismatch) {
+      // Same state Step 5 would set → the catch below emails the operator
+      // (En attente du Nème vol / poids différent) and sets the card badge.
+      updateAutomationState(folderPath, preMismatch.patch);
+      throw new Error(preMismatch.res.errorMessage);
+    }
+
+    // ── Run DUM declaration
+    const freshAch = {
+      ...acheminement,
+      partiels: lotResult.partiels,
+      automationState: getAutomationState(folderPath),
+    };
+    const { BadrSessionError } = BADRDumNormalPartiel;
+    const MAX_BADR_RETRIES = 3;
+    for (let attempt = 1; attempt <= MAX_BADR_RETRIES; attempt++) {
+      // Re-read saved phase on every attempt so we resume from the last checkpoint
+      const attemptAch = {
+        ...freshAch,
+        automationState: getAutomationState(folderPath),
+      };
+      const dum = new BADRDumNormalPartiel(badrConn.page);
+      try {
+        await dum.run(attemptAch, badrConn, (patch) => {
+          updateAutomationState(folderPath, patch);
+          attemptAch.automationState = getAutomationState(folderPath);
+        });
+        break; // success — exit retry loop
+      } catch (err) {
+        if (err instanceof BadrSessionError && attempt < MAX_BADR_RETRIES) {
+          sendLog(
+            "warn",
+            "Automation",
+            `BADR erreur interne détectée — tentative ${attempt + 1}/${MAX_BADR_RETRIES}…`,
+          );
+          await new Promise((r) => setTimeout(r, 3000));
+          continue;
+        }
+        throw err; // non-BADR error or exhausted retries
+      }
+    }
+
+    // ── After run(): DUM PDF is printed — waiting for manual signature ───────
+    // run() now stops at partiel_pdf_saved; scellés are declared separately
+    // by the user via the "Déclarer scellés" button in the UI.
+    const postRunState = getAutomationState(folderPath);
+    if (
+      postRunState?.phase === "partiel_pdf_saved" ||
+      postRunState?.phase === "partiel_done" // already fully done (re-entry)
+    ) {
+      if (postRunState.phase === "partiel_pdf_saved") {
+        updateAutomationState(folderPath, {
+          phase: "partiel_waiting_signature",
+        });
+        sendLog(
+          "info",
+          "BADR",
+          `"${id}" — DUM imprimée ✓. Série: ${postRunState.dumSerie} / Clé: ${postRunState.dumCle}. Signature manuelle requise.`,
+        );
+        sendProgress(id, "partiel-waiting-signature", {
+          dumSerie: postRunState.dumSerie,
+          dumCle: postRunState.dumCle,
+        });
+        return { success: false, waitingSignature: true };
+      }
+      // partiel_done: already finished (scellés were declared in a previous run)
+      sendProgress(id, "done");
+      return { success: true };
+    }
+
+    sendProgress(id, "done");
+    return { success: true };
+  } catch (err) {
+    // Préapurement poids/colis mismatch: badrDumNormalPartiel persisted a
+    // `poidsMismatch` (with the lots screenshot) + the right phase before
+    // throwing. Email the operator once and reflect the proper card status,
+    // instead of the generic "error" state.
+    const st = getAutomationState(folderPath);
+    if (st?.poidsMismatch) {
+      await notifyPartielPoidsMismatch(id, acheminement, st);
+      if (st.poidsMismatch.kind === "waiting_vol") {
+        sendLog(
+          "warn",
+          "BADR",
+          `[${id}] ${st.errorMessage} — notification envoyée`,
+        );
+        sendProgress(id, "partiel-waiting-lots", {
+          nextVol: st.poidsMismatch.nextVol,
+        });
+        return {
+          success: false,
+          skipped: true,
+          reason: "partiel_waiting_lots",
+        };
+      }
+      sendLog(
+        "warn",
+        "WeightCheck",
+        `[${id}] ${st.errorMessage} — notification envoyée`,
+      );
+      sendProgress(id, "weight-mismatch", { error: st.errorMessage });
+      return { success: false, error: st.errorMessage };
+    }
+
+    updateAutomationState(folderPath, { phase: "error", error: err.message });
+    sendLog(
+      "error",
+      "Automation",
+      `Partiel flow failed for "${id}": ${err.message}`,
+    );
+    sendProgress(id, "error", { error: err.message });
+    return { success: false, error: err.message };
+  }
+}
+
+async function runAutomationTask(
+  acheminement,
+  {
+    stopAfterSubmit = false,
+    sharedPortnetPage = null,
+    // true for every USER-initiated launch (Lancer, Tout lancer, Ajouter au
+    // traitement) — bypasses the manifest re-check interval below. The operator
+    // clicking the button IS the "check now" request; the interval exists only to
+    // stop unattended background loops (the watcher, the monitor's own
+    // retryWaitingManifest) from hammering BADR, and those call sites already
+    // pre-filter on manifestCheckThrottled before ever reaching this function, so
+    // they are unaffected by this flag.
+    forceManifestRecheck = false,
+  } = {},
+) {
+  const { id, folderPath } = acheminement;
+
+  // Folder deleted by the operator (from disk) before/while we got here → bail
+  // before any BADR work or email; the UI drops the card on its next re-scan.
+  if (!folderPath || !fs.existsSync(folderPath)) {
+    sendLog("info", "Automation", `"${id}": dossier supprimé — ignoré.`);
+    return { success: false, deleted: true };
+  }
+
+  sendLog("info", "Automation", `Starting automation for: ${id}`);
+  sendProgress(id, "running");
+
+  const checkpoint = getAutomationState(folderPath);
+  const hasSubmittedPortnet = !!checkpoint?.portnetRef;
+  const hasAcceptedPortnet = !!checkpoint?.badrRef;
+
+  if (checkpoint?.phase === "badr_done") {
+    sendLog("info", "Automation", `Skipping "${id}" — already completed.`);
+    sendProgress(id, "done", { declarationRef: checkpoint.badrRef });
+    return { success: true, declarationRef: checkpoint.badrRef, skipped: true };
+  }
+
+  // Manifest re-check throttle: if this LTA is waiting for its manifest and the
+  // last BADR check was < MANIFEST_CHECK_INTERVAL_MS ago, don't hit BADR (or email)
+  // again yet. This guards the PASSIVE paths (app restart, the background watcher's
+  // own call already pre-filtered — this is belt-and-suspenders there) — but an
+  // explicit user click (forceManifestRecheck) always re-checks right away.
+  if (
+    checkpoint?.phase === "waiting_manifest" &&
+    !forceManifestRecheck &&
+    manifestCheckThrottled(checkpoint)
+  ) {
+    sendProgress(id, "waiting-manifest");
+    return { success: false, waitingManifest: true, throttled: true };
+  }
+  if (checkpoint?.phase === "waiting_manifest" && forceManifestRecheck) {
+    sendLog(
+      "info",
+      "BADR",
+      `"${id}": re-vérification du manifeste demandée — nouvel essai immédiat (sans attendre l'intervalle).`,
+    );
+  }
+
+  // ── Partiel DUM Normale path ──────────────────────────────────────────────
+  if (acheminement.partiel === true) {
+    return await runPartielDumFlow(acheminement);
+  }
+
+  if (hasAcceptedPortnet) {
+    sendLog(
+      "info",
+      "Automation",
+      `Resuming "${id}" from accepted checkpoint (${checkpoint.badrRef}).`,
+    );
+    return await finalizeAcceptedOnBadr(acheminement, checkpoint.badrRef);
+  }
+
+  let portnetPage = sharedPortnetPage;
+
+  try {
+    if (!hasSubmittedPortnet) {
+      const prep = await prepareLotAndWeightCheck(acheminement);
+      if (!prep.success) return prep;
+
+      if (!portnetPage) {
+        sendProgress(id, "captcha-waiting");
+        portnetPage = await ensurePortnetSession();
+      }
+
+      const submitResult = await submitPortnetPhase(
+        { ...acheminement, ...(prep.formFields || {}) },
+        prep.lotInfo,
+        portnetPage,
+      );
+      if (submitResult?.debugStop) {
+        return submitResult;
+      }
+      if (!submitResult.success || stopAfterSubmit) {
+        return submitResult;
+      }
+    } else {
+      const resumeStatus =
+        checkpoint.phase === "portnet_submitted"
+          ? "portnet-submitted"
+          : "monitoring-portnet";
+      sendLog(
+        "info",
+        "Automation",
+        `Checkpoint found for "${id}" — request already submitted (${checkpoint.portnetRef}), skipping precheck + re-send.`,
+      );
+      sendProgress(id, resumeStatus, {
+        portnetRef: checkpoint.portnetRef,
+      });
+    }
+
+    if (!portnetPage) {
+      sendProgress(id, "captcha-waiting");
+      portnetPage = await ensurePortnetSession();
+    }
+
+    await monitorPendingPortnetRequests([acheminement], portnetPage);
+    const finalState = getAutomationState(folderPath);
+    if (finalState?.phase === "badr_done") {
+      return { success: true, declarationRef: finalState.badrRef };
+    }
+
+    return {
+      success: false,
+      error: finalState?.error || "Processing did not complete",
+    };
+  } catch (err) {
+    updateAutomationState(folderPath, { phase: "error", error: err.message });
+    sendLog("error", "Automation", `Failed for "${id}": ${err.message}`);
+    sendProgress(id, "error", { error: err.message });
+    return { success: false, error: err.message };
+  }
+}
+
+async function runAllAutomationTasks(acheminements) {
+  let portnetPage = null;
+  batchRunning = true;
+
+  try {
+    const toProcess = acheminements
+      .filter((a) => !a.refMismatch || !!a.manifestRef)
+      // Non-partial LTAs always run first; partials are appended at the end.
+      .sort(
+        (a, b) => (a.partiel === true ? 1 : 0) - (b.partiel === true ? 1 : 0),
+      );
+
+    // Phases that are terminal / can't progress in a batch → need no browser.
+    // NOTE: partiel_waiting_lots is NOT here — relaunching it must re-open BADR to
+    // re-check whether the next vol has arrived.
+    const noSessionPhases = [
+      "badr_done",
+      "partiel_done",
+      "partiel_skip",
+      "partiel_waiting_signature",
+      "weight_mismatch",
+    ];
+    const isActive = (ach) =>
+      !noSessionPhases.includes(getAutomationState(ach.folderPath)?.phase);
+    // Partiel (DUM Normale) LTAs never touch Portnet — only open the Portnet
+    // session if at least one NON-partiel LTA still has work. BADR is needed for
+    // both kinds, so it opens whenever anything is active.
+    const needsPortnet = toProcess.some(
+      (ach) => ach.partiel !== true && isActive(ach),
+    );
+    const needsBadr = toProcess.some((ach) => isActive(ach));
+
+    // Open Portnet + BADR sessions UP-FRONT and IN PARALLEL, so the user solves
+    // the Portnet CAPTCHA and inserts the BADR USB certificate once at the start,
+    // then the batch (submission + Portnet polling + BADR finalisation) runs
+    // unattended. Previously BADR only opened later — when the first LTA was
+    // accepted — forcing the user to stay at the PC to enter the certificate then.
+    const sessionTasks = [];
+    if (needsPortnet) {
+      sessionTasks.push(
+        ensurePortnetSession().then((p) => {
+          portnetPage = p;
+        }),
+      );
+    }
+    if (needsBadr) {
+      sessionTasks.push(
+        ensureBadrSession().catch((err) =>
+          sendLog(
+            "warn",
+            "BADR",
+            `Ouverture anticipée de la session BADR échouée: ${err.message} — réessai à la demande.`,
+          ),
+        ),
+      );
+    }
+    await Promise.all(sessionTasks);
+
+    // LTAs whose BADR lot lookup found no manifest yet — retried in the monitor.
+    const waitingManifest = [];
+
+    for (const ach of toProcess) {
+      const checkpoint = getAutomationState(ach.folderPath);
+      const hasSubmittedPortnet = !!checkpoint?.portnetRef;
+      const hasAcceptedPortnet = !!checkpoint?.badrRef;
+
+      if (checkpoint?.phase === "badr_done") {
+        sendProgress(ach.id, "done", { declarationRef: checkpoint.badrRef });
+        continue;
+      }
+      if (checkpoint?.phase === "partiel_done") {
+        sendProgress(ach.id, "done");
+        continue;
+      }
+      if (checkpoint?.phase === "partiel_waiting_signature") {
+        // Waiting for user to sign the DUM manually — skip in batch
+        sendProgress(ach.id, "partiel-waiting-signature", {
+          dumSerie: checkpoint.dumSerie,
+          dumCle: checkpoint.dumCle,
+        });
+        continue;
+      }
+      if (ach.partiel === true) {
+        const pr = await runPartielDumFlow(ach);
+        if (pr?.waitingManifest) waitingManifest.push(ach);
+        continue;
+      }
+      if (hasSubmittedPortnet && !hasAcceptedPortnet) {
+        const resumeStatus =
+          checkpoint.phase === "portnet_submitted"
+            ? "portnet-submitted"
+            : "monitoring-portnet";
+        sendLog(
+          "info",
+          "Automation",
+          `Skipping submit for "${ach.id}" — already submitted (${checkpoint.portnetRef}), going directly to monitoring.`,
+        );
+        sendProgress(ach.id, resumeStatus, {
+          portnetRef: checkpoint.portnetRef,
+        });
+        continue;
+      }
+      if (hasAcceptedPortnet) {
+        sendProgress(ach.id, "portnet-accepted", {
+          declarationRef: checkpoint.badrRef,
+        });
+        await finalizeAcceptedOnBadr(ach, checkpoint.badrRef);
+        continue;
+      }
+
+      // "Tout lancer" is an explicit user click — re-check the manifest now.
+      const r = await runAutomationTask(ach, {
+        stopAfterSubmit: true,
+        sharedPortnetPage: portnetPage,
+        forceManifestRecheck: true,
+      });
+      if (r?.waitingManifest) waitingManifest.push(ach);
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    if (portnetPage) {
+      await monitorPendingPortnetRequests(
+        toProcess,
+        portnetPage,
+        waitingManifest,
+      );
+    }
+
+    // Collect folders of LTAs that are now fully done so the UI can offer to delete them.
+    const doneFolders = toProcess
+      .filter((ach) => {
+        const phase = getAutomationState(ach.folderPath)?.phase;
+        return phase === "badr_done" || phase === "partiel_done";
+      })
+      .map((ach) => ach.folderPath)
+      .filter(Boolean);
+
+    return { success: true, doneFolders };
+  } catch (err) {
+    sendLog("error", "Automation", `Batch run failed: ${err.message}`);
+    return { success: false, error: err.message };
+  } finally {
+    batchRunning = false;
+    injectionQueue.length = 0; // drop anything not picked up by the monitor
+  }
+}
+
+// ── IPC: Open folder dialog ───────────────────────────────────────────────────
+ipcMain.handle("dialog:openFolder", async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ["openDirectory"],
+    title: "Sélectionner le dossier des acheminements",
+  });
+  return result.canceled ? null : result.filePaths[0];
+});
+
+// ── IPC: Delete completed LTA folders after user confirmation ─────────────────
+ipcMain.handle("folder:delete-done", async (_event, { folders }) => {
+  if (!Array.isArray(folders) || folders.length === 0) {
+    return { deleted: [], cancelled: false };
+  }
+
+  const names = folders.map((f) => path.basename(f)).join("\n  • ");
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    type: "question",
+    buttons: ["Supprimer", "Annuler"],
+    defaultId: 0,
+    cancelId: 1,
+    title: "Supprimer les dossiers terminés ?",
+    message: `${folders.length} LTA(s) ont le statut Terminé.\nSupprimer leurs dossiers ?`,
+    detail: `  • ${names}`,
+  });
+
+  if (response === 1) {
+    // User cancelled
+    return { deleted: [], cancelled: true };
+  }
+
+  const deleted = [];
+  for (const folderPath of folders) {
+    try {
+      fs.rmSync(folderPath, { recursive: true, force: true });
+      sendLog(
+        "info",
+        "Cleanup",
+        `Dossier supprimé: ${path.basename(folderPath)}`,
+      );
+      deleted.push(folderPath);
+    } catch (err) {
+      sendLog(
+        "warn",
+        "Cleanup",
+        `Impossible de supprimer ${path.basename(folderPath)}: ${err.message}`,
+      );
+    }
+  }
+
+  return { deleted, cancelled: false };
+});
+
+// Parse the two scellé numbers from an LTA folder name, e.g.
+// "4eme LTA 1234567-1234568" → { scelle1: "1234567", scelle2: "1234568" }.
+// Returns nulls when the name has no "<digits>-<digits>" group (user forgot —
+// the scellé inputs stay empty for manual entry).
+function parseScellesFromFolderName(name) {
+  const m = String(name || "").match(/(\d+)\s*-\s*(\d+)/);
+  if (!m) return { scelle1: null, scelle2: null };
+  return { scelle1: m[1], scelle2: m[2] };
+}
+
+// Build an email subject from the folder name + declaration type, e.g.
+// "2éme acheminement DS Combinée LTA N° 72-74340954". Uses only the acheminement
+// rank and the LTA reference — never scellés or DS series.
+// "2EME 13460565-…" (folder name) → "2éme acheminement". Returns null when the
+// folder name has no leading number, so callers can avoid leaking the raw name.
+function acheminementOrdinal(folderName) {
+  const m = String(folderName || "").match(/^\s*(\d+)/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return `${n}${n === 1 ? "er" : "éme"} acheminement`;
+}
+
+function buildAcheminementSubject(folderName, typeLabel, ref) {
+  const ordinal =
+    acheminementOrdinal(folderName) || String(folderName || "").trim();
+  return `${ordinal} ${typeLabel} LTA N° ${ref}`;
+}
+
+// Prefix any email subject with the acheminement ordinal ("3éme acheminement — …")
+// so EVERY mail identifies which acheminement it's about, like the done mails.
+// No-op when the folder name has no leading number.
+function subjectWithOrdinal(folderName, subject) {
+  const ordinal = acheminementOrdinal(folderName);
+  return ordinal ? `${ordinal} — ${subject}` : subject;
+}
+
+// Screenshot the BADR préapurement lots section (in #iframeMenu) to Downloads,
+// cropped to the form3 panel when visible; falls back to a full-page capture.
+// Returns the saved path, or null. Used by the weight/colis mismatch emails.
+async function captureBadrPreapShot(page, label, folderPath) {
+  const safe = String(label || "lots").replace(/[\\/:*?"<>|]/g, "_");
+  const fileName = `screenshot-LTA-${safe}-Probleme-Poid.png`;
+  const dlDir = path.join(os.homedir(), "Downloads");
+  const targets = [];
+  if (folderPath && fs.existsSync(folderPath)) {
+    targets.push(path.join(folderPath, fileName));
+  }
+  try {
+    if (!fs.existsSync(dlDir)) fs.mkdirSync(dlDir, { recursive: true });
+    targets.push(path.join(dlDir, fileName));
+  } catch {}
+  if (targets.length === 0) return null;
+
+  const primary = targets[0];
+  const capture = async (dest) => {
+    // Capture the ENTIRE préapurement block (Recherche du lot — Type DS / Référence
+    // DS / Lieu de chargement / Référence lot — AND Lot de dédouanement — Poids
+    // brut / Nbre contenant / Tare — plus Confirmer). Scroll it into view inside
+    // the iframe and capture it directly so the email shows the full context.
+    // Ordered widest → narrowest so a layout change still yields a useful shot.
+    const blockSelectors = [
+      "#mainTab\\:form3\\:preap_details", // whole "Préapurement N°" block
+      "#mainTab\\:form3\\:panelDecExistante", // Recherche + Lot de dédouanement + Confirmer
+      "#mainTab\\:form3\\:declarationExistante", // just "Lot de dédouanement"
+    ];
+    try {
+      const frame = page.frameLocator("#iframeMenu");
+      for (const sel of blockSelectors) {
+        const block = frame.locator(sel).first();
+        if (await block.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await block.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+          await page.waitForTimeout(400);
+          await block.screenshot({ path: dest });
+          return;
+        }
+      }
+    } catch {
+      /* fall through to the iframe / full-page capture */
+    }
+    // Fallback: the iframe ELEMENT (full BADR content area), then the full page.
+    const panel = page.locator("#iframeMenu").first();
+    if (await panel.isVisible().catch(() => false)) {
+      await panel.screenshot({ path: dest });
+    } else {
+      await page.screenshot({ path: dest });
+    }
+  };
+  try {
+    await capture(primary);
+  } catch {
+    try {
+      await page.screenshot({ path: primary });
+    } catch {
+      return null;
+    }
+  }
+  for (const t of targets.slice(1)) {
+    try {
+      fs.copyFileSync(primary, t);
+    } catch {}
+  }
+  return primary;
+}
+
+// Email the partiel poids/colis mismatch detected during préapurement, using the
+// screenshot + totals persisted in the automation state by badrDumNormalPartiel.
+async function notifyPartielPoidsMismatch(id, acheminement, state) {
+  const pm = state?.poidsMismatch || {};
+  const ref =
+    normalizeLotReference(
+      extractLotReferenceFromFolder(acheminement.folderPath),
+    ) ||
+    acheminement.refNumber ||
+    id;
+  const attachments = pm.screenshotPath ? [{ path: pm.screenshotPath }] : [];
+
+  if (pm.kind === "waiting_vol") {
+    await sendNotification({
+      subject: subjectWithOrdinal(
+        id,
+        `En attente du ${pm.nextVol}ème vol — LTA N° ${ref}`,
+      ),
+      text:
+        `Bonjour,\n\n` +
+        `La somme du nombre de colis des lots (${pm.totalNbr}) ne correspond pas encore au manifeste (${pm.expectedNbr}) pour la LTA N° ${ref}.\n` +
+        `Cela signifie que tous les vols ne sont pas encore arrivés — en attente du ${pm.nextVol}ème vol.\n\n` +
+        `Voir la capture des lots ci-jointe.\n\n-- MedAfrica --`,
+      attachments,
+    }).catch(() => {});
+  } else {
+    await sendNotification({
+      subject: subjectWithOrdinal(
+        id,
+        `Le poids trouvé dans le système BADR est différent du poids du manifeste / MAWB — LTA N° ${ref}`,
+      ),
+      text:
+        `Bonjour,\n\n` +
+        `Merci de régler le poids de la LTA N° ${ref}.\n\n` +
+        `Poids BADR (somme des lots) : ${Number(pm.totalPoids).toFixed(2)} kg\n` +
+        `Poids manifeste : ${pm.expectedPoids} kg\n\n` +
+        `Voir la capture des lots ci-jointe.\n\n-- MedAfrica --`,
+      attachments,
+    }).catch(() => {});
+  }
+}
+
+// Cross-check the manifest's pieces/weight against the MAWB's (No of Pieces RCP
+// / Gross Weight). Returns a clear French message when they differ, else null.
+// Only compares when the MAWB values are known (scanned MAWB → Gemini Vision).
+function computeMawbVsManifestMismatch({
+  manifestNbr,
+  manifestPoids,
+  mawbNbr,
+  mawbPoids,
+}) {
+  // Returns { blocking, warning }:
+  //  • colis (package count) mismatch → BLOCKING: a different number of packages
+  //    is a real discrepancy the operator must reconcile before launching.
+  //  • poids (weight) mismatch → WARNING only: manifest vs MAWB weight commonly
+  //    differs by a few kg (rounding); it's rectifiable in the poids input and
+  //    the authoritative BADR weight is checked downstream, so never block on it.
+  const blocking = [];
+  const warnings = [];
+  const mn = parseInt(String(manifestNbr ?? "").replace(/\D/g, ""), 10);
+  const xn = parseInt(String(mawbNbr ?? "").replace(/\D/g, ""), 10);
+  if (!isNaN(mn) && !isNaN(xn) && mn !== xn) {
+    blocking.push(`nombre de colis (manifeste ${mn} ≠ MAWB ${xn})`);
+  }
+  const mp = parseFloat(String(manifestPoids ?? "").replace(",", "."));
+  const xp = parseFloat(String(mawbPoids ?? "").replace(",", "."));
+  if (!isNaN(mp) && !isNaN(xp) && Math.round(mp) !== Math.round(xp)) {
+    warnings.push(`poids brut (manifeste ${mp} kg ≠ MAWB ${xp} kg)`);
+  }
+  return {
+    blocking: blocking.length
+      ? `Incohérence manifeste / MAWB sur le ${blocking.join(" et le ")}. Vérifiez les documents avant de lancer.`
+      : null,
+    warning: warnings.length
+      ? `Écart de poids manifeste / MAWB : ${warnings.join(" et ")}. Vous pouvez rectifier le poids dans le champ ci-dessous puis lancer.`
+      : null,
+  };
+}
+
+// ── Scan ONE subfolder into an acheminement object. Extracted so the monitor can
+// rescan a single newly-added LTA folder mid-run (not just via the folder:scan IPC).
+async function scanSingleAcheminement(rootFolderPath, entryName) {
+  const entry = { name: entryName };
+  const dirPath = path.join(rootFolderPath, entry.name);
+  const files = fs
+    .readdirSync(dirPath)
+    .filter((f) => f.toLowerCase().endsWith(".pdf"));
+
+  const mawb = pickMawbPdf(files);
+  const mawbRef = mawb ? extractLotReferenceFromFilename(mawb) || null : null;
+  const manifeste = pickManifestPdf(files);
+  const manifesteRef = manifeste
+    ? extractLotReferenceFromFilename(manifeste) || null
+    : null;
+
+  let manifestPdfExtract = null;
+  if (manifeste) {
+    const manifestPath = path.join(dirPath, manifeste);
+    try {
+      manifestPdfExtract =
+        await extractManifestMetricsFromPdfFile(manifestPath);
+      if (manifestPdfExtract?.ok) {
+        const bits = [
+          manifestPdfExtract.refNumber && `réf ${manifestPdfExtract.refNumber}`,
+          manifestPdfExtract.nombreContenant &&
+            `${manifestPdfExtract.nombreContenant} colis`,
+          manifestPdfExtract.poidTotal && `${manifestPdfExtract.poidTotal} kg`,
+          manifestPdfExtract.currency &&
+            `devise ${manifestPdfExtract.currency}`,
+          manifestPdfExtract.totalValue &&
+            `valeur ${manifestPdfExtract.totalValue}`,
+          manifestPdfExtract.qteFacturee &&
+            `qteFacturée ${manifestPdfExtract.qteFacturee}`,
+          manifestPdfExtract._source && `(via ${manifestPdfExtract._source})`,
+        ]
+          .filter(Boolean)
+          .join(", ");
+        sendLog(
+          "info",
+          "Manifeste",
+          `[${entry.name}] PDF "${manifeste}" — extrait${bits ? `: ${bits}` : ""}`,
+        );
+        if (!manifestPdfExtract.totalValue) {
+          sendLog(
+            "warn",
+            "Manifeste",
+            `[${entry.name}] Valeur totale (2ᵉ des trois totaux en bas du tableau) absente du texte PDF — saisie manuelle ou PDF image uniquement.`,
+          );
+        }
+      } else {
+        const errDetails = manifestPdfExtract?.error || "inconnu";
+        const hint = errDetails.includes("Invalid PDF")
+          ? " — le fichier PDF a une structure non supportée par le lecteur intégré"
+          : errDetails === "no_manifest_header_match"
+            ? " — le PDF est lisible mais ne contient pas l’en-tête MAWB/Pcs/kg attendu"
+            : errDetails === "gemini_vision_all_models_failed"
+              ? " — PDF illisible et Vision Gemini a aussi échoué"
+              : "";
+        sendLog(
+          "warn",
+          "Manifeste",
+          `[${entry.name}] PDF "${manifeste}" — pas d’en-tête exploitable (${errDetails})${hint}`,
+        );
+      }
+    } catch (e) {
+      manifestPdfExtract = { ok: false, error: String(e?.message || e) };
+      sendLog(
+        "error",
+        "Manifeste",
+        `[${entry.name}] lecture PDF échouée: ${manifestPdfExtract.error}`,
+      );
+    }
+  }
+
+  if (
+    manifestPdfExtract &&
+    !manifestPdfExtract.ok &&
+    mawb &&
+    mawb !== manifeste
+  ) {
+    try {
+      const mawbPath = path.join(dirPath, mawb);
+      const fromMawb = await extractManifestMetricsFromPdfFile(mawbPath);
+      if (fromMawb.ok) {
+        manifestPdfExtract = fromMawb;
+        sendLog(
+          "info",
+          "Manifeste",
+          `[${entry.name}] en-tête lu depuis le PDF MAWB "${mawb}" (le manifeste seul n’a pas de texte exploitable)`,
+        );
+      }
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  let refNumber = mawbRef || manifesteRef || "";
+  if (manifestPdfExtract?.ok && manifestPdfExtract.refNumber) {
+    refNumber =
+      refNumber || normalizeLotReference(manifestPdfExtract.refNumber) || "";
+  }
+
+  // ── Auto-extract shipper name from MAWB PDF (partiel LTAs) ──────────
+  const savedForShipper = readAcheminementFile(dirPath);
+  // Extract MAWB metrics for ANY LTA with a MAWB (pieces/weight are cross-checked
+  // against the manifest for all LTAs). Shipper/currency/fret are also captured —
+  // only used for partiels, but the single Vision call returns them anyway.
+  //
+  // Runs ONCE per folder (mawbExtracted flag). Auto re-scans (folder watcher /
+  // "Actualiser") must NOT re-extract — that overwrote the operator's verified
+  // partiel fields (shipperName, qteFacturee, mawbCurrency, fretValue). A fresh
+  // extraction is only triggered explicitly via the per-card "Rescan" button
+  // (acheminement:rescan-mawb, which clears mawbExtracted). `forceReextract`
+  // is set by that IPC path.
+  if (
+    mawb &&
+    !savedForShipper.mawbExtracted &&
+    (savedForShipper.mawbNbrPieces == null ||
+      savedForShipper.mawbGrossWeight == null ||
+      (savedForShipper.partiel && !savedForShipper.shipperName))
+  ) {
+    try {
+      const mawbPath = path.join(dirPath, mawb);
+      const knowCompaniesPath = path.join(
+        __dirname,
+        "..",
+        "known_companies.json",
+      );
+      sendLog(
+        "info",
+        "MAWB",
+        `[${entry.name}] Extraction expéditeur depuis: ${mawb}`,
+      );
+      const meta = await extractMawbMeta(mawbPath, knowCompaniesPath, (msg) =>
+        sendLog("info", "MAWB", `[${entry.name}] ${msg}`),
+      );
+      if (
+        meta.shipperName ||
+        meta.mawbCurrency ||
+        meta.fretValue ||
+        meta.nbrPieces ||
+        meta.grossWeight ||
+        meta.aliexpress ||
+        meta.issuingAgent
+      ) {
+        // Persist back so it shows up on next scan. Never overwrite a field the
+        // operator has explicitly edited (edit-tracking) — the "Rescan" button
+        // clears those flags first when a forced re-extraction IS wanted.
+        const current = readAcheminementFile(dirPath);
+        const patch = { mawbExtracted: true };
+        if (meta.shipperName && !userEdited(current, "shipperName")) {
+          patch.shipperName = meta.shipperName;
+          savedForShipper.shipperName = meta.shipperName;
+        }
+        if (meta.mawbCurrency && !userEdited(current, "mawbCurrency"))
+          patch.mawbCurrency = meta.mawbCurrency;
+        // Freight: only auto-fill when the Total Prepaid was confidently
+        // reconciled (printed total ≈ sum of charges). Otherwise leave it empty
+        // and flag it — a partiel LTA then can't run until it's filled manually.
+        if (
+          meta.fretValue &&
+          meta.fretConfident &&
+          !userEdited(current, "fretValue")
+        ) {
+          patch.fretValue = meta.fretValue;
+          patch.fretUncertain = false;
+        } else if (!userEdited(current, "fretValue")) {
+          patch.fretUncertain = !meta.fretConfident;
+        }
+        // MAWB pieces/weight — used to cross-check against the manifest.
+        if (meta.nbrPieces != null) patch.mawbNbrPieces = meta.nbrPieces;
+        if (meta.grossWeight != null) patch.mawbGrossWeight = meta.grossWeight;
+        // "Issuing Carrier's Agent Name and City" (distinct MAWB field) + the
+        // AliExpress (AE) flag derived from it — the operator must verify the
+        // declared value before submitting to customs.
+        if (meta.issuingAgent) patch.issuingAgent = meta.issuingAgent;
+        patch.isAliExpress = !!meta.aliexpress;
+        patch.aliexpressAgent = meta.aliexpressAgent || null;
+        if (meta.aliexpress) {
+          sendLog(
+            "warn",
+            "MAWB",
+            `[${entry.name}] ⚠ AWB AliExpress (AE) détecté — agent transitaire "${meta.issuingAgent || meta.aliexpressAgent}" — vérifier la valeur totale avant de lancer.`,
+          );
+        }
+        writeAcheminementFile(dirPath, { ...current, ...patch });
+        sendLog(
+          "info",
+          "MAWB",
+          `[${entry.name}] ✓ Extrait: expéditeur="${meta.shipperName}" devise=${meta.mawbCurrency} fret=${meta.fretValue ?? "—"} (confiance=${meta.fretConfident}) colis=${meta.nbrPieces} poids=${meta.grossWeight}`,
+        );
+      } else {
+        // No usable data — still mark as extracted so auto re-scans don't retry
+        // every cycle (operator fills manually, or forces via "Rescan").
+        const current = readAcheminementFile(dirPath);
+        writeAcheminementFile(dirPath, { ...current, mawbExtracted: true });
+        sendLog(
+          "warn",
+          "MAWB",
+          `[${entry.name}] Extraction retournée null — aucun expéditeur trouvé`,
+        );
+      }
+    } catch (e) {
+      sendLog(
+        "warn",
+        "MAWB",
+        `[${entry.name}] Extraction expéditeur échouée: ${e.message}`,
+      );
+    }
+  }
+
+  const filenameMismatch = !!(
+    mawbRef &&
+    manifesteRef &&
+    mawbRef !== manifesteRef
+  );
+  const pdfVsFilenameMismatch = !!(
+    manifestPdfExtract?.ok &&
+    manifestPdfExtract.refNumber &&
+    refNumber &&
+    normalizeLotReference(manifestPdfExtract.refNumber) !==
+      normalizeLotReference(refNumber)
+  );
+  const refMismatch = filenameMismatch || pdfVsFilenameMismatch;
+
+  const saved = readAcheminementFile(dirPath);
+
+  // Scellés may be encoded in the folder name ("… 1234567-1234568"). Use them
+  // to fill empty scellés, and PERSIST so downstream readers (notably the
+  // partiel declare-scellés handler, which reads acheminement.json) see them.
+  // A value already saved (e.g. a manual edit) is kept — folder name only fills
+  // gaps. If the name has no numbers, scellés stay empty for manual entry.
+  const folderScelles = parseScellesFromFolderName(entry.name);
+  let scellesChanged = false;
+  if (!saved.scelle1 && folderScelles.scelle1) {
+    saved.scelle1 = folderScelles.scelle1;
+    scellesChanged = true;
+  }
+  if (!saved.scelle2 && folderScelles.scelle2) {
+    saved.scelle2 = folderScelles.scelle2;
+    scellesChanged = true;
+  }
+  if (scellesChanged) writeAcheminementFile(dirPath, saved);
+
+  const mergedNombre = pickSavedOrExtracted(
+    saved.nombreContenant,
+    manifestPdfExtract?.ok ? manifestPdfExtract.nombreContenant : null,
+    "",
+  );
+  const mergedPoids = pickSavedOrExtracted(
+    saved.poidTotal,
+    manifestPdfExtract?.ok ? manifestPdfExtract.poidTotal : null,
+    "",
+  );
+  // Currency & totalValue: the PDF extraction is the source of truth and wins
+  // over the saved value — UNLESS the operator explicitly edited the field, in
+  // which case their value is preserved (survives a folder re-open).
+  const mergedCurrency = userEdited(saved, "currency")
+    ? String(saved.currency || "").trim() || "MAD"
+    : pickSavedOrExtracted(
+        manifestPdfExtract?.ok ? manifestPdfExtract.currency : null,
+        saved.currency,
+        "MAD",
+      );
+  const mergedTotalValue = userEdited(saved, "totalValue")
+    ? String(saved.totalValue ?? "")
+    : pickSavedOrExtracted(
+        manifestPdfExtract?.ok ? manifestPdfExtract.totalValue : null,
+        saved.totalValue,
+        "",
+      );
+  const mawbCheck = computeMawbVsManifestMismatch({
+    manifestNbr: mergedNombre,
+    manifestPoids: mergedPoids,
+    mawbNbr: saved.mawbNbrPieces,
+    mawbPoids: saved.mawbGrossWeight,
+  });
+
+  return {
+    id: entry.name,
+    name: entry.name,
+    folderPath: dirPath,
+    manifeste,
+    mawb,
+    refNumber,
+    refMismatch,
+    manifestPdfExtract,
+    files,
+    scelle1: saved.scelle1 ?? "",
+    scelle2: saved.scelle2 ?? "",
+    nombreContenant: mergedNombre,
+    poidTotal: mergedPoids,
+    sequenceNumber: saved.sequenceNumber ?? "",
+    lieuChargement: saved.lieuChargement ?? "",
+    currency: mergedCurrency,
+    totalValue: mergedTotalValue,
+    valueRangeAck: saved.valueRangeAck ?? false,
+    _editedFields: Array.isArray(saved._editedFields)
+      ? saved._editedFields
+      : [],
+    partiel: saved.partiel ?? false,
+    manifestRef: saved.manifestRef ?? "",
+    shipperName: saved.shipperName ?? "",
+    fretValue: saved.fretValue ?? "",
+    mawbCurrency: saved.mawbCurrency ?? "",
+    qteFacturee: pickSavedOrExtracted(
+      saved.qteFacturee,
+      manifestPdfExtract?.ok ? manifestPdfExtract.qteFacturee : null,
+      "",
+    ),
+    partiels: saved.partiels ?? null,
+    mawbNbrPieces: saved.mawbNbrPieces ?? null,
+    mawbGrossWeight: saved.mawbGrossWeight ?? null,
+    issuingAgent: saved.issuingAgent ?? null,
+    isAliExpress: saved.isAliExpress ?? false,
+    aliexpressAgent: saved.aliexpressAgent ?? null,
+    mawbExtracted: saved.mawbExtracted ?? false,
+    // Freight couldn't be confidently reconciled from the MAWB → must be typed.
+    fretUncertain: saved.fretUncertain ?? false,
+    // Manifest-vs-MAWB cross-check (all LTAs). mawbMismatch = blocking colis
+    // discrepancy (red banner, Lancer disabled); mawbWarning = non-blocking
+    // weight gap (amber banner, rectifiable, Lancer stays enabled). Both null
+    // when MAWB metrics are unknown.
+    mawbMismatch: mawbCheck.blocking,
+    mawbWarning: mawbCheck.warning,
+    automationState: saved[CHECKPOINT_KEY] ?? null,
+  };
+}
+
+// ── Scan a whole folder into acheminement objects (folder:scan IPC + monitor). ──
+async function scanAcheminementsFolder(folderPath) {
+  if (!folderPath || !fs.existsSync(folderPath)) return [];
+
+  sendLog("info", "Scan", `Dossier acheminements: ${folderPath}`);
+
+  const entries = fs.readdirSync(folderPath, { withFileTypes: true });
+  const acheminements = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const ach = await scanSingleAcheminement(folderPath, entry.name);
+    if (ach) acheminements.push(ach);
+  }
+
+  // Sort by leading number in folder name (e.g. "7eme LTA" < "10eme LTA")
+  acheminements.sort((a, b) => {
+    const numA = parseInt(a.id, 10) || 0;
+    const numB = parseInt(b.id, 10) || 0;
+    return numA - numB;
+  });
+
+  return acheminements;
+}
+
+// ── IPC: Scan folder for acheminements ────────────────────────────────────────
+ipcMain.handle("folder:scan", async (_event, folderPath) => {
+  // (Re)watch this folder so folders added later show up live without a manual
+  // refresh. Idempotent when the path is unchanged.
+  watchAcheminementsFolder(folderPath);
+  return await scanAcheminementsFolder(folderPath);
+});
+
+// ── IPC: Persist user-input fields for one acheminement ──────────────────────
+const SAVED_FIELDS = [
+  "scelle1",
+  "scelle2",
+  "nombreContenant",
+  "poidTotal",
+  "sequenceNumber",
+  "lieuChargement",
+  "currency",
+  "totalValue",
+  "partiel",
+  "manifestRef",
+  "shipperName",
+  "fretValue",
+  "mawbCurrency",
+  "qteFacturee",
+  "partiels",
+  // Operator's acceptance of an out-of-range Valeur totale, and the set of fields
+  // they've explicitly edited — both must persist so the acceptance sticks across
+  // re-scans/restarts and edits aren't overwritten by re-extraction.
+  "valueRangeAck",
+  "_editedFields",
+  // "Issuing Carrier's Agent Name and City" (MAWB field) + AliExpress (AE)
+  // detection derived from it — flags a card for value verification.
+  "issuingAgent",
+  "isAliExpress",
+  "aliexpressAgent",
+  // MAWB was already extracted once → auto re-scans skip re-extraction (avoids
+  // clobbering the operator's verified partiel fields). Reset by "Rescan".
+  "mawbExtracted",
+];
+ipcMain.handle(
+  "acheminement:save",
+  async (_event, { folderPath: fp, data, changedKey }) => {
+    try {
+      const existing = readAcheminementFile(fp);
+      const toSave = Object.fromEntries(
+        SAVED_FIELDS.map((k) => [k, data[k] ?? null]),
+      );
+      if (existing[CHECKPOINT_KEY]) {
+        toSave[CHECKPOINT_KEY] = existing[CHECKPOINT_KEY];
+      }
+      writeAcheminementFile(fp, toSave);
+
+      // ── Auto-extract shipper name ONLY when the partiel checkbox is toggled ──
+      // NOT on other field edits: otherwise clearing the shipper field to retype
+      // it (empty shipper on a partiel LTA) would re-extract and overwrite what
+      // the operator is typing. `changedKey === "partiel"` = the checkbox changed;
+      // undefined (legacy callers) still allows it.
+      let extractedShipperName = null;
+      let extractedMeta = null;
+      if (
+        (changedKey === undefined || changedKey === "partiel") &&
+        data.partiel === true &&
+        !data.shipperName
+      ) {
+        const folderName = path.basename(fp);
+        sendLog(
+          "info",
+          "MAWB",
+          `[${folderName}] partiel=true détecté — recherche MAWB PDF dans: ${fp}`,
+        );
+        try {
+          const files = fs
+            .readdirSync(fp)
+            .filter((f) => f.toLowerCase().endsWith(".pdf"));
+          sendLog(
+            "info",
+            "MAWB",
+            `[${folderName}] PDFs trouvés: ${files.join(", ") || "(aucun)"}`,
+          );
+          const mawbFile = pickMawbPdf(files);
+          if (!mawbFile) {
+            sendLog(
+              "warn",
+              "MAWB",
+              `[${folderName}] Aucun MAWB PDF trouvé (pickMawbPdf → null)`,
+            );
+          } else {
+            sendLog(
+              "info",
+              "MAWB",
+              `[${folderName}] MAWB sélectionné: ${mawbFile} — extraction expéditeur...`,
+            );
+            const mawbPath = path.join(fp, mawbFile);
+            const knowCompaniesPath = path.join(
+              __dirname,
+              "..",
+              "known_companies.json",
+            );
+            const knowExists = fs.existsSync(knowCompaniesPath);
+            sendLog(
+              "info",
+              "MAWB",
+              `[${folderName}] known_companies.json: ${knowExists ? "trouvé" : "ABSENT (fallback actif)"}`,
+            );
+            const meta = await extractMawbMeta(
+              mawbPath,
+              knowCompaniesPath,
+              (msg) => sendLog("info", "MAWB", `[${folderName}] ${msg}`),
+            );
+            extractedMeta = meta;
+            extractedShipperName = meta.shipperName || null;
+            if (
+              meta.shipperName ||
+              meta.mawbCurrency ||
+              meta.fretValue ||
+              meta.aliexpress ||
+              meta.issuingAgent
+            ) {
+              const refreshed = readAcheminementFile(fp);
+              const patch = { mawbExtracted: true };
+              if (meta.shipperName) patch.shipperName = meta.shipperName;
+              if (meta.mawbCurrency) patch.mawbCurrency = meta.mawbCurrency;
+              if (meta.fretValue) patch.fretValue = meta.fretValue;
+              if (meta.issuingAgent) patch.issuingAgent = meta.issuingAgent;
+              patch.isAliExpress = !!meta.aliexpress;
+              patch.aliexpressAgent = meta.aliexpressAgent || null;
+              if (meta.aliexpress) {
+                sendLog(
+                  "warn",
+                  "MAWB",
+                  `[${folderName}] ⚠ AWB AliExpress (AE) détecté (agent "${meta.aliexpressAgent}") — vérifier la valeur totale avant de lancer.`,
+                );
+              }
+              writeAcheminementFile(fp, { ...refreshed, ...patch });
+              sendLog(
+                "info",
+                "MAWB",
+                `[${folderName}] ✓ Extrait: expéditeur="${meta.shipperName}" devise=${meta.mawbCurrency} fret=${meta.fretValue}`,
+              );
+            } else {
+              sendLog(
+                "warn",
+                "MAWB",
+                `[${folderName}] Extraction retournée null — aucun expéditeur trouvé dans le PDF`,
+              );
+            }
+          }
+        } catch (e) {
+          sendLog(
+            "error",
+            "MAWB",
+            `[${folderName}] Extraction expéditeur échouée: ${e.message}`,
+          );
+        }
+      } else if (data.partiel === true && data.shipperName) {
+        // Already has a shipper name, skip silently
+      }
+
+      return {
+        ok: true,
+        shipperName: extractedShipperName,
+        mawbCurrency: extractedMeta?.mawbCurrency ?? null,
+        fretValue: extractedMeta?.fretValue ?? null,
+      };
+    } catch (e) {
+      console.error("[acheminement:save] Failed:", e.message);
+      return { ok: false };
+    }
+  },
+);
+
+// ── IPC: Force a fresh MAWB extraction for ONE folder ("Rescan" button) ──────
+// Auto re-scans never re-extract (mawbExtracted flag) so the operator's verified
+// partiel fields are never clobbered. This is the ONLY path that re-extracts: it
+// clears the once-flag and drops the edit-locks on the auto-extracted MAWB fields
+// so the fresh values can replace them, then re-scans just this folder.
+ipcMain.handle("acheminement:rescan-mawb", async (_event, { folderPath }) => {
+  try {
+    if (!folderPath || !fs.existsSync(folderPath)) {
+      return { ok: false, error: "Dossier introuvable" };
+    }
+    const id = path.basename(folderPath);
+    const current = readAcheminementFile(folderPath);
+    const edited = Array.isArray(current._editedFields)
+      ? current._editedFields
+      : [];
+    const REEXTRACT = ["shipperName", "mawbCurrency", "fretValue"];
+    writeAcheminementFile(folderPath, {
+      ...current,
+      mawbExtracted: false, // force re-extraction on the scan below
+      _editedFields: edited.filter((k) => !REEXTRACT.includes(k)),
+    });
+    sendLog(
+      "info",
+      "MAWB",
+      `[${id}] Rescan manuel — nouvelle extraction MAWB…`,
+    );
+    const ach = await scanSingleAcheminement(path.dirname(folderPath), id);
+    return { ok: true, ach };
+  } catch (e) {
+    sendLog("error", "MAWB", `Rescan échoué: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+});
+
+// ── IPC: Open file in OS explorer ────────────────────────────────────────────
+ipcMain.handle("shell:openPath", async (_event, filePath) => {
+  await shell.openPath(filePath);
+});
+
+// If a batch is running (ANY phase — form-fill/submit OR monitoring), queue the
+// launch instead of starting a concurrent batch. Enqueuing is just an array push
+// (never touches the browser), so it's safe even mid-submission; the running
+// monitor drains the queue once it reaches the polling phase. Returns null only
+// when no batch is active, so the caller starts one normally.
+function tryQueueDuringActiveBatch(items) {
+  if (batchRunning || monitorActive) {
+    // Queue the FULL ach objects (with the operator's edited fields) — the monitor
+    // uses them as-is, skipping already submitted/done ones and retrying errored
+    // LTAs (except Portnet-rejected ones, which resume monitoring). See drainInjectionQueue.
+    for (const a of items) {
+      if (a?.folderPath) injectionQueue.push(a);
+    }
+    sendLog(
+      "info",
+      "Automation",
+      `${items.length} LTA(s) ajouté(s) à la file — seront traités par le lot en cours (déjà traités ignorés).`,
+    );
+    return { success: true, queued: true };
+  }
+  return null;
+}
+
+// ── IPC: Run automation for one acheminement ──────────────────────────────────
+const WATCHER_BUSY_MSG =
+  "Une re-vérification automatique du manifeste est en cours — réessayez dans un instant.";
+
+ipcMain.handle("automation:run", async (_event, acheminement) => {
+  const queued = tryQueueDuringActiveBatch([acheminement]);
+  if (queued) return queued;
+  // The background manifest watcher is mid re-check on the shared BADR page.
+  if (watcherRunning)
+    return { success: false, busy: true, error: WATCHER_BUSY_MSG };
+  // Explicit "Lancer" click — re-check the manifest now, don't wait out the interval.
+  const result = await withBusy(() =>
+    runAutomationTask(acheminement, { forceManifestRecheck: true }),
+  );
+  // No batch/monitor is running here (we'd have been queued above otherwise) — the
+  // operator clicking Lancer is treated as "check BADR now" for every OTHER
+  // waiting-manifest LTA too (the idle background watcher's registry), not just
+  // this one. Best-effort; failures here don't affect the result already computed.
+  await sweepManifestWatchExcept(acheminement?.folderPath).catch((err) =>
+    sendLog("warn", "BADR", `Balayage manifeste échoué: ${err.message}`),
+  );
+  return result;
+});
+
+ipcMain.handle("automation:run-all", async (_event, acheminements) => {
+  const queued = tryQueueDuringActiveBatch(acheminements || []);
+  if (queued) return queued;
+  if (watcherRunning)
+    return { success: false, busy: true, error: WATCHER_BUSY_MSG };
+  return await withBusy(() => runAllAutomationTasks(acheminements || []));
+});
+
+ipcMain.handle("automation:close-sessions", async () => {
+  await closeSharedSessions();
+  return { success: true };
+});
+
+// ── Declare scellés for a partiel DUM (after manual signature) ───────────────
+// Runs after the operator signs the DUM in BADR manually and enters the signed
+// serie. signedSerie may differ from the originally validated dumSerie if BADR
+// regenerated it during signing. Invoked directly when idle, or drained from
+// declarationQueue by the monitor when a batch is running (BADR serialization).
+async function declareScellesPartielFlow(folderPath, signedSerie) {
+  const id = path.basename(folderPath);
+  const state = getAutomationState(folderPath);
+  const saved = readAcheminementFile(folderPath);
+
+  const dumCle = state?.dumCle;
+  const dumSerie = state?.dumSerie;
+  const scelle1 = saved.scelle1;
+  const scelle2 = saved.scelle2;
+
+  // On failure, restore the waiting-signature panel (with the error attached)
+  // instead of bouncing the card to "error", so the user can retry just this
+  // step without re-running the whole partiel DUM flow.
+  const failWaiting = (errorMsg) => {
+    sendProgress(id, "partiel-waiting-signature", {
+      dumSerie,
+      dumCle,
+      error: errorMsg,
+    });
+    return { ok: false, error: errorMsg };
+  };
+
+  if (!signedSerie || !signedSerie.trim()) {
+    return failWaiting("Série signée manquante");
+  }
+  if (!dumCle) {
+    return failWaiting("Clé DUM introuvable dans l'état sauvegardé");
+  }
+  if (!scelle1 || !scelle2) {
+    return failWaiting("Numéros de scellés manquants");
+  }
+
+  // Normalize the user-entered signed serie: strip ALL whitespace anywhere
+  // (spaces, tabs, newlines, non-breaking spaces), then split into digits +
+  // optional trailing letter. Accepts "12847 F", "12847F", "0012847 F",
+  // "0012847F", "12847\nF", even "12 847 F". Leading zeros are dropped below
+  // via parseInt; the letter is uppercased.
+  const cleaned = String(signedSerie || "").replace(/\s+/g, "");
+  const withLetter = cleaned.match(/^(\d+)([A-Za-z])$/);
+  const digitsOnly = cleaned.match(/^(\d+)$/);
+
+  let serie;
+  let cle;
+  if (withLetter) {
+    serie = String(parseInt(withLetter[1], 10) || withLetter[1]);
+    cle = withLetter[2].toUpperCase();
+  } else if (digitsOnly) {
+    serie = String(parseInt(digitsOnly[1], 10) || digitsOnly[1]);
+    cle = dumCle;
+  } else {
+    return failWaiting(
+      `Format de série invalide: "${signedSerie}". Format attendu: chiffres suivis d'une lettre (ex: "12345S" ou "12345 S").`,
+    );
+  }
+
+  sendLog(
+    "info",
+    "BADR",
+    `[${id}] Déclaration scellés — série signée: ${serie} clé: ${cle}`,
+  );
+  sendProgress(id, "running");
+
+  try {
+    const BADRDsCombineFinalize = require("../src/badr/badrDsCombineFinalize");
+    const badrConn = await ensureBadrSession();
+    await badrConn.navigateToAccueil();
+
+    const finalizer = new BADRDsCombineFinalize(badrConn.page, null, badrConn);
+    await finalizer.declarerScellesPartiel(
+      "301",
+      "085",
+      serie,
+      cle,
+      scelle1,
+      scelle2,
+    );
+
+    updateAutomationState(folderPath, { phase: "partiel_done" });
+    sendLog(
+      "info",
+      "BADR",
+      `[${id}] ✓ Scellés déclarés — DUM Normale Partiel terminée`,
+    );
+
+    // Fetch the REAL registered (signed) DUM PDF: DEDOUANEMENT → Services →
+    // Rechercher par référence (301/085/année/série/clé + "Déclaration
+    // enregistrée") → Valider → IMPRIMER. The PDF saved during the run is only
+    // provisional (pre-signature) and must NOT be emailed.
+    let signedPdfPath = null;
+    try {
+      await badrConn.navigateToAccueil();
+      finalizer.page = badrConn.page;
+      const annee = new Date().getFullYear().toString();
+      // File name like "DS_3eme_acheminement_DUM_NORMAL_SIGNE_4885P" — the
+      // acheminement ordinal (accents stripped, spaces → "_"), not the raw folder.
+      const ordSlug = (acheminementOrdinal(id) || id)
+        .replace(/[éèêë]/gi, "e") // "3éme" → "3eme" (accents → ASCII)
+        .replace(/[àâä]/gi, "a")
+        .replace(/[îï]/gi, "i")
+        .replace(/[ôö]/gi, "o")
+        .replace(/[ûüù]/gi, "u")
+        .replace(/[çÇ]/g, "c")
+        .replace(/[^A-Za-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "");
+      const safeName = `DS_${ordSlug}_DUM_NORMAL_SIGNE_${serie}${cle}`
+        .replace(/[\\/:*?"<>|]/g, "_")
+        .slice(0, 120);
+      signedPdfPath = await finalizer.printRegisteredDumByRef(
+        "301",
+        "085",
+        annee,
+        serie,
+        cle,
+        { saveDir: folderPath, saveName: safeName },
+      );
+      updateAutomationState(folderPath, { signedPdfPath });
+      sendLog("info", "BADR", `[${id}] ✓ DUM signé récupéré: ${signedPdfPath}`);
+    } catch (printErr) {
+      sendLog(
+        "warn",
+        "BADR",
+        `[${id}] Récupération du DUM signé échouée: ${printErr.message} — email envoyé sans pièce jointe.`,
+      );
+    }
+
+    // LTA/MAWB reference from the manifest/MAWB filename (NOT the scellés).
+    const dumRef =
+      normalizeLotReference(extractLotReferenceFromFolder(folderPath)) ||
+      saved.refNumber ||
+      "";
+    await sendNotification({
+      subject: buildAcheminementSubject(id, "Dum Normale", dumRef),
+      text:
+        `Bonjour,\n\n` +
+        `Veuillez trouver ci-joint le DUM Normale Partiel signé pour la LTA N° ${dumRef}.\n\n` +
+        `-- MedAfrica --`,
+      attachments: signedPdfPath ? [{ path: signedPdfPath }] : [],
+    }).catch(() => {});
+
+    sendProgress(id, "done");
+    return { ok: true };
+  } catch (err) {
+    updateAutomationState(folderPath, { error: err.message });
+    sendLog(
+      "error",
+      "BADR",
+      `[${id}] Erreur déclaration scellés: ${err.message}`,
+    );
+    return failWaiting(err.message);
+  }
+}
+
+ipcMain.handle(
+  "automation:declare-scelles-partiel",
+  async (_event, { folderPath, signedSerie }) => {
+    // While a batch monitor holds the BADR session, queue the declaration so it
+    // runs serialized inside the monitor loop (no BADR concurrency race). The
+    // card stays on its waiting-signature panel until the monitor processes it.
+    if (monitorActive) {
+      declarationQueue.push({ folderPath, signedSerie });
+      const id = path.basename(folderPath);
+      sendLog(
+        "info",
+        "Scellés",
+        `[${id}] Déclaration en file — sera traitée par le lot en cours (BADR occupé).`,
+      );
+      sendProgress(id, "running");
+      return { ok: true, queued: true };
+    }
+    // The background manifest watcher is mid re-check on the shared BADR page:
+    // don't run two BADR flows at once. Put the card back on its signature panel
+    // (the UI had already flipped it to "running") and ask to retry.
+    if (watcherRunning) {
+      const id = path.basename(folderPath);
+      const st = getAutomationState(folderPath);
+      sendProgress(id, "partiel-waiting-signature", {
+        dumSerie: st?.dumSerie,
+        dumCle: st?.dumCle,
+        error: WATCHER_BUSY_MSG,
+      });
+      return { ok: false, error: WATCHER_BUSY_MSG };
+    }
+    // Counted as busy so the manifest watcher never reloads BADR mid-declaration.
+    return await withBusy(() =>
+      declareScellesPartielFlow(folderPath, signedSerie),
+    );
+  },
+);
+
+let portnetClosedForQuit = false;
+
+app.on("before-quit", async (event) => {
+  // Electron doesn't wait for async handlers, and Portnet's Edge no longer exits
+  // with the app, so hold the quit until it has closed.
+  if (sharedPortnetApp && !portnetClosedForQuit) {
+    portnetClosedForQuit = true;
+    event.preventDefault();
+    await Promise.race([
+      sharedPortnetApp.close().catch(() => {}),
+      new Promise((r) => setTimeout(r, 5000)),
+    ]);
+    sharedPortnetApp = null;
+    sharedPortnetPage = null;
+    app.quit();
+    return;
+  }
+
+  if (folderWatcher) {
+    try {
+      folderWatcher.close();
+    } catch {
+      /* ignore */
+    }
+    folderWatcher = null;
+  }
+  stopManifestWatchTimer();
+  manifestWatch.clear();
+  await closeSharedSessions();
+});

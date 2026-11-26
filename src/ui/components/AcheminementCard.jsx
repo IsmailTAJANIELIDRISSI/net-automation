@@ -101,6 +101,23 @@ export default function AcheminementCard({
   const partiels = Array.isArray(ach.partiels) ? ach.partiels : [];
   const showPartielSeries = ach.partiel && partiels.length > 0;
 
+  // Partiel: the operator may already know one séquence per vol. All filled →
+  // used as-is (no BADR lot search); all empty → the app searches BADR.
+  const manualSeqs = Array.isArray(ach.partielSequences)
+    ? ach.partielSequences
+    : [];
+  const lotCount = Math.min(5, Math.max(2, manualSeqs.length || 2));
+  const seqs = Array.from({ length: lotCount }, (_, i) => manualSeqs[i] ?? "");
+  const hasManualSeqs = ach.partiel && seqs.some((s) => String(s).trim());
+  const setLotCount = (n) =>
+    onChange(id, "partielSequences", Array.from({ length: n }, (_, i) => seqs[i] ?? ""));
+  const setSeq = (i, v) =>
+    onChange(id, "partielSequences", seqs.map((s, j) => (j === i ? v : s)));
+  const inputClass = `bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-sm
+                   text-slate-100 placeholder-slate-600
+                   focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/50
+                   disabled:opacity-50 disabled:cursor-not-allowed transition-colors`;
+
   return (
     <div
       className={`bg-slate-800/60 border ${cardBorder} rounded-2xl p-4 flex flex-col gap-3
@@ -263,11 +280,54 @@ export default function AcheminementCard({
         {field("scelle2", "Scellé #2", "ex: SN789012")}
         {field("nombreContenant", "Nb. contenant", "ex: 3", "number")}
         {field("poidTotal", "Poids total (kg)", "ex: 245.50", "number")}
-        {showPartielSeries ? (
+        {ach.partiel && (
+          <div className="col-span-2 flex flex-col gap-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <label className="text-xs text-slate-400 font-medium">
+                Séquences (optionnel)
+              </label>
+              <label className="flex items-center gap-1.5 text-xs text-slate-400">
+                Nombre de lots
+                <select
+                  value={lotCount}
+                  disabled={isRunning || isDone}
+                  onChange={(e) => setLotCount(Number(e.target.value))}
+                  className={`${inputClass} py-1`}
+                >
+                  {[2, 3, 4, 5].map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            {seqs.map((s, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <span className="text-[11px] text-slate-500 w-12 flex-shrink-0">
+                  Vol {i + 1}
+                </span>
+                <input
+                  type="text"
+                  value={s}
+                  placeholder="ex: 15403 R"
+                  disabled={isRunning || isDone}
+                  onChange={(e) => setSeq(i, e.target.value)}
+                  className={`flex-1 ${inputClass}`}
+                />
+              </div>
+            ))}
+            <p className="text-[11px] text-slate-500 leading-snug">
+              Remplissez toutes les séquences, ou laissez-les toutes vides pour
+              que l'app cherche les lots dans BADR.
+            </p>
+          </div>
+        )}
+        {showPartielSeries && (
           // Partiel: one série per part, found in BADR (read-only).
           <div className="col-span-2 flex flex-col gap-1">
             <label className="text-xs text-slate-400 font-medium">
-              Séquences trouvées ({partiels.length}{" "}
+              Séquences trouvées dans BADR ({partiels.length}{" "}
               {partiels.length > 1 ? "parts" : "part"})
             </label>
             <div className="flex flex-col gap-1.5">
@@ -288,12 +348,14 @@ export default function AcheminementCard({
               ))}
             </div>
           </div>
-        ) : (
-          field("sequenceNumber", "Séquence (optionnel)", "ex: 3447 U")
         )}
+        {!ach.partiel &&
+          field("sequenceNumber", "Séquence (optionnel)", "ex: 3447 U")}
         {field(
           "lieuChargement",
-          "Lieu de chargement (optionnel)",
+          hasManualSeqs
+            ? "Lieu de chargement (requis, commun à tous les vols)"
+            : "Lieu de chargement (optionnel)",
           "ex: ABU DHABI INTERNATIONAL",
         )}
 

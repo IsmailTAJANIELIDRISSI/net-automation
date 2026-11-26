@@ -2264,6 +2264,41 @@ async function runPartielDumFlow(acheminement) {
     return { success: false, error };
   }
 
+  // Séquences typed by the operator (one per vol): all filled → used instead of
+  // the BADR lot search; all empty → search BADR as usual. The pré-contrôle below
+  // still checks their summed colis/poids against the manifest.
+  const resolvedRef = acheminement.refNumber || acheminement.id;
+  const typedSeqs = (acheminement.partielSequences || []).map((s) =>
+    String(s ?? "").trim(),
+  );
+  let manualPartiels = null;
+  if (typedSeqs.some(Boolean)) {
+    const lieu = String(acheminement.lieuChargement || "").trim();
+    const parsed = typedSeqs.map((s) =>
+      s.match(/^0*(\d+)\s*-?\s*([A-Za-z])$/),
+    );
+    let error = null;
+    if (typedSeqs.some((s) => !s)) {
+      error = `Séquences incomplètes (${typedSeqs.filter(Boolean).length}/${typedSeqs.length}) — remplissez-les toutes ou laissez-les toutes vides.`;
+    } else if (parsed.some((m) => !m)) {
+      error = `Séquence invalide : "${typedSeqs[parsed.findIndex((m) => !m)]}" (format attendu : numéro + clé, ex. 15403 R).`;
+    } else if (!lieu) {
+      error = "Lieu de chargement requis quand les séquences sont saisies.";
+    }
+    if (error) {
+      updateAutomationState(folderPath, { phase: "error", error });
+      sendLog("warn", "BADR", `[${id}] ${error}`);
+      sendProgress(id, "error", { error });
+      return { success: false, error };
+    }
+    manualPartiels = parsed.map((m) => ({
+      serie: m[1],
+      cle: m[2].toUpperCase(),
+      lieu,
+      ref: resolvedRef,
+    }));
+  }
+
   try {
     const BADRLotLookup = require("../src/badr/badrLotLookup");
     const BADRDumNormalPartiel = require("../src/badr/badrDumNormalPartiel");
@@ -2272,15 +2307,29 @@ async function runPartielDumFlow(acheminement) {
     await badrConn.navigateToAccueil();
 
     // ── Lot lookup
-    const resolvedRef = acheminement.refNumber || acheminement.id;
     const priorState = getAutomationState(folderPath);
-    const lotLookup = new BADRLotLookup(badrConn.page);
-    await lotLookup.openLotPopup();
-    const lotResult = await lotLookup.searchLot(resolvedRef, {
-      emailOnEmpty: !priorState?.manifestNotified,
-      subjectPrefix: acheminementOrdinal(id),
-    });
-    await lotLookup.close();
+    let lotResult;
+    if (manualPartiels) {
+      sendLog(
+        "info",
+        "BADR",
+        `"${id}" — ${manualPartiels.length} séquences saisies (${manualPartiels.map((p) => `${p.serie} ${p.cle}`.trim()).join(", ")}) — recherche des lots BADR ignorée.`,
+      );
+      lotResult = {
+        isEmpty: false,
+        isPartiel: true,
+        rowCount: manualPartiels.length,
+        partiels: manualPartiels,
+      };
+    } else {
+      const lotLookup = new BADRLotLookup(badrConn.page);
+      await lotLookup.openLotPopup();
+      lotResult = await lotLookup.searchLot(resolvedRef, {
+        emailOnEmpty: !priorState?.manifestNotified,
+        subjectPrefix: acheminementOrdinal(id),
+      });
+      await lotLookup.close();
+    }
 
     if (lotResult.isEmpty) {
       // Retryable — the manifest isn't in BADR yet (see prepareLotAndWeightCheck).
@@ -3330,6 +3379,7 @@ async function scanSingleAcheminement(rootFolderPath, entryName) {
         "",
       ),
       partiels: saved.partiels ?? null,
+      partielSequences: saved.partielSequences ?? null,
       mawbNbrPieces: saved.mawbNbrPieces ?? null,
       mawbGrossWeight: saved.mawbGrossWeight ?? null,
       issuingAgent: saved.issuingAgent ?? null,
@@ -3398,6 +3448,8 @@ const SAVED_FIELDS = [
   "mawbCurrency",
   "qteFacturee",
   "partiels",
+  // Séquences typed by the operator for a partiel LTA (one per vol).
+  "partielSequences",
   // Operator's acceptance of an out-of-range Valeur totale, and the set of fields
   // they've explicitly edited — both must persist so the acceptance sticks across
   // re-scans/restarts and edits aren't overwritten by re-extraction.

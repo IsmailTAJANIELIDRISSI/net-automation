@@ -5,6 +5,19 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-11-26 — Partiel: operator can type one séquence per vol (2–5)
+
+**Problem:** the card had a single "Séquence (optionnel)" input, used only by the DS Combinée flow. For a partiel LTA (several vols) the operator sometimes already knows every séquence, but there was nowhere to enter them, and `runPartielDumFlow` always searched BADR.
+
+**Change:**
+- `AcheminementCard.jsx`: partiel cards show a "Nombre de lots" select (2–5) and that many séquence inputs, stored as `partielSequences` (array). Non-partiel cards keep the single field. Lieu de chargement stays one field shared by all vols, labelled "requis" once séquences are typed. Lots found in BADR are still shown read-only below.
+- `electron/main.js` `runPartielDumFlow`: all séquences filled → partiels built from them (`serie`, `clé`, shared `lieu`, `ref` = LTA ref) and the BADR lot search is skipped; all empty → BADR search as before. Some empty, a bad format (must be number + clé, e.g. `15403 R`) or no lieu → clear error, nothing done. The existing pré-contrôle still checks the lots' summed colis/poids against the manifest, so a wrong séquence or a missing vol is caught before the declaration is filled.
+- `partielSequences` added to `SAVED_FIELDS`, the scan, and the refresh merge in `App.jsx`.
+
+**Note:** Step 5 picks the lieu from BADR's autocomplete by text match, so the typed lieu must be part of BADR's label (e.g. `ISTAMBOUL`).
+
+**Files changed:** `src/ui/components/AcheminementCard.jsx`, `src/ui/App.jsx`, `electron/main.js`
+
 ## 2026-11-01 — Portnet: start Edge as a normal browser so the manual reCAPTCHA stops looping
 
 **Problem:** in the Portnet window, reCAPTCHA kept serving image rounds and "invalide, veuillez réessayer" even with correct answers, while a normal Edge window passed in 2-3 steps. A slow CAPTCHA also killed the whole batch at the 180 s limit (`page.waitForURL: Timeout 180000ms exceeded`; 8 such failures in the logs).
