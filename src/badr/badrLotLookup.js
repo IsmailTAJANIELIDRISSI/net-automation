@@ -26,7 +26,34 @@ const log = createLogger("BADRLotLookup");
 
 const FORM = "j_id_1h"; // stable form id on the popup page
 
+// Partiel LTAs: the vols of one LTA can land more than a week apart, so search
+// today-13 → today (14 days) instead of the usual today-6 → today (7 days).
+const PARTIEL_WINDOW_DAYS = 13;
+
 class BADRLotLookup {
+  /** Days before today covered by the first search window. */
+  static searchWindowDays(partiel = false) {
+    return partiel
+      ? PARTIEL_WINDOW_DAYS
+      : Number(process.env.BADR_SEARCH_WINDOW_DAYS || 6);
+  }
+
+  /**
+   * What a partiel run should do with a searchLot() result:
+   * "waiting_manifest" (nothing yet), "lots_found" (2+ lots → continue; the
+   * pré-contrôle checks they add up to the manifest) or "single_lot" (one lot
+   * over the whole 14-day window → it is a DS combinée, not a partiel).
+   */
+  static classifyPartielResult(result) {
+    if (result.isEmpty) return "waiting_manifest";
+    if (result.isPartiel) return "lots_found";
+    return "single_lot";
+  }
+
+  static singleLotMessage(ref) {
+    return `Un seul lot trouvé pour ${ref} sur ${PARTIEL_WINDOW_DAYS + 1} jours — cette LTA est une DS combinée, pas une LTA partielle. Décochez « Partiel » et relancez.`;
+  }
+
   /**
    * @param {import('playwright').Page} page – The BADR main page (already logged in)
    */
@@ -145,15 +172,15 @@ class BADRLotLookup {
    */
   async searchLot(
     lotReference,
-    { emailOnEmpty = true, subjectPrefix = null } = {},
+    { emailOnEmpty = true, subjectPrefix = null, partiel = false } = {},
   ) {
     const p = this.popupPage;
     const normalizedLotReference = this._normalizeLotReference(lotReference);
 
-    // Default behavior: try the last 6 days once.
-    // If we get 0 results, retry using the previous 6-day window (shift earlier).
+    // Default behavior: try the last 6 days once (13 for a partiel).
+    // If we get 0 results, retry using the previous window (shift earlier).
     // This avoids failing the workflow during testing when BADR data isn't ready yet.
-    const windowDays = Number(process.env.BADR_SEARCH_WINDOW_DAYS || 6);
+    const windowDays = BADRLotLookup.searchWindowDays(partiel);
     const retryAttempts = Number(process.env.BADR_SEARCH_RETRY_ATTEMPTS || 2);
     const retryShiftDays = Number(
       process.env.BADR_SEARCH_RETRY_SHIFT_DAYS || windowDays,
@@ -436,8 +463,12 @@ class BADRLotLookup {
     return `${normalizedPrefix}${match[3]}`;
   }
 
-  _computeDateRange(endOffsetDays = 0, windowDays = 6, startExtraDays = 0) {
-    const now = new Date();
+  _computeDateRange(
+    endOffsetDays = 0,
+    windowDays = 6,
+    startExtraDays = 0,
+    now = new Date(),
+  ) {
     const dateAu = new Date(now);
     dateAu.setDate(now.getDate() + endOffsetDays);
 

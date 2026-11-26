@@ -4,6 +4,7 @@
   "main": "electron/main.js",
   "scripts": {
     "autopull": "node scripts/auto-pull.js",
+    "test": "node --test \"test/*.test.js\"",
     "postinstall": "npx playwright install chromium",
     "predev": "npm run autopull",
     "dev": "concurrently -k -n VITE,ELECTRON -c cyan,green \"vite\" \"node scripts/wait-vite.js\"",

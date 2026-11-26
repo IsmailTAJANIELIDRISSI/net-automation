@@ -5,6 +5,22 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-11-26 — Partiel: search lots over 14 days; one lot means DS combinée
+
+**Problem:** for a partiel LTA the lot search covered only today-6 → today (e.g. 20/11–26/11). It stops at the first window that returns anything, so with one lot found it never looked further back, and the run said "en attente du 2ème vol" while the 2nd lot existed on 18/11.
+
+**Change:**
+- `badrLotLookup.js`: `searchLot(ref, { partiel: true })` searches today-13 → today (14 days). Non-partiel keeps today-6 → today (`BADR_SEARCH_WINDOW_DAYS`). New static helpers `searchWindowDays`, `classifyPartielResult` and `singleLotMessage`. `_computeDateRange` takes an optional `now` so it can be tested.
+- `electron/main.js` `runPartielDumFlow`: 2+ lots → continue as before (the pré-contrôle still checks colis/poids against the manifest). One lot over the 14 days → stop with an error: "cette LTA est une DS combinée, pas une LTA partielle. Décochez « Partiel » et relancez." No lot → waiting_manifest, unchanged.
+- The later "en attente du Nème vol" (2+ lots whose colis don't add up to the manifest) is unchanged.
+- First automated tests: `test/partielLotSearch.test.js`, run with `npm test` (Node's built-in runner, no new dependency). They cover the four scenarios plus month, year and leap-year boundaries.
+
+**Trade-off:** a real partiel whose 2nd vol hasn't landed yet now stops as "DS combinée" instead of waiting. The operator relaunches it when the 2nd vol arrives.
+
+**Not verified:** a live BADR search with a 14-day range.
+
+**Files changed:** `src/badr/badrLotLookup.js`, `electron/main.js`, `test/partielLotSearch.test.js`, `package.json`
+
 ## 2026-11-26 — Partiel: operator can type one séquence per vol (2–5)
 
 **Problem:** the card had a single "Séquence (optionnel)" input, used only by the DS Combinée flow. For a partiel LTA (several vols) the operator sometimes already knows every séquence, but there was nowhere to enter them, and `runPartielDumFlow` always searched BADR.

@@ -2220,7 +2220,7 @@ async function runPartielDumFlow(acheminement) {
   // NOTE: no early-return for `partiel_waiting_lots`. An explicit "Lancer" must
   // RE-CHECK the lots (the operator clicks it because the 2nd vol may have arrived).
   // The lot lookup below re-evaluates: if both vols are now in BADR it proceeds;
-  // if still only one, it simply re-sets partiel_waiting_lots. (Previously it bailed
+  // if only one exists over the 14-day window, it stops as a DS combinée. (Previously it bailed
   // with "rien à faire", so the LTA could only be relaunched by toggling Partiel.)
 
   // Cross-check manifest vs MAWB. Only a colis discrepancy blocks; a weight gap
@@ -2327,11 +2327,13 @@ async function runPartielDumFlow(acheminement) {
       lotResult = await lotLookup.searchLot(resolvedRef, {
         emailOnEmpty: !priorState?.manifestNotified,
         subjectPrefix: acheminementOrdinal(id),
+        partiel: true,
       });
       await lotLookup.close();
     }
+    const lotOutcome = BADRLotLookup.classifyPartielResult(lotResult);
 
-    if (lotResult.isEmpty) {
+    if (lotOutcome === "waiting_manifest") {
       // Retryable — the manifest isn't in BADR yet (see prepareLotAndWeightCheck).
       const checks = (priorState?.manifestCheckCount || 0) + 1;
       updateAutomationState(folderPath, {
@@ -2361,19 +2363,13 @@ async function runPartielDumFlow(acheminement) {
       return { success: false, error: "Partiels not collected" };
     }
 
-    if (!lotResult.isPartiel && lotResult.rowCount === 1) {
-      // Only 1 lot found — waiting for second flight
-      updateAutomationState(folderPath, {
-        phase: "partiel_waiting_lots",
-        nextVol: 2,
-      });
-      sendLog(
-        "warn",
-        "BADR",
-        `"${id}" — 1 seul lot trouvé, en attente du 2ème vol`,
-      );
-      sendProgress(id, "partiel-waiting-lots", { nextVol: 2 });
-      return { success: false, skipped: true, reason: "partiel_waiting_lots" };
+    if (lotOutcome === "single_lot") {
+      // One lot over the whole 14-day window → not a partiel LTA.
+      const error = BADRLotLookup.singleLotMessage(resolvedRef);
+      updateAutomationState(folderPath, { phase: "error", error });
+      sendLog("warn", "BADR", `"${id}" — ${error}`);
+      sendProgress(id, "error", { error });
+      return { success: false, error, reason: "partiel_single_lot" };
     }
 
     // Persist partiels array + lots_found phase
