@@ -26,23 +26,59 @@ const log = createLogger("BADRLotLookup");
 
 const FORM = "j_id_1h"; // stable form id on the popup page
 
-// Partiel LTAs: the vols of one LTA can land more than a week apart, so search
-// today-13 → today (14 days) instead of the usual today-6 → today (7 days).
-const PARTIEL_WINDOW_DAYS = 13;
-
 class BADRLotLookup {
-  /** Days before today covered by the first search window. */
-  static searchWindowDays(partiel = false) {
-    return partiel
-      ? PARTIEL_WINDOW_DAYS
-      : Number(process.env.BADR_SEARCH_WINDOW_DAYS || 6);
+  /**
+   * Search periods, newest first. BADR rejects a period longer than 7 days
+   * (E2800009), so each one is at most 7 days: today-6 → today, then
+   * today-13 → today-6. A normal run stops at the first that finds a lot; a
+   * partiel searches both (its vols can land more than a week apart).
+   */
+  static searchWindows({ partiel = false, now = new Date() } = {}) {
+    const windowDays = Number(process.env.BADR_SEARCH_WINDOW_DAYS || 6);
+    const attempts = Number(process.env.BADR_SEARCH_RETRY_ATTEMPTS || 2);
+    const shiftDays = Number(
+      process.env.BADR_SEARCH_RETRY_SHIFT_DAYS || windowDays,
+    );
+    const extraDays = Number(
+      process.env.BADR_SEARCH_RETRY_START_EXTRA_DAYS || 1,
+    );
+    const count = partiel ? Math.max(2, attempts) : attempts;
+    return Array.from({ length: count }, (_, a) =>
+      BADRLotLookup.computeDateRange(
+        -a * shiftDays,
+        windowDays,
+        a === 0 ? 0 : extraDays,
+        now,
+      ),
+    );
+  }
+
+  /** Lots from several partiel searches, without the ones seen twice. */
+  static mergeLots(lots, lotReference) {
+    const seen = new Set();
+    const unique = lots.filter((l) => {
+      const key = `${l.serie}-${l.cle}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    if (unique.length === 0) {
+      return { isEmpty: true, isPartiel: false, rowCount: 0, lotReference };
+    }
+    return {
+      isEmpty: false,
+      isPartiel: unique.length >= 2,
+      rowCount: unique.length,
+      lotReference,
+      partiels: unique,
+    };
   }
 
   /**
    * What a partiel run should do with a searchLot() result:
    * "waiting_manifest" (nothing yet), "lots_found" (2+ lots → continue; the
    * pré-contrôle checks they add up to the manifest) or "single_lot" (one lot
-   * over the whole 14-day window → it is a DS combinée, not a partiel).
+   * over both weeks → it is a DS combinée, not a partiel).
    */
   static classifyPartielResult(result) {
     if (result.isEmpty) return "waiting_manifest";
@@ -51,7 +87,7 @@ class BADRLotLookup {
   }
 
   static singleLotMessage(ref) {
-    return `Un seul lot trouvé pour ${ref} sur ${PARTIEL_WINDOW_DAYS + 1} jours — cette LTA est une DS combinée, pas une LTA partielle. Décochez « Partiel » et relancez.`;
+    return `Un seul lot trouvé pour ${ref} sur les 14 derniers jours — cette LTA est une DS combinée, pas une LTA partielle. Décochez « Partiel » et relancez.`;
   }
 
   /**
@@ -177,18 +213,7 @@ class BADRLotLookup {
     const p = this.popupPage;
     const normalizedLotReference = this._normalizeLotReference(lotReference);
 
-    // Default behavior: try the last 6 days once (13 for a partiel).
-    // If we get 0 results, retry using the previous window (shift earlier).
-    // This avoids failing the workflow during testing when BADR data isn't ready yet.
-    const windowDays = BADRLotLookup.searchWindowDays(partiel);
-    const retryAttempts = Number(process.env.BADR_SEARCH_RETRY_ATTEMPTS || 2);
-    const retryShiftDays = Number(
-      process.env.BADR_SEARCH_RETRY_SHIFT_DAYS || windowDays,
-    );
-
-    const retryStartExtraDays = Number(
-      process.env.BADR_SEARCH_RETRY_START_EXTRA_DAYS || 1,
-    );
+    const windows = BADRLotLookup.searchWindows({ partiel });
 
     // Opérateurs essayés dans l'ordre : RAM d'abord, puis SWIFTAIR en secours
     // si RAM ne donne aucun lot sur toutes les fenêtres de dates.
@@ -241,19 +266,15 @@ class BADRLotLookup {
       const isLastOperateur = opIdx === operateurs.length - 1;
 
       await this._selectOperateur(op.query, op.label);
+      const partielLots = [];
 
-      for (let attempt = 0; attempt < retryAttempts; attempt++) {
-        const endOffsetDays = -attempt * retryShiftDays;
-        const { dateDu, dateAu } = this._computeDateRange(
-          endOffsetDays,
-          windowDays,
-          attempt === 0 ? 0 : retryStartExtraDays,
-        );
+      for (let attempt = 0; attempt < windows.length; attempt++) {
+        const { dateDu, dateAu } = windows[attempt];
 
         log.info("Filling lot search form", {
           operateur: op.label,
           attempt: attempt + 1,
-          retryAttempts,
+          retryAttempts: windows.length,
           lotReference,
           normalizedLotReference,
           dateDu,
@@ -270,33 +291,86 @@ class BADRLotLookup {
         log.info("Clicking Valider…");
         await p.click(`#${FORM}\\:confirmButon`);
 
-        // Wait for PrimeFaces partial update: result panel must contain the count text
+        // Wait for PrimeFaces partial update: the result count, or BADR's error
+        // banner (e.g. E2800009 period too long), which never shows a count.
         await p.waitForFunction(
           () => {
             const panel = document.getElementById("j_id_1h:resultPanel");
+            const err = [...document.querySelectorAll(".ui-messages-error")].find(
+              (e) => e.offsetParent !== null && e.textContent.trim(),
+            );
             return (
-              panel && panel.textContent.includes("Nombre d'enregistrements")
+              (panel &&
+                panel.textContent.includes("Nombre d'enregistrements")) ||
+              !!err
             );
           },
           { timeout: 30000 },
         );
+        const badrError = await p
+          .locator(".ui-messages-error:visible")
+          .first()
+          .textContent({ timeout: 500 })
+          .catch(() => "");
+        if (badrError.trim()) {
+          throw new Error(
+            `BADR a refusé la recherche (${dateDu} → ${dateAu}) : ${badrError.replace(/\s+/g, " ").trim()}`,
+          );
+        }
         await p.waitForTimeout(500);
 
-        const isFinalAttempt = attempt === retryAttempts - 1;
+        const isFinalAttempt = attempt === windows.length - 1;
         // Only send the "no result" email on the very last try (last window of
         // the last opérateur) — otherwise we'd email before trying SWIFTAIR.
         lastResult = await this._parseResults(normalizedLotReference, {
-          sendNoResultEmail: emailOnEmpty && isFinalAttempt && isLastOperateur,
+          sendNoResultEmail:
+            emailOnEmpty &&
+            isFinalAttempt &&
+            isLastOperateur &&
+            partielLots.length === 0,
           subjectPrefix,
         });
+
+        if (partiel) {
+          if (!lastResult.isEmpty) {
+            partielLots.push(
+              ...(lastResult.partiels || [
+                {
+                  serie: String(parseInt(lastResult.serie, 10)),
+                  cle: lastResult.cle,
+                  lieu: lastResult.lieuChargement,
+                  ref: normalizedLotReference,
+                },
+              ]),
+            );
+          }
+          if (!isFinalAttempt) {
+            log.info(
+              `Partiel — recherche aussi la semaine précédente (${attempt + 2}/${windows.length})…`,
+            );
+          }
+          continue;
+        }
 
         if (!lastResult?.isEmpty) return lastResult;
 
         if (!isFinalAttempt) {
           log.warn(
-            `No result yet — retrying earlier window (attempt ${attempt + 2}/${retryAttempts})…`,
+            `No result yet — retrying earlier window (attempt ${attempt + 2}/${windows.length})…`,
           );
         }
+      }
+
+      if (partiel && partielLots.length) {
+        const merged = BADRLotLookup.mergeLots(
+          partielLots,
+          normalizedLotReference,
+        );
+        log.info(
+          `Partiel — ${merged.rowCount} lot(s) sur les ${windows.length} semaines`,
+          merged.partiels,
+        );
+        return merged;
       }
 
       if (!isLastOperateur) {
@@ -463,7 +537,7 @@ class BADRLotLookup {
     return `${normalizedPrefix}${match[3]}`;
   }
 
-  _computeDateRange(
+  static computeDateRange(
     endOffsetDays = 0,
     windowDays = 6,
     startExtraDays = 0,

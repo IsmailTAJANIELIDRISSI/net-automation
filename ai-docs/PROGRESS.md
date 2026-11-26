@@ -10,14 +10,15 @@ _Format: `## YYYY-MM-DD — <title>`_
 **Problem:** for a partiel LTA the lot search covered only today-6 → today (e.g. 20/11–26/11). It stops at the first window that returns anything, so with one lot found it never looked further back, and the run said "en attente du 2ème vol" while the 2nd lot existed on 18/11.
 
 **Change:**
-- `badrLotLookup.js`: `searchLot(ref, { partiel: true })` searches today-13 → today (14 days). Non-partiel keeps today-6 → today (`BADR_SEARCH_WINDOW_DAYS`). New static helpers `searchWindowDays`, `classifyPartielResult` and `singleLotMessage`. `_computeDateRange` takes an optional `now` so it can be tested.
+- `badrLotLookup.js`: `searchLot(ref, { partiel: true })` searches both weeks (today-6 → today, then today-13 → today-6) and combines the lots, without counting twice a lot seen in both. Non-partiel is unchanged: it stops at the first week that finds a lot. New static helpers `searchWindows`, `mergeLots`, `classifyPartielResult` and `singleLotMessage`. `computeDateRange` is now static and takes `now`, so it can be tested.
+- **Fix after the first live run:** the first version searched one 14-day period, and BADR refused it with "E2800009 - La période ne doit pas excéder [7] jours". No count ever appeared, so the run failed after a 30 s timeout. Every search is now at most 7 days. A visible BADR error banner after Valider now fails right away with BADR's own message instead of timing out.
 - `electron/main.js` `runPartielDumFlow`: 2+ lots → continue as before (the pré-contrôle still checks colis/poids against the manifest). One lot over the 14 days → stop with an error: "cette LTA est une DS combinée, pas une LTA partielle. Décochez « Partiel » et relancez." No lot → waiting_manifest, unchanged.
 - The later "en attente du Nème vol" (2+ lots whose colis don't add up to the manifest) is unchanged.
-- First automated tests: `test/partielLotSearch.test.js`, run with `npm test` (Node's built-in runner, no new dependency). They cover the four scenarios plus month, year and leap-year boundaries.
+- First automated tests: `test/partielLotSearch.test.js`, run with `npm test` (Node's built-in runner, no new dependency). 12 tests cover the four scenarios, the 7-day limit on every period, month, year and leap-year boundaries, and the `searchLot` loop against a fake BADR page (both weeks searched, lots combined, BADR refusal reported).
 
 **Trade-off:** a real partiel whose 2nd vol hasn't landed yet now stops as "DS combinée" instead of waiting. The operator relaunches it when the 2nd vol arrives.
 
-**Not verified:** a live BADR search with a 14-day range.
+**Verified live:** the older-week period (e.g. 30/10 → 06/11, an 8-day span counting both ends) has already been accepted by BADR in earlier runs.
 
 **Files changed:** `src/badr/badrLotLookup.js`, `electron/main.js`, `test/partielLotSearch.test.js`, `package.json`
 
