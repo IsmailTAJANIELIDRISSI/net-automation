@@ -134,9 +134,19 @@ The lots' total weight becomes authoritative: `poidTotal` is rewritten in
 flow continues with the corrected value.
 
 **Case P4 — everything matches.** The declaration is saved (*Sauvegarder*), the phase
-becomes `partiel_preapurement_done`, and the flow proceeds to Documents → Demandes →
-Articles → Print. A colis expectation of 0 (manifest colis missing) skips the colis
-check and falls through to the weight comparison.
+becomes `partiel_preapurement_done`, and the flow proceeds to Demandes → Articles →
+Documents (annexes, always last) → Print. A colis expectation of 0 (manifest colis
+missing) skips the colis check and falls through to the weight comparison.
+
+**Pré-contrôle (since 2026-11-27).** `runPartielDumFlow` runs these checks first, through
+`precheckLots`, in a new declaration *before* Entête is filled. When it passes, that same
+declaration stays open: `run(…, { precheck })` clicks the Entête tab and fills
+Entête → Transport → Caution, then skips Step 1 and the lot registration of Step 5. There
+is no return to Accueil and no second Préapurement DS. A P3 rounding writes the lots'
+weight straight into Entête, so no correction is needed afterwards. On a mismatch (P1/P2),
+or if the check itself fails, the run goes back to Accueil and handles it as before. The
+full Step 5 also runs on a BADR-error retry, because going to Accueil closes the kept
+declaration.
 
 ## 5. Quick reference
 

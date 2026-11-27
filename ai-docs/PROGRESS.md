@@ -5,6 +5,21 @@ _Format: `## YYYY-MM-DD — <title>`_
 
 ---
 
+## 2026-11-27 — Partiel: one declaration instead of two; documents annexed last
+
+**Problem:** a partiel run opened a throw-away declaration for the pré-contrôle (Préapurement DS + colis/poids check). It then went back to Accueil, opened a second declaration and registered the same lots in Préapurement DS again. In both flows the documents were annexed in the middle of the declaration: in BADR partiel before Demandes/Articles, and in Portnet DS Combinée before Demandes diverses.
+
+**Change:**
+- `badrDumNormalPartiel.js` `run(ach, conn, updateState, { precheck })`: a successful pré-contrôle result means its declaration is still open with the lots registered. The run skips Step 1, opens the Entête tab (`_openEnteteTab`) and fills Entête → Transport → Caution. It skips the lot registration of Step 5 but still saves. A ≤ 1 kg rounding (`_applyPoidsCorrection`, the old inline code) goes straight into Entête. Without a precheck the flow is unchanged.
+- New BADR partiel order: Entête → Transport → Caution → Préapurement → Demandes → Articles → **Documents** → Print. The phase order in `_isDone` follows. `main.js` always resets the phase to `partiel_lots_found` before a run, so old saved phases can't skip a step.
+- `electron/main.js` `runPartielDumFlow`: it goes back to Accueil after the pré-contrôle only on a mismatch or a failed check, which then runs the full flow as before. The kept precheck is passed only to retry attempt 1: a BADR session error goes to Accueil, which closes the declaration, so attempt 2+ use the full Step 5.
+- `portnetDsCombine.js` `fillEntete` (non-partiel): Demandes diverses → **Annexe**, then submit. The navigation and every other section are unchanged. The annexe debug stop still returns its flag.
+- Tests: `test/declarationOrder.test.js` (10 tests, steps stubbed) covers the step order of both flows, no second Créer/Préapurement after the precheck, the rounding, mismatch, resume, retry and Portnet annexe-last.
+
+**Not verified live:** BADR saving the precheck's lots with the first Sauvegarder (Entête). Before, the lots were added after Caution and then saved. If the lots are missing from the printed DUM, that is where to look.
+
+**Files changed:** `src/badr/badrDumNormalPartiel.js`, `electron/main.js`, `src/portnet/portnetDsCombine.js`, `test/declarationOrder.test.js`, `ai-docs/PREAPUREMENT-FLOW.md`
+
 ## 2026-11-26 — Partiel: search lots over 14 days; one lot means DS combinée
 
 **Problem:** for a partiel LTA the lot search covered only today-6 → today (e.g. 20/11–26/11). It stops at the first window that returns anything, so with one lot found it never looked further back, and the run said "en attente du 2ème vol" while the 2nd lot existed on 18/11.

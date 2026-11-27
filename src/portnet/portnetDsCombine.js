@@ -1185,7 +1185,15 @@ class PortnetDsCombine {
       );
     }
 
-    // ── Annexe section ───────────────────────────────────────────────────────
+    // ── Demandes diverses section ────────────────────────────────────────────
+    if (formData.scelle1 && formData.scelle2) {
+      await this.fillDemandesDiverses(formData.scelle1, formData.scelle2);
+    } else {
+      log.warn("No scelle1/scelle2 in formData – skipping Demandes diverses");
+    }
+
+    // ── Annexe section — LAST step before submission ─────────────────────────
+    // Documents are annexed once every other section is filled.
     if (formData.folderPath) {
       const annexeResult = await this.fillAnnexe(formData.folderPath);
       if (annexeResult?.stoppedAfterCompression) {
@@ -1201,15 +1209,8 @@ class PortnetDsCombine {
       log.warn("No folderPath in formData – skipping Annexe upload");
     }
 
-    // ── Demandes diverses section ────────────────────────────────────────────
-    if (formData.scelle1 && formData.scelle2) {
-      await this.fillDemandesDiverses(formData.scelle1, formData.scelle2);
-    } else {
-      log.warn("No scelle1/scelle2 in formData – skipping Demandes diverses");
-    }
-
     log.info(
-      "DS Combinée form fill complete (Entête + Caution + Connaissement + Équipements + Annexe + Demandes diverses)",
+      "DS Combinée form fill complete (Entête + Caution + Connaissement + Équipements + Demandes diverses + Annexe)",
     );
 
     return {

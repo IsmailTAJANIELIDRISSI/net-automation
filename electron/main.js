@@ -2391,6 +2391,10 @@ async function runPartielDumFlow(acheminement) {
     // vol" instead of after a half-filled declaration. Fail-open: if the check
     // itself can't run, fall through to the normal flow (Step 5 still checks).
     let preMismatch = null;
+    // Precheck passed → its declaration (lots registered, poids verified) stays
+    // open and the real run continues in it: Entête → … (no Accueil, no second
+    // Préapurement DS). Mismatch or a failed check → Accueil + full flow, as before.
+    let keptPrecheck = null;
     try {
       sendLog(
         "info",
@@ -2408,11 +2412,12 @@ async function runPartielDumFlow(acheminement) {
       );
       if (preRes?.mismatch) {
         preMismatch = { res: preRes, patch: pre.mismatchStatePatch(preRes) };
-      } else {
+      } else if (preRes) {
+        keptPrecheck = preRes;
         sendLog(
           "info",
           "BADR",
-          `"${id}" — lots complets (colis/poids conformes au manifeste) — remplissage de la déclaration…`,
+          `"${id}" — lots complets (colis/poids conformes au manifeste) — remplissage de la déclaration (même déclaration, direct vers l'Entête)…`,
         );
       }
     } catch (preErr) {
@@ -2422,16 +2427,19 @@ async function runPartielDumFlow(acheminement) {
         `"${id}" — pré-contrôle des lots indisponible (${preErr.message}) — poursuite avec le flux normal.`,
       );
     }
-    // LEAVE the throw-away declaration: back to the BADR Accueil home page. While
-    // a declaration is open BADR swaps the left menu (SAUVEGARDER / VALIDER / …),
-    // so the real run's "DEDOUANEMENT → Créer une déclaration" wouldn't be found
-    // and Step 1 hung. `force` because the draft lives in an iframe on the same
-    // Accueil URL, which the normal "already on Accueil" shortcut can't detect.
-    try {
-      await badrConn.navigateToAccueil({ force: true });
-      sendLog("info", "BADR", `"${id}" — retour à l'Accueil BADR (fin du pré-contrôle).`);
-    } catch (navErr) {
-      sendLog("warn", "BADR", `"${id}" — retour à l'Accueil échoué: ${navErr.message}`);
+    // Mismatch / failed check only: LEAVE the throw-away declaration → back to
+    // the BADR Accueil home page. While a declaration is open BADR swaps the left
+    // menu (SAUVEGARDER / VALIDER / …), so the real run's "DEDOUANEMENT → Créer
+    // une déclaration" wouldn't be found and Step 1 hung. `force` because the
+    // draft lives in an iframe on the same Accueil URL, which the normal "already
+    // on Accueil" shortcut can't detect.
+    if (!keptPrecheck) {
+      try {
+        await badrConn.navigateToAccueil({ force: true });
+        sendLog("info", "BADR", `"${id}" — retour à l'Accueil BADR (fin du pré-contrôle).`);
+      } catch (navErr) {
+        sendLog("warn", "BADR", `"${id}" — retour à l'Accueil échoué: ${navErr.message}`);
+      }
     }
     if (preMismatch) {
       // Same state Step 5 would set → the catch below emails the operator
@@ -2456,10 +2464,17 @@ async function runPartielDumFlow(acheminement) {
       };
       const dum = new BADRDumNormalPartiel(badrConn.page);
       try {
-        await dum.run(attemptAch, badrConn, (patch) => {
-          updateAutomationState(folderPath, patch);
-          attemptAch.automationState = getAutomationState(folderPath);
-        });
+        await dum.run(
+          attemptAch,
+          badrConn,
+          (patch) => {
+            updateAutomationState(folderPath, patch);
+            attemptAch.automationState = getAutomationState(folderPath);
+          },
+          // Only the first attempt can use the precheck's declaration: a BADR
+          // session error sends BADR to Accueil, which closes it.
+          { precheck: attempt === 1 ? keptPrecheck : null },
+        );
         break; // success — exit retry loop
       } catch (err) {
         if (err instanceof BadrSessionError && attempt < MAX_BADR_RETRIES) {

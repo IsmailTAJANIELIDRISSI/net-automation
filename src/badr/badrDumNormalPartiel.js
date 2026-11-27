@@ -69,27 +69,50 @@ class BADRDumNormalPartiel {
    * @param {object} badrConn - BADRConnection instance
    * @param {function} updateState - callback(patch) to persist phase
    */
-  async run(ach, badrConn, updateState) {
+  /**
+   * @param {object} [opts]
+   * @param {object} [opts.precheck] - a successful precheckLots() result whose
+   *   declaration is STILL OPEN in BADR (lots already registered in Préapurement
+   *   DS, colis/poids verified). The run then continues in that declaration:
+   *   Entête → Transport → Caution, and skips Step 1 and the lot registration of
+   *   Step 5 (no second visit to Accueil / Préapurement DS). Only pass it right
+   *   after the precheck, never on a retry (the retry path went to Accueil).
+   */
+  async run(ach, badrConn, updateState, opts = {}) {
     const iframe = this.page.frameLocator("#iframeMenu");
     const phase = ach.automationState?.phase || "";
+    const freshStart =
+      !phase ||
+      phase === "partiel_lots_found" ||
+      phase === "partiel_waiting_lots";
+    const reused =
+      freshStart && opts.precheck && !opts.precheck.mismatch
+        ? opts.precheck
+        : null;
 
     log.info("Starting DUM Normale Partiel", {
       id: ach.id,
       phase,
       partiels: ach.partiels?.length,
+      reusePrecheckDeclaration: !!reused,
     });
 
     // ── STEP 1 — Open Create Declaration ──────────────────────────────────
-    if (
-      !phase ||
-      phase === "partiel_lots_found" ||
-      phase === "partiel_waiting_lots"
-    ) {
-      await this._guardStep(
-        "step1_openDeclaration",
-        () => this._step1_openDeclaration(iframe, badrConn),
-        badrConn,
-      );
+    if (freshStart) {
+      if (reused) {
+        log.info(
+          "Step 1 — déclaration du pré-contrôle conservée (lots déjà en Préapurement DS) — passage direct à l'Entête",
+        );
+        // Lot-authoritative poids (≤ 1 kg rounding) goes straight into Entête,
+        // so no later Entête correction is needed.
+        if (reused.poidsAdjusted) ach = this._applyPoidsCorrection(ach, reused);
+      } else {
+        await this._guardStep(
+          "step1_openDeclaration",
+          () => this._step1_openDeclaration(iframe, badrConn),
+          badrConn,
+        );
+      }
       updateState({ phase: "partiel_declaration_opened" });
     }
 
@@ -104,7 +127,11 @@ class BADRDumNormalPartiel {
       };
       await this._guardStep(
         "step2_entete",
-        () => this._step2_entete(iframe, ach),
+        async () => {
+          // The precheck left the declaration on the Préapurement DS tab.
+          if (reused) await this._openEnteteTab(iframe);
+          await this._step2_entete(iframe, ach);
+        },
         badrConn,
       );
       updateState({ phase: "partiel_entete_saved" });
@@ -132,44 +159,35 @@ class BADRDumNormalPartiel {
 
     // ── STEP 5 — Préapurement DS Tab ───────────────────────────────────────
     if (!this._isDone(ach, "partiel_preapurement_done")) {
-      const result = await this._guardStep(
-        "step5_preapurement",
-        () => this._step5_preapurement(iframe, ach),
-        badrConn,
-      );
-      if (result.mismatch) {
-        // waiting_vol = colis sum ≠ manifest (more flights to come);
-        // poids = colis OK but weight differs. main.js reads `poidsMismatch`
-        // from the state to send the right email + screenshot.
-        log.warn(`Step 5 — ${result.errorMessage} (${result.kind})`);
-        updateState(this.mismatchStatePatch(result));
-        throw new Error(result.errorMessage);
-      }
-      // Rounding diff ≤ 1 kg: use lot-authoritative poids for all downstream steps.
-      if (result.poidsAdjusted) {
+      if (reused) {
+        // Lots were registered and colis/poids verified by the precheck, in
+        // this same declaration — registering them again would duplicate them.
         log.info(
-          `Poids correction: ${ach.poidTotal} → ${result.actualPoids} kg (rounding ≤ 1 kg)`,
+          "Step 5 — lots déjà enregistrés et vérifiés par le pré-contrôle — pas de second passage",
         );
-        ach = { ...ach, poidTotal: String(result.actualPoids) };
-        // Persist corrected poidTotal to JSON so re-runs don't re-correct
-        if (ach.folderPath) {
-          try {
-            const achFile = path.join(ach.folderPath, "acheminement.json");
-            const saved = JSON.parse(fs.readFileSync(achFile, "utf8"));
-            saved.poidTotal = String(result.actualPoids);
-            fs.writeFileSync(achFile, JSON.stringify(saved, null, 2), "utf8");
-            log.info(
-              `Persisted corrected poidTotal=${result.actualPoids} to acheminement.json`,
-            );
-          } catch (e) {
-            log.warn(`Could not persist poidTotal correction: ${e.message}`);
-          }
-        }
-        await this._guardStep(
-          "correct_entete_poids",
-          () => this._correctEntePoids(iframe, result.actualPoids),
+      } else {
+        const result = await this._guardStep(
+          "step5_preapurement",
+          () => this._step5_preapurement(iframe, ach),
           badrConn,
         );
+        if (result.mismatch) {
+          // waiting_vol = colis sum ≠ manifest (more flights to come);
+          // poids = colis OK but weight differs. main.js reads `poidsMismatch`
+          // from the state to send the right email + screenshot.
+          log.warn(`Step 5 — ${result.errorMessage} (${result.kind})`);
+          updateState(this.mismatchStatePatch(result));
+          throw new Error(result.errorMessage);
+        }
+        // Rounding diff ≤ 1 kg: use lot-authoritative poids for all downstream steps.
+        if (result.poidsAdjusted) {
+          ach = this._applyPoidsCorrection(ach, result);
+          await this._guardStep(
+            "correct_entete_poids",
+            () => this._correctEntePoids(iframe, result.actualPoids),
+            badrConn,
+          );
+        }
       }
       await this._guardStep(
         "sauvegarder_after_step5",
@@ -179,37 +197,38 @@ class BADRDumNormalPartiel {
       updateState({ phase: "partiel_preapurement_done" });
     }
 
-    // ── STEP 6 — Documents Tab ─────────────────────────────────────────────
-    if (!this._isDone(ach, "partiel_documents_saved")) {
-      await this._guardStep(
-        "step6_documents",
-        () => this._step7_documents(iframe, ach),
-        badrConn,
-      );
-      updateState({ phase: "partiel_documents_saved" });
-    }
-
-    // ── STEP 7 — Demandes Diverses Tab ─────────────────────────────────────
+    // ── STEP 6 — Demandes Diverses Tab ─────────────────────────────────────
     if (!this._isDone(ach, "partiel_demandes_saved")) {
       await this._guardStep(
-        "step7_demandes",
+        "step6_demandes",
         () => this._step8_demandes(iframe, ach),
         badrConn,
       );
       updateState({ phase: "partiel_demandes_saved" });
     }
 
-    // ── STEP 8 — Articles Tab ──────────────────────────────────────────────
+    // ── STEP 7 — Articles Tab ──────────────────────────────────────────────
     if (!this._isDone(ach, "partiel_articles_saved")) {
       await this._guardStep(
-        "step8_articles",
+        "step7_articles",
         () => this._step9_articles(iframe, ach),
         badrConn,
       );
       updateState({ phase: "partiel_articles_saved" });
     }
 
-    // ── STEP 9 — Print / Download ──────────────────────────────────────────
+    // ── STEP 8 — Documents Tab (annexes) — LAST step before printing ───────
+    // Annexing comes after every other tab is filled and saved, so the
+    // documents are attached to a complete declaration.
+    if (!this._isDone(ach, "partiel_documents_saved")) {
+      await this._guardStep(
+        "step8_documents",
+        () => this._step7_documents(iframe, ach),
+        badrConn,
+      );
+      updateState({ phase: "partiel_documents_saved" });
+    }
+
     // ── STEP 9 — Print / Download ─────────────────────────────────────────
     if (!this._isDone(ach, "partiel_pdf_saved")) {
       const result = await this._guardStep(
@@ -350,9 +369,9 @@ class BADRDumNormalPartiel {
       "partiel_transport_saved",
       "partiel_caution_saved",
       "partiel_preapurement_done",
-      "partiel_documents_saved",
       "partiel_demandes_saved",
       "partiel_articles_saved",
+      "partiel_documents_saved", // annexes: last tab before printing
       "partiel_pdf_saved", // PDF downloaded; dumSerie/dumCle persisted in state
       "partiel_done", // scelles declared
     ];
@@ -1526,6 +1545,40 @@ class BADRDumNormalPartiel {
   }
 
   // ── Shared helpers ───────────────────────────────────────────────────────
+
+  // Use the lots' summed poids (rounding diff ≤ 1 kg) for every later step and
+  // persist it to acheminement.json so re-runs don't re-correct.
+  _applyPoidsCorrection(ach, result) {
+    log.info(
+      `Poids correction: ${ach.poidTotal} → ${result.actualPoids} kg (rounding ≤ 1 kg)`,
+    );
+    const next = { ...ach, poidTotal: String(result.actualPoids) };
+    if (next.folderPath) {
+      try {
+        const achFile = path.join(next.folderPath, "acheminement.json");
+        const saved = JSON.parse(fs.readFileSync(achFile, "utf8"));
+        saved.poidTotal = String(result.actualPoids);
+        fs.writeFileSync(achFile, JSON.stringify(saved, null, 2), "utf8");
+        log.info(
+          `Persisted corrected poidTotal=${result.actualPoids} to acheminement.json`,
+        );
+      } catch (e) {
+        log.warn(`Could not persist poidTotal correction: ${e.message}`);
+      }
+    }
+    return next;
+  }
+
+  // Precheck path: the declaration is open on the Préapurement DS tab → show
+  // the Entête tab so Step 2's fields are visible/editable.
+  async _openEnteteTab(iframe) {
+    log.info("Step 2 — Ouverture de l'onglet Entête…");
+    await iframe.locator("a[href='#mainTab:tab0']").click();
+    await iframe
+      .locator("#mainTab\\:form0\\:nomOperateurExpediteur")
+      .waitFor({ state: "visible", timeout: 10000 });
+    await this.page.waitForTimeout(400);
+  }
 
   // Re-fill Entête poids brut after Step 5 rounding correction.
   // Called only when actualPoids differs from manifest by ≤ 1 kg.
